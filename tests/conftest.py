@@ -10,11 +10,17 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from harness import Action, Decision, Harness, TaskState, Write  # noqa: E402
+from harness import Action, CapabilityToken, Decision, Harness, TaskState, Write  # noqa: E402
 
 
 def make_harness(run_limits: int = 1000) -> Harness:
+    """默认 Harness + 通配能力 token（D13：deny-by-default 下的测试夹具）。
+
+    安全用例必须用**不装 default_token** 的 `Harness()` 自行断言拒绝。
+    """
     h = Harness(run_limits=run_limits)
+    h.policy.default_token = CapabilityToken(
+        "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
     return h
 
 

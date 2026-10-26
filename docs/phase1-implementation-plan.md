@@ -104,10 +104,19 @@ RUN_TERMINAL = {DONE, DONE_PARTIAL, FAILED, CANCELLED}
 
 **兼容垫片**：`Result.__eq__` 接受 `Status`（`result == Status.OK` 仍成立），S8 后移除。这样迁移可以**分批**，不会一次性红一片。
 
-### 2.3 迁移策略
+**迁移顺序（S0 已执行的按 ✅ 标注）**：
 
-- **S0 一次性完成** §2.2 全部签名变更 + 调用点迁移，判据 = **现有 35 测试全绿**。
-- 迁移期间禁止改行为（只改签名/结构），行为改动一律留到 S1–S8。这样出问题能立刻定位是「迁移错」还是「行为错」。
+| 接口 | 迁移时点 | 原因 |
+|---|---|---|
+| `Event` 补 4 字段 / `Result` / `TRANSITIONS` / `RunState` / `Clock` / 注入图 / deny-by-default | ✅ **S0** | 纯增量，不改断言语义 |
+| `EventLog.append(..., run_id=)` / `append_batch` | ✅ **S0**（`run_id` 暂为关键字默认值，S1 的 WAL 强制必填） | 保持位置参数兼容 |
+| `AgentRuntime.run` 的 `decide` 注入 | S6 | 需先有 `snapshot` |
+| `IntentRegistry.reserve/compatible` 参数顺序与 `mode` 取值 | **S2** | 与 `test_a9` 重写同步，避免一次性红 4 处调用点 |
+| `BudgetManager.reserve -> Reservation`、`release(reservation_id)` | **S4** | 与 `test_a4/a12/a13` 重写同步 |
+| `CapabilityToken.agent_id → issue()` | **S7** | 与能力用例重写同步（S0 已加四维 + 通配 + `default_token`） |
+| `CheckpointStore.load -> ACB` | S5 | 与 `recover` 重写同步 |
+
+> 这条「签名随测试重写一起收紧」的规则替代了 v1.0 的「S0 一次性全改」：后者会在没有任何新测试兜底时同时红掉 4 个模块，出问题无法定位是迁移错还是行为错。
 
 ---
 
@@ -606,7 +615,7 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 
 | Step | 内容 | 完成判据（精确） |
 |---|---|---|
-| **S0** | `pyproject.toml` + markers + `protocols.py` + `types.py`（Event/Result/TaskState/RunState/TRANSITIONS）+ `clock.py` + **§2.2 全部签名迁移** | ① `pytest --markers` 输出含 `ms0..ms3`；② **现有 35 测试全绿**（迁移不改变行为） |
+| **S0** | `pyproject.toml` + markers + `protocols.py` + `types.py`（Event/Result/TaskState/RunState/TRANSITIONS）+ `clock.py` + 注入图 + deny-by-default | ① `pytest --markers` 输出含 `ms0..ms3`；② `-m ms0` 能选出子集；③ **原有 35 测试全绿 + 新增 9 个骨架测试**（共 44） |
 | **S1** | `storage/atomic.py` + `blob.py` + `wal.py` + `WalEventLog` + `InMemoryEventLog` | T1–T4 绿 |
 | **S2** | `intent_registry`（注入时钟）+ `workspace`（manifest/blob/锁序/base_version 恒等） | T5、T7 + `test_a9_lease_renew_revoke_race` 绿 |
 | **S3** | `rebase.py` + `handle_commit_result` + `Delete` 哨兵补偿 | T6、T8 + `test_a1_compensation_cross_no_overwrite` 绿 |
@@ -742,3 +751,18 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | `subscription` 无归属 | 纳入 §3.1，阶段一只做注册 + 有序分发（§4.4） |
 | 覆盖率一刀切 80% 不可达 | 分模块阈值（§7.1） |
 | C3 期望高于 A10 承诺 | 改为诚实口径（§9.4） |
+
+---
+
+## 13. 实施进度
+
+| Step | 状态 | 产出 | 判据实测 |
+|---|---|---|---|
+| **S0** | ✅ 完成（2026-10-26） | `pyproject.toml`（markers + coverage 配置）、`harness/clock.py`、`harness/types.py`（Event 全字段 / `Result` / `TaskState`+`RunState` / `TRANSITIONS` / `advance` / `Reservation` / ACB 新字段）、`harness/protocols.py`、`EventLog.append_batch`、`Harness` 注入图 + deny-by-default + `default_token` | **44 passed**（原 35 + 新增 9）；`pytest -m ms0` → 9 passed / 35 deselected；`pytest --markers` 含 ms0–ms3、fault |
+| S1 | ⏳ 待开工 | `storage/atomic.py`、`blob.py`、`wal.py`、`WalEventLog` | T1–T4 |
+| S2–S8 | ⏳ 待开工 | 见 §8 | 见 §8 |
+
+**S0 的已知偏差（记录在案）**：
+1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。
+2. `TaskState.DONE_PARTIAL` 暂留在枚举里（标注「归属 RunState」），S4 随 `test_a11` 重写时移除。
+3. `IntentRegistry.reserve` / `BudgetManager.reserve` / `CapabilityToken.agent_id` 的签名**未改** —— 按 §2.2「签名随测试重写一起收紧」的规则，分别在 S2 / S4 / S7 执行。

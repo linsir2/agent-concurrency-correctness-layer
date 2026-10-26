@@ -36,7 +36,7 @@
 ## 运行测试
 
 ```bash
-python3 -m pytest tests/ -q     # 35 passed
+python3 -m pytest tests/ -q     # 44 passed
 ```
 
-测试覆盖：U1–U4 真实用例、A1–A13 对抗用例（含背压降级）、MS0 出口（seq 单调）、MS7 出口（能力强制）、MS8 出口（I1–I13 一致性校验）。
+测试覆盖：U1–U4 真实用例、A1–A13 对抗用例（含背压降级）、MS0 出口（seq 单调 + schema 定稿 + 状态机表驱动）、MS7 出口（能力强制）、MS8 出口（I1–I13 一致性校验）。

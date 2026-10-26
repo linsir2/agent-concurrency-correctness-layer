@@ -10,6 +10,7 @@ import threading
 
 from .budget import BudgetManager
 from .checkpoint import CheckpointStore, EffectJournal
+from .clock import SystemClock
 from .context import ContextAssembler
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
@@ -32,24 +33,37 @@ class Harness:
                  lease_ms: int = 60_000, guard_every: int = 1,
                  aging_max: int = 5, max_steps: int = 10_000,
                  max_concurrent: int = 100,
-                 policy_default_allow: bool = True) -> None:
+                 policy_default_allow: bool = False, *,
+                 clock=None, event_log=None, intents=None, versions=None,
+                 workspace=None, budget=None, checkpoints=None, effects=None,
+                 policy=None, context=None, subscriptions=None,
+                 decide=None, default_token=None) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
         self.max_steps = max_steps
         self.max_concurrent = max_concurrent
+        self.retention = retention
 
-        self.event_log = EventLog()
-        self.intents = IntentRegistry()
-        self.versions = WorkspaceVersionStore()
-        self.workspace = WorkspaceManager(self.event_log, self.intents, self.versions)
-        self.budget = BudgetManager(run_limits)
-        self.checkpoints = CheckpointStore()
-        self.effects = EffectJournal(self.event_log)
-        self.subscriptions = SubscriptionRegistry(self.event_log)
-        self.policy = PolicyEngine(default_allow=policy_default_allow)
-        self.context = ContextAssembler(self.event_log, self.workspace, retention)
+        self.clock = clock or SystemClock()
+        self.event_log = event_log if event_log is not None else EventLog(clock=self.clock)
+        self.intents = intents if intents is not None else IntentRegistry()
+        self.versions = versions if versions is not None else WorkspaceVersionStore()
+        self.workspace = (workspace if workspace is not None
+                          else WorkspaceManager(self.event_log, self.intents, self.versions))
+        self.budget = budget if budget is not None else BudgetManager(run_limits)
+        self.checkpoints = checkpoints if checkpoints is not None else CheckpointStore()
+        self.effects = (effects if effects is not None
+                        else EffectJournal(self.event_log))
+        self.subscriptions = (subscriptions if subscriptions is not None
+                              else SubscriptionRegistry(self.event_log))
+        self.policy = (policy if policy is not None
+                       else PolicyEngine(default_allow=policy_default_allow,
+                                         default_token=default_token))
+        self.context = (context if context is not None
+                        else ContextAssembler(self.event_log, self.workspace, retention))
         self.compensation_journal: list[dict] = []      # 文档 §5.4
+        self.decide = decide
 
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)

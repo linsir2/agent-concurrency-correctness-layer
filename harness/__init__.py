@@ -16,9 +16,11 @@
 """
 
 from .types import (
-    Resource, Lease, Event, ACB, Write, Decision, Action,
-    Status, Mode, EventKind, TaskState,
+    Resource, Lease, Event, ACB, Write, Decision, Action, Result, Reservation,
+    Status, Mode, EventKind, TaskState, RunState, TASK_TERMINAL, RUN_TERMINAL,
+    TRANSITIONS, advance,
 )
+from .clock import Clock, SystemClock, ManualClock
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
 from .workspace import WorkspaceManager, WorkspaceVersionStore
@@ -33,7 +35,10 @@ from .harness import Harness
 
 __all__ = [
     "Resource", "Lease", "Event", "ACB", "Write", "Decision", "Action",
-    "Status", "Mode", "EventKind", "TaskState",
+    "Result", "Reservation",
+    "Status", "Mode", "EventKind", "TaskState", "RunState",
+    "TASK_TERMINAL", "RUN_TERMINAL", "TRANSITIONS", "advance",
+    "Clock", "SystemClock", "ManualClock",
     "EventLog", "IntentRegistry", "WorkspaceManager", "WorkspaceVersionStore",
     "BudgetManager", "CheckpointStore", "EffectJournal", "SubscriptionRegistry",
     "PolicyEngine", "CapabilityToken", "ContextAssembler", "AgentRuntime",

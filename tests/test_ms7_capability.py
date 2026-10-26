@@ -6,18 +6,19 @@
 from __future__ import annotations
 
 from conftest import admit, decision, finish, make_harness
-from harness import CapabilityToken, TaskState
+from harness import CapabilityToken, Harness, TaskState
 
 
 def test_capability_denied_blocks_tool():
-    h = make_harness()
+    # D13：不装 default_token → deny-by-default（I4 能力封闭）
+    h = Harness()
     h.policy.issue(CapabilityToken("A-T1", tools={"read"}, paths={"/src"}))
 
     assert h.policy.check_capability("A-T1", "read", "/src/a.ts") is True
     assert h.policy.check_capability("A-T1", "write", "/src/a.ts") is False
     assert h.policy.check_capability("A-T1", "read", "/etc/passwd") is False
-    # 未签发 token → 参考实现默认放行（生产实现应改为拒绝）
-    assert h.policy.check_capability("A-UNKNOWN", "read", "/src/a.ts") is True
+    # 未签发 token 且无 default_token → 拒绝（不是放行）
+    assert h.policy.check_capability("A-UNKNOWN", "read", "/src/a.ts") is False
 
 
 def test_toolgateway_enforces_capability():

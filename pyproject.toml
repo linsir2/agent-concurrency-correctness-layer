@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-concurrency-correctness-layer"
+version = "0.1.0"
+description = "多智能体并发正确性层：RSC = OCC + 租约 fencing + 短临界区 + Saga 补偿"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6"]
+
+[tool.setuptools.packages.find]
+include = ["harness*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "ms0: 骨架与事件原语",
+    "ms1: 单资源 RSC",
+    "ms2: 预算与准入",
+    "ms3: 崩溃恢复与幂等",
+    "conformance: 不变量 I1-I14 的可执行校验",
+    "adversarial: 对抗用例 A1-A13",
+    "slow: 长跑用例（-m 'not slow' 可跳过）",
+    "serial: 需串行执行的并发用例",
+    "fault: 故障注入（真实 fsync / 子进程 kill）",
+]
+
+[tool.coverage.run]
+source = ["harness"]
+branch = true
+omit = ["tests/*", "*/conftest.py"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "\\.\\.\\.",
+    "raise NotImplementedError",
+]

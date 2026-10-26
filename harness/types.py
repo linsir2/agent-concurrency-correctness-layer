@@ -1,6 +1,10 @@
 """核心类型定义（对应文档 §4.5 数据结构定义）。
 
 所有类型都是**纯数据**（dataclass），不绑定实现，便于替换存储后端。
+
+v1.1（S0）：补齐 `Event` 的 4 个缺失字段（event_id/run_id/ts/schema_version）、
+新增 `Result`（带载状态，供 CONFLICT 携带 diff）、`Reservation`、
+`RunState`（表 B，与 TaskState 表 A 分离）、`TRANSITIONS`（状态机表驱动）。
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ from typing import Any, Optional
 
 
 class Status(str, Enum):
-    """文档 §4.4 错误码统一枚举。"""
+    """文档 §4.4 错误码统一枚举（**封闭集合**，不得随意新增）。"""
     OK = "OK"
     VALID = "VALID"
     CONFLICT = "CONFLICT"
@@ -30,6 +34,40 @@ class Status(str, Enum):
     COMMIT_UNRECOVERABLE = "COMMIT_UNRECOVERABLE"
     GUARD_VIOLATION = "GUARD_VIOLATION"
     APPROVAL_TIMEOUT = "APPROVAL_TIMEOUT"
+
+
+@dataclass(frozen=True, eq=False)
+class Result:
+    """带载状态：`CONFLICT` 必须带 diff、`REJECT_STALE_READ` 必须带 resource。
+
+    兼容垫片：`result == Status.OK` 与 `result.value` 仍然成立，
+    使签名迁移可以分批进行（S8 后移除垫片）。
+    """
+
+    status: Status
+    detail: dict = field(default_factory=dict)
+
+    @property
+    def value(self) -> str:
+        return self.status.value
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Status):
+            return self.status == other
+        if isinstance(other, Result):
+            return self.status == other.status and self.detail == other.detail
+        return NotImplemented
+
+    def __ne__(self, other: object) -> bool:
+        eq = self.__eq__(other)
+        return NotImplemented if eq is NotImplemented else not eq
+
+    def __hash__(self) -> int:
+        return hash(self.status)
+
+
+def ok(detail: Optional[dict] = None) -> Result:
+    return Result(Status.OK, detail or {})
 
 
 class Mode(str, Enum):
@@ -59,7 +97,7 @@ class EventKind(str, Enum):
 
 
 class TaskState(str, Enum):
-    """文档 §5.9 状态机。"""
+    """文档 §5.9 **表 A**：任务 / Agent 状态机。"""
     PLANNED = "PLANNED"
     ADMITTED = "ADMITTED"
     INSTANTIATING = "INSTANTIATING"
@@ -72,13 +110,79 @@ class TaskState(str, Enum):
     INADMISSIBLE = "INADMISSIBLE"
     REPLANNING = "REPLANNING"
     DONE = "DONE"
-    DONE_PARTIAL = "DONE_PARTIAL"
+    DONE_PARTIAL = "DONE_PARTIAL"   # 兼容保留：归属 RunState，S4 从 TaskState 移除
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     DEAD_LETTER = "DEAD_LETTER"
 
 
-TERMINAL_STATES = {TaskState.DONE, TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER}
+class RunState(str, Enum):
+    """文档 §5.9 **表 B**：Run 状态机（阶段一只定义，MS4 启用）。"""
+    NEW = "NEW"
+    PLANNING = "PLANNING"
+    RUNNING = "RUNNING"
+    DONE = "DONE"
+    DONE_PARTIAL = "DONE_PARTIAL"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+TASK_TERMINAL = frozenset({
+    TaskState.DONE, TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
+})
+RUN_TERMINAL = frozenset({
+    RunState.DONE, RunState.DONE_PARTIAL, RunState.FAILED, RunState.CANCELLED,
+})
+
+# 兼容旧名（历史代码引用，S4 清理）
+TERMINAL_STATES = TASK_TERMINAL
+
+
+TRANSITIONS: dict[tuple[TaskState, str], TaskState] = {
+    (TaskState.PLANNED, "try_admit"): TaskState.ADMITTED,
+    (TaskState.PLANNED, "try_admit_rejected"): TaskState.INADMISSIBLE,
+    (TaskState.ADMITTED, "instantiate"): TaskState.INSTANTIATING,
+    (TaskState.ADMITTED, "instantiate_failed"): TaskState.FAILED,
+    (TaskState.INSTANTIATING, "spawn"): TaskState.READY,
+    (TaskState.INSTANTIATING, "spawn_failed"): TaskState.FAILED,
+    (TaskState.READY, "schedule"): TaskState.RUNNING,
+    (TaskState.RUNNING, "finish_ok"): TaskState.DONE,
+    (TaskState.RUNNING, "request_approval"): TaskState.WAITING_APPROVAL,
+    (TaskState.RUNNING, "verifier_failed"): TaskState.REBASING,
+    (TaskState.RUNNING, "transient_error"): TaskState.RETRYING,
+    (TaskState.RUNNING, "no_progress"): TaskState.FAILED,
+    (TaskState.WAITING_APPROVAL, "resume"): TaskState.RUNNING,
+    (TaskState.WAITING_APPROVAL, "timeout"): TaskState.FAILED,
+    (TaskState.REBASING, "patch_applied"): TaskState.RUNNING,
+    (TaskState.REBASING, "replan_required"): TaskState.REPLANNING,
+    (TaskState.REBASING, "replan_budget_exhausted"): TaskState.QUARANTINED,
+    (TaskState.RETRYING, "retry"): TaskState.RUNNING,
+    (TaskState.RETRYING, "restart_window_exceeded"): TaskState.QUARANTINED,
+    (TaskState.RETRYING, "schema_failed"): TaskState.FAILED,
+    (TaskState.QUARANTINED, "escalate"): TaskState.REPLANNING,
+    (TaskState.QUARANTINED, "replan_budget_exhausted"): TaskState.DEAD_LETTER,
+    (TaskState.REPLANNING, "new_plan"): TaskState.PLANNED,
+    (TaskState.INADMISSIBLE, "escalate"): TaskState.REPLANNING,
+    (TaskState.INADMISSIBLE, "give_up"): TaskState.FAILED,
+}
+
+# 表 A 末行：除终态外，任何状态遇用户取消 → CANCELLED
+CANCELLABLE = frozenset(set(TaskState) - set(TASK_TERMINAL))
+
+
+def advance(acb: "ACB", event: str) -> Result:
+    """状态机**唯一**写入口（D10）。非法转移返回 INVALID_INPUT（不新增错误码）。"""
+    src = acb.state
+    if event == "cancel":
+        if src in CANCELLABLE:
+            acb.state = TaskState.CANCELLED
+            return Result(Status.OK, {"from": src.value, "to": TaskState.CANCELLED.value})
+        return Result(Status.INVALID_INPUT, {"from": src.value, "event": event})
+    dst = TRANSITIONS.get((src, event))
+    if dst is None:
+        return Result(Status.INVALID_INPUT, {"from": src.value, "event": event})
+    acb.state = dst
+    return Result(Status.OK, {"from": src.value, "to": dst.value})
 
 
 @dataclass
@@ -96,8 +200,21 @@ class Lease:
     resource: str
     agent_id: str
     epoch: int
-    ttl_ms: int
+    ttl_ms: int = 5000
     valid: bool = True
+    mode: str = "W"            # "R" | "W"（S2 起由 reserve 显式传入）
+    expires_at: int = 0        # 注入时钟的毫秒时间戳（0 = 不按时间过期）
+
+
+@dataclass
+class Reservation:
+    """预算预留句柄（S4 起 `reserve` 返回它，`release` 幂等）。"""
+    reservation_id: str
+    node_id: str
+    amount: int
+
+    def __bool__(self) -> bool:
+        return True
 
 
 @dataclass
@@ -110,6 +227,10 @@ class Event:
     producer: str = ""
     caused_by: str = ""
     idempotency_key: str = ""
+    event_id: str = ""          # ulid/uuid：恢复去重键
+    run_id: str = ""
+    ts: int = 0                 # epoch ms（来自注入时钟）
+    schema_version: int = 1
 
 
 @dataclass
@@ -154,14 +275,18 @@ class ACB:
     logical_subgoal_id: str = ""          # I7 幂等键基准（v1.10 修复 P0-2）
     generation: int = 1
     state: TaskState = TaskState.PLANNED
+    spec: dict = field(default_factory=dict)
+    capability: Any = None
     read_set: dict = field(default_factory=dict)
     base_version: dict = field(default_factory=dict)
     staged: dict = field(default_factory=dict)
+    pre_image: dict = field(default_factory=dict)   # resource -> 前像 blob hash（供补偿）
     materialized: dict = field(default_factory=dict)
     cursor: int = 0
     subscriptions: set = field(default_factory=set)
     event_log: list = field(default_factory=list)
     budget_node: Any = None
+    leases: list = field(default_factory=list)
     deadline: Optional[int] = None
     step: int = 0
     heartbeat_at: int = 0
@@ -172,6 +297,9 @@ class ACB:
     hitl_result: Any = None
     retried: int = 0
     no_progress_steps: int = 0
+    last_action_sig: Optional[str] = None
     retry_budget: int = 3
+    trace_id: str = ""
+    span_id: str = ""
     parent: "ACB | None" = None
     children: list = field(default_factory=list)
