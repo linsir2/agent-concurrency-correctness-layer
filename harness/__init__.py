@@ -32,6 +32,7 @@ from .context import ContextAssembler
 from .runtime import AgentRuntime
 from .orchestration import Planner, Dispatcher, Scheduler, RunCoordinator, ReconcileLoop, HITL
 from .harness import Harness
+from .rebase import (MISSING, DELETE, Conflict, MergePolicy, MergeResult, merge3)
 
 __all__ = [
     "Resource", "Lease", "Event", "ACB", "Write", "Decision", "Action",
@@ -44,4 +45,5 @@ __all__ = [
     "PolicyEngine", "CapabilityToken", "ContextAssembler", "AgentRuntime",
     "Planner", "Dispatcher", "Scheduler", "RunCoordinator", "ReconcileLoop", "HITL",
     "Harness",
+    "MISSING", "DELETE", "Conflict", "MergePolicy", "MergeResult", "merge3",
 ]
