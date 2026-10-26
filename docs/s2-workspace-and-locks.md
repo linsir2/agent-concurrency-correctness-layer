@@ -2,12 +2,12 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | **v1.1（已按三路评审修订）** |
+| 版本 | **v1.2（已确认 D-4/D-6 取舍）** |
 | 日期 | 2026-10-26 |
 | 上游 | [第一阶段方案 v1.1](phase1-implementation-plan.md) §4.5/§4.6/§5.1/§6、[设计规范 v1.12](multi-agent-harness-design-final.md) §5.4/§6.1/§7.4 |
-| 覆盖测试 | T4（提交点 vs manifest）、T5（读集合陈旧 + `detail.resource`）、T5b（租约时钟过期）、T7（锁序不死锁） |
-| 交付判据 | 上述 4 组测试绿 + **原有 49 测试全绿** |
-| 修订 | v1.0 → v1.1：修 5 个 P0 + 12 个 P1（逐条见 §11） |
+| 覆盖测试 | T4（提交点 vs manifest + 前像重建）、T5（读集合陈旧 + `detail.resource`）、T5b（租约时钟过期）、T7（锁序不死锁） |
+| 交付判据 | 上述 4 组测试绿 + **原有 49 测试全绿**（其中 11 个需按 §7 调整版本基线） |
+| 修订 | v1.1 → v1.2：`put` 改为**推进版本**（D-4）；前像**随 WAL 重建**（D-6）；补 11 个测试的基线调整清单 |
 
 ---
 
@@ -15,7 +15,7 @@
 
 | 级别 | 问题 | 处置 |
 |---|---|---|
-| **P0** | `put` 若推进版本，会打挂 11 个以 `version==0` 为基线的测试 | `put` **不推进版本**（新资源 version=0），只写种子事件（§5.2） |
+| **P0** | `put` 推进版本会让 11 个以 `version==0` 为基线的测试失效 | **v1.2 已确认改为推进版本**，并把这 11 个测试改为**相对基线**（§7 清单），而不是靠语义特例绕开 |
 | **P0** | `put` 写 `WORKSPACE_COMMITTED`，但重建只认 `RESOURCE_COMMITTED` → 重启丢种子 | 重建**同时识别两种 kind**（§5.7） |
 | **P0** | `commit_batch` 归属二义（Harness vs WorkspaceManager） | **公共入口固定在 `Harness.commit_batch`**；workspace 只提供「已持锁」内部步骤（§5.5） |
 | **P0** | `path_of` 未定义 | 改为**可选注入**，默认 `None` = 不做磁盘物化（§5.5） |
@@ -191,16 +191,16 @@ def get(self, resource: str):
 - **类型约定**：只保证 `dict/list/str/int/float/bool/None/bytes` 往返；tuple/set 会退化为 list/str（`canonical_bytes` 的 `default=str`）。
 - **None 歧义**：资源不存在与「内容为 None」都返回 `None`；约定**内容不得为 None**（`put`/`commit_batch` 对 None 内容返回 `INVALID_INPUT`）。
 
-### 5.2 `put`（种子，**不推进版本**）
+### 5.2 `put`（upsert，**推进版本**；D-4 已确认）
 
 ```python
 def put(self, resource: str, content) -> ManifestEntry:
-    """种初始内容：新资源 version=0；已存在则原地替换内容（仅供夹具/初始化）。"""
+    """upsert：每次 put 都是一个新版本（与 commit_batch 同一套版本语义）。"""
     if content is None:
         raise ValueError("资源内容不得为 None（与「不存在」歧义）")
     blob_hash = self._blobs.put(canonical_bytes(content))
     cur = self.manifest.get(resource)
-    version = cur.version if cur else 0
+    version = (cur.version if cur else 0) + 1        # ← 推进版本
     entry = ManifestEntry(version=version, blob_hash=blob_hash,
                           prev_hash=cur.blob_hash if cur else "")
     self.manifest[resource] = entry
@@ -212,7 +212,16 @@ def put(self, resource: str, content) -> ManifestEntry:
     return entry
 ```
 
-**为什么不推进版本**：11 个现有测试以 `version==0` 为基线（I10 断言 `version("r")==0`，I1/I2/I6/I8/U1/U2/U3/A1/A3 用 `base_version=0`）。`put` 是**种子**，不是运行期更新；运行期更新必须走 `commit_batch`。
+**D-4 的代价（已确认接受）**：种子后 `version` 为 **1**（不是 0），因此 **11 个以 `version==0` 为基线的测试需要调整**（清单见 §7）。调整原则：**不再硬编码版本号，改为相对基线**——
+
+```python
+v0 = seed(h, "r", "v0")          # seed 返回 put 后的版本（=1）
+acb.base_version["r"] = v0
+...
+assert h.workspace.version("r") == v0 + 1
+```
+
+> 这比硬编码更稳：以后 `put` 语义再变，测试不用跟着改数字。
 
 ### 5.3 `stage`（覆盖，不 setdefault）
 
@@ -346,7 +355,7 @@ def _apply_locked(self, acb, w, blob_hash, prev_hash):
 - `path_of` **可选注入**（`WorkspaceManager(..., path_of=None)`）：默认不物化，读路径只看 manifest+blob。demo/bench 传 `lambda r: f"/tmp/ws/{r}"`。
 - `_versions.record` 保留：A1/A3 依赖它取前像内容做 reverse patch。
 
-### 5.7 `recover` / manifest 重建
+### 5.7 `recover` / manifest + 前像重建（D-6 已确认）
 
 ```python
 def _rebuild_from_events(self) -> None:
@@ -356,17 +365,26 @@ def _rebuild_from_events(self) -> None:
             continue
         resource = p.get("resource") or ev.subject
         blob_hash = p.get("blob_hash")
+        prev_hash = p.get("prev_hash", "")
         if not resource or not blob_hash:
             continue                              # 旧格式事件：跳过
         version = int(p.get("version", 0))
         cur = self.manifest.get(resource)
         if cur is not None and version < cur.version:
             continue                              # 版本回退：忽略（不静默覆盖）
+        # D-6：前像重建 —— 上一版本的 blob 就是 version-1 的内容
+        if prev_hash and self._blobs.exists(prev_hash):
+            self._versions.record(resource, version - 1, self._decode(prev_hash))
         self.manifest[resource] = ManifestEntry(
-            version=version, blob_hash=blob_hash, prev_hash=p.get("prev_hash", ""))
+            version=version, blob_hash=blob_hash, prev_hash=prev_hash)
 ```
 
-`WorkspaceManager.__init__` 末尾调用 → 同一份 WAL 重开，manifest 自动一致（T4 判据）。
+**D-6 的关键点**：
+- `prev_hash` 是**上一版本的内容指纹**，因此 `version-1` 的前像可无损恢复 → 崩溃后 `compute_reverse_patch` 不再返回 `None`，补偿不会退化为 PIVOT。
+- `_versions.record` 必须**按 `(resource, version)` 去重**（重放会多次遇到同一版本），否则快照列表膨胀。
+- `prev_hash` 对应的 blob 必须存在（`blobs.exists`）；不存在说明 blob 被 GC 或从未落盘 → 跳过并留给 S3 的孤儿检测。
+
+`WorkspaceManager.__init__` 末尾调用 → 同一份 WAL 重开，manifest **与前像**都自动一致（T4 判据）。
 
 ---
 
@@ -415,11 +433,27 @@ def _base_of(self, acb, resource) -> int:
 | `harness/protocols.py` | `Workspace.prepare/apply -> Result`；补 `lock_for`/`put`/`get`/`version`/`content_hash`；`IntentRegistry.reserve` 的 `mode` 默认与实现统一 |
 | `harness/runtime.py` | 删除 `stage` 后重复的 `read_set.setdefault`（`stage` 已负责）；`st.value` 继续可用（`Result.value`） |
 | `harness/context.py` | `workspace.get()` 返回值从 deepcopy 变 JSON 解码（语义等价）；无代码改动，仅确认 |
-| `tests/conftest.py` | `make_harness(run_limits=1000, *, clock=None, blobs=None)` |
-| `tests/test_adversarial.py` | A12 的 `t.join()` → `join(timeout=5)` + `is_alive()` |
+| `tests/conftest.py` | `make_harness(run_limits=1000, *, clock=None, blobs=None)`；`seed()` **返回 put 后的版本** |
+| `tests/test_ms8_conformance.py` | I1/I2/I6/I8/I10：`base_version`/`version` 断言改为**相对基线**（`v0 = seed(...)`） |
+| `tests/test_real_cases.py` | U1/U1-B/U2/U3：同上 |
+| `tests/test_adversarial.py` | A1/A3：同上；A12 的 `t.join()` → `join(timeout=5)` + `is_alive()` |
 | `pyproject.toml` | 增加 `faulthandler_timeout = 10` |
 
-**明确不改**：11 个以 `version==0` 为基线的测试（靠 §5.2 的「put 不推版本」保住）；A1/A3（靠 `_versions.record` 保住前像）。
+**D-4 影响的 11 个测试（必须逐个改基线，不能只改数字）**：
+
+| 测试 | 现状 | 改法 |
+|---|---|---|
+| `test_i1_single_writer_commit` | `seed("r")` 后 `base_version=0`，断言 `version==1` | `v0 = seed(...)`；`base_version=v0`；断言 `v0+1` |
+| `test_i2_no_lost_update` | 同上 | 同上 |
+| `test_i6_context_causal` | 5 次提交后断言 `view` 与 `seqs` | `v0 = seed(...)`，只断言内容与 seq 单调（不断言绝对版本） |
+| `test_i8_event_atomic_with_replace` | 断言 `version("r")==1` | 断言 `v0+1` |
+| `test_i10_private_workspace_isolated` | 断言 `version("r")==0` | 断言 `v0`（seed 后未再提交） |
+| `test_u1_parallel_refactor_serial_branch` | 断言 `1/2/3` | 断言 `v0+1/v0+2/v0+3` |
+| `test_u1_parallel_refactor_concurrent_conflict_and_merge` | 断言 `version==2` | `v0+1` |
+| `test_u2_parallel_review_conflict_and_rebase` | 断言 `version==2` | `v0+1` |
+| `test_u3_batch_migration_json_aware_merge` | 断言 `version==5` | `v0+4`（4 次提交）或 `v0+5`，按实际提交次数 |
+| `test_a1_compensation_cross_no_overwrite` | 用 `base_version=0` | 用 `v0` |
+| `test_a3_compensation_crash_midway` | 依赖 seed 快照 | 用 `v0` 作为 base；前像由 `_versions.record` 提供 |
 
 ---
 
@@ -434,43 +468,47 @@ def test_ms1_commit_point_is_wal(tmp_path):
     log = WalEventLog(wal_path)
     ws = WorkspaceManager(log, IntentRegistry(), blobs=blobs)
     ws.put("r", "v0")
+    v0 = ws.version("r")                     # = 1（put 推进版本）
     h = Harness(event_log=log, blobs=blobs, workspace=ws)
-    acb = _acb(h, "r")                       # 见下方 helper
+    acb = _acb(h, "r")
+    acb.base_version["r"] = v0
     assert h.commit_batch(acb, [Write("r", content={"v": 1})]) == Status.OK
     hash_before = ws.content_hash("r")
-    assert ws.version("r") == 1
+    assert ws.version("r") == v0 + 1
     log.close()
 
     # 丢弃实例，用同一 WAL + 同一 blob 目录重建
     log2 = WalEventLog(wal_path)
     ws2 = WorkspaceManager(log2, IntentRegistry(), blobs=blobs)
-    assert ws2.version("r") == 1             # 种子(0) + 提交(1) 都被重放
+    assert ws2.version("r") == v0 + 1        # 种子 + 提交 都被重放
     assert ws2.get("r") == {"v": 1}
     assert ws2.content_hash("r") == hash_before
+    # D-6：前像也重建（version-1 的内容 = 种子内容）
+    assert ws2._versions.get("r", v0) == "v0"
 ```
 
-> 注意：`put` 的种子事件也必须被重放，否则 `version("r")` 只有 1 但 `get` 依赖的 blob 仍在——T4 用 `version==1` + `get` 双断言覆盖这一点。
+> 两个关键点：① `put` 推进版本后种子是 `1`、提交后是 `2`，所以断言一律用 `v0`/`v0+1`；② `put` 的种子事件也必须被重放，否则 `get` 依赖的 blob 仍在但 manifest 缺条目。
 
 ### T5 `test_ms1_occ_readset_rejects_stale`
 
 ```python
 def test_ms1_occ_readset_rejects_stale():
     h = make_harness()
-    seed(h, "r", "v0"); seed(h, "dep", "d0")
+    v_r = seed(h, "r", "v0"); v_dep = seed(h, "dep", "d0")
     plan = h.planner.plan("T", [{"task_id": "T1"}, {"task_id": "T2"}])
     h.plans["T"] = plan
     a = admit(h, "T", plan, "T1"); b = admit(h, "T", plan, "T2")
 
-    a.base_version["r"] = 0
-    a.read_set["dep"] = 0                    # 读过 dep@0，但没读 r
-    b.base_version["dep"] = 0
+    a.base_version["r"] = v_r
+    a.read_set["dep"] = v_dep                # 读过 dep，但没读 r
+    b.base_version["dep"] = v_dep
     assert h.commit_batch(b, [Write("dep", content="B")]) == Status.OK
-    assert h.workspace.version("dep") == 1
+    assert h.workspace.version("dep") == v_dep + 1
 
     r = h.commit_batch(a, [Write("r", content="A")])
     assert r == Status.REJECT_STALE_READ     # base(r) 命中 → 隔离到读集合检查
     assert r.detail["resource"] == "dep"
-    assert h.workspace.version("r") == 0
+    assert h.workspace.version("r") == v_r
     assert h.workspace.get("r") == "v0"
 ```
 
@@ -503,14 +541,14 @@ def test_ms1_lease_expiry_uses_injected_clock():
 def test_ms1_lock_order_no_deadlock():
     h = make_harness()
     h.lock_timeout_s = 30.0                  # 让真死锁表现为「线程未结束」而非超时返回
-    seed(h, "a", 0); seed(h, "b", 0)
+    v_a = seed(h, "a", 0); v_b = seed(h, "b", 0)
     errors, results = [], []
     barrier = threading.Barrier(2)
 
     def worker(order):
         try:
             acb = _acb(h, order[0])
-            acb.base_version.update({"a": 0, "b": 0})
+            acb.base_version.update({"a": v_a, "b": v_b})
             barrier.wait(timeout=5)
             results.append(h.commit_batch(
                 acb, [Write(order[0], content=1), Write(order[1], content=1)]))
@@ -525,7 +563,7 @@ def test_ms1_lock_order_no_deadlock():
     assert all(not t.is_alive() for t in ts), "线程未在期限内结束 → 疑似死锁"
     assert not errors
     assert all(r == Status.OK for r in results), f"提交失败（非 OK）: {results}"
-    assert h.workspace.version("a") == 1 and h.workspace.version("b") == 1
+    assert h.workspace.version("a") == v_a + 1 and h.workspace.version("b") == v_b + 1
     assert len(h.workspace._locks) >= 2, "仍是单锁 → 本测试无意义（假通过）"
 ```
 
@@ -550,9 +588,9 @@ def _acb(h, resource):
 | D-1 | `base_version` 对**未读资源**回退到提交时版本 | OCC「没读不校验」；`stage` 已保证已读资源恒等 | write-only 提交无保护；需显式 `stage` |
 | D-2 | 公共 `prepare` 自己取锁；`commit_batch` 持全锁调 `_validate_locked` | 设计 §5.4 是逐阶段加锁，phase1 §5.1 是批量全序；用「两入口」同时满足 | 两个入口的语义必须由同一个 `_validate_locked` 保证 |
 | D-3 | 锁超时不重试，返回 `UPSTREAM_FAILED` | 重试需随机抖动，属 MS4 Supervisor | 高争用下多一次失败 |
-| D-4 | `put` 不推进版本（种子语义） | 11 个现有测试以 version=0 为基线 | 运行期误用 `put` 会绕过版本推进；靠文档 + 测试约束 |
+| D-4 | `put` **推进版本**（upsert） | **已确认（用户决策）**：与 `commit_batch` 同一套版本语义，避免「种子/运行期」两套规则 | 11 个测试需改相对基线（§7 已列） |
 | D-5 | 不兼容旧格式 WAL（无 `blob_hash` 的事件跳过） | 无线上数据 | 复用旧 WAL 会丢 manifest |
-| D-6 | `WorkspaceVersionStore` 前像**不随 WAL 重建** | 需要 `prev_hash → blob` 反查，属 S3 的 Delete/补偿范围 | 崩溃后补偿退化为 PIVOT（S3 修，T6 在 S3） |
+| D-6 | 前像**随 WAL 重建** | **已确认（用户决策）**：`prev_hash` 就是上一版本指纹，可无损恢复 → 崩溃后补偿不退化为 PIVOT | 重建时必须 `blobs.exists(prev_hash)`，并按键去重 |
 | D-7 | `is_valid` 无锁只读 | 避免 L3→L0 反向取锁 | 单进程可接受；跨进程需 MS9 fencing |
 | D-8 | S2 不提供 `prune` | prune 会造成锁身份漂移、互斥失效 | 长跑进程锁表增长（阶段一有界） |
 
@@ -601,3 +639,11 @@ def _acb(h, resource):
 | 中 | `lock_timeout_ms` 未定义/未注入 | 提为 `Harness.lock_timeout_s`，默认 5s，T7 设 30s（§4.4） |
 | 中 | `is_valid` 可能在 L3 内取 L0 锁 | 规定 `is_valid` 无锁只读（§6.4） |
 | 低 | `acb.subscriptions` 未纳入复验 | 阶段一 `stage` 同步写 `read_set`，等价；差异记录在案（§5.4） |
+
+### v1.1 → v1.2（用户确认取舍后）
+
+| 决策 | v1.1 | v1.2 | 连带影响 |
+|---|---|---|---|
+| **D-4** | `put` 不推版本（为保住 11 个测试） | **`put` 推进版本**（upsert） | 11 个测试改为相对基线（§7 清单）；`seed()` 返回版本 |
+| **D-6** | 前像不重建，补偿崩溃后降级 PIVOT | **前像随 WAL 重建**（`prev_hash → blob`） | `_versions.record` 需按 `(resource, version)` 去重；T4 增加前像断言 |
+| D-1 | 未读资源回退 | 不变（**已确认**） | — |
