@@ -618,7 +618,7 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S0** | `pyproject.toml` + markers + `protocols.py` + `types.py`（Event/Result/TaskState/RunState/TRANSITIONS）+ `clock.py` + 注入图 + deny-by-default | ① `pytest --markers` 输出含 `ms0..ms3`；② `-m ms0` 能选出子集；③ **原有 35 测试全绿 + 新增 9 个骨架测试**（共 44） |
 | **S1** | `storage/atomic.py` + `blob.py` + `wal.py` + `WalEventLog` + `InMemoryBlobStore`/`FileBlobStore` | T1、T2、T3 绿 + 重放重建 seq/索引（T4 的 manifest 一致性随 S2 的 manifest 一起验） |
 | **S2** | `intent_registry`（注入时钟）+ `workspace`（manifest/blob/锁序/base_version 恒等）+ `Harness.commit_batch` 全序持锁 | T4、T5、T5b、T7 绿 + `test_a9_lease_renew_revoke_race` 绿（详见 [S2 详细方案](s2-workspace-and-locks.md)） |
-| **S3** | `rebase.py` + `handle_commit_result` + `Delete` 哨兵补偿 | T6、T8 + `test_a1_compensation_cross_no_overwrite` 绿 |
+| **S3** | `rebase.py`（结构化冲突的 merge3）+ `handle_commit_result`（冲突→rebase→有界重试→QUARANTINED）+ `Delete` 哨兵补偿 | T6、T8、T20、T21、T22 + `test_a1_compensation_cross_no_overwrite` 绿（详见 [S3 详细方案](s3-rebase-and-compensation.md)） |
 | **S4** | `budget`（Reservation + 幂等 release）+ `dispatcher`（回滚）+ `policy`（deny-by-default + default_token） | T9、T10、T14 + `test_a4_budget_double_spend`、`test_a12_concurrent_reserve_no_overcommit`、`test_a13_per_action_guard_budget` 绿 |
 | **S5** | `EffectJournal`（probe）+ `CompensationJournal`（落盘 + 幂等键）+ `recover`（resume_policy） | T11、T12、T13 + `test_u4_long_task_crash_recovery_idempotent` 绿 |
 | **S6** | `runtime`（表驱动 + guard + 续租）+ `run_task` 走 dispatcher + `snapshot` | T19 + U1×2、U2、U3 绿 |

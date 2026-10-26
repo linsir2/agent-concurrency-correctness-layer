@@ -9,3 +9,6 @@ venv/
 .hypothesis/
 .coverage
 coverage.xml
+.env
+.env.*
+!.env.example
