@@ -21,7 +21,7 @@ from .types import (
     TRANSITIONS, advance,
 )
 from .clock import Clock, SystemClock, ManualClock
-from .event_log import EventLog
+from .event_log import EventLog, WalEventLog
 from .intent_registry import IntentRegistry
 from .workspace import WorkspaceManager, WorkspaceVersionStore
 from .budget import BudgetManager
@@ -39,7 +39,7 @@ __all__ = [
     "Status", "Mode", "EventKind", "TaskState", "RunState",
     "TASK_TERMINAL", "RUN_TERMINAL", "TRANSITIONS", "advance",
     "Clock", "SystemClock", "ManualClock",
-    "EventLog", "IntentRegistry", "WorkspaceManager", "WorkspaceVersionStore",
+    "EventLog", "WalEventLog", "IntentRegistry", "WorkspaceManager", "WorkspaceVersionStore",
     "BudgetManager", "CheckpointStore", "EffectJournal", "SubscriptionRegistry",
     "PolicyEngine", "CapabilityToken", "ContextAssembler", "AgentRuntime",
     "Planner", "Dispatcher", "Scheduler", "RunCoordinator", "ReconcileLoop", "HITL",
