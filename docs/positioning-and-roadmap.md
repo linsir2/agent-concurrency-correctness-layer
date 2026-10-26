@@ -7,7 +7,7 @@
 | 版本 | **v2.0（含 agent OS 判定 + 交叉对齐 + 终审修订计划）** |
 | 日期 | 2026-10-26 |
 | 输入 | 4 个调研子智能体 + 3 个审查子智能体（交叉对齐 / agent OS 判定 / 终审） |
-| 前置文档 | [多智能体 Harness 设计规范 v1.11](multi-agent-harness-design-final.md) |
+| 前置文档 | [多智能体 Harness 设计规范 v1.12](multi-agent-harness-design-final.md) |
 | 结论 | **不是 Agent OS**，是「Agent OS 的并发/事务子系统」——即 **Agent Concurrency Correctness Layer** |
 
 ---
@@ -458,7 +458,7 @@
 
 ### B.1 分层归属表
 
-> **编号说明**：本表的 **L1–L5 是「交付归属层」**（L1 核心 / L2 规范 / L3 托管运行时 / L4 编排适配 / L5 删除），与附录 A 的 **Agent OS 栈层 L0–L5** 是**两套正交的编号**。
+> **编号说明**：本表的 **L1–L5 是「交付归属层」**（L1 核心 / L2 规范 / L3 托管运行时 / L4 编排适配 / L5 不交付），与附录 A 的 **Agent OS 栈层 L0–L5** 是**两套正交的编号**。
 
 | v1.1 组件/能力 | v1.1 章节 | 归属 | 理由 |
 |---|---|---|---|
@@ -489,9 +489,9 @@
 | **AgentRuntime（单 agent 循环）** | §4.2 | **L4**（adapter 钩子） | 红线 4 |
 | **spawn_child 嵌套派生** | §5.2⑦ | **L4** | 编排 |
 | **HITL 审批台** | §9.3 | **L4** | 产品/编排 |
-| **Trace/Audit（OTel span）** | §4.2/§9.2 | **L5**（删除） | 红线 2 |
-| **SecretBroker** | §4.2 | **L5**（或 L4） | 平台能力 |
-| **MemoryStore / §6.2 记忆分层** | §4.2/§6.2 | **L5**（删除） | 非并发正确性 |
+| **Trace/Audit（OTel span）** | §4.2/§9.2 | **L5**（不交付，只留接口契约） | 红线 2 |
+| **SecretBroker** | §4.2 | **L5**（不交付，只留接口契约） | 平台能力 |
+| **MemoryStore / §6.2 记忆分层** | §4.2/§6.2 | **L5**（不交付，只留接口契约） | 非并发正确性 |
 | **收据格式 / conformance suite** | — | **L2**（新增） | 规范四件套 |
 | **资源模型（符号/键/外部副作用）** | — | **L2**（补全） | ResourceSpec 仅 FILE/DIR/DB_ROW/API/CONTRACT/INVARIANT |
 | **协调协议（GRANT/WAIT/DIE）** | — | **L2**（补全） | v1.1 只有 RSC |

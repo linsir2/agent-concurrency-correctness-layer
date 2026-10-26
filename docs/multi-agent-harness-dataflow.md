@@ -9,6 +9,7 @@
 | 前置文档 | [四层读写分区与并发上下文设计](multi-agent-rw-partition-design.md) · [OS ↔ 多智能体双向映射](os-to-multiagent-mapping.md) · [派发与运行架构方案 v0.2](multi-agent-dispatch-architecture.md) |
 | 本轮输入 | 3 个子智能体：harness 能力清单调研 / OS·工作流引擎·Actor 运行时对比 / 对抗式数据流审计 |
 | 修订说明 | v0.3 修复了对抗式审计发现的 20 个问题（含 3 个致命），补全状态机，给出**可跑通的完整数据流**与 **5 个样例逐步验证** |
+| 状态 | **历史专题稿（已被 supersede）**：机制以 [设计规范 v1.12](multi-agent-harness-design-final.md) 为准；本文的 `L0–L4` 分层与 final 的 `P0–P5` 平面 / `L1–L5` 交付归属**不是同一套编号**，勿混用 |
 
 ---
 

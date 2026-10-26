@@ -7,7 +7,7 @@
 | 版本 | v1.2（含评审修复） |
 | 日期 | 2026-10-26 |
 | 输入 | 4 个调研子智能体（体系结构 / 物理·链路层 / 网络·传输层 / 设计思想）+ 1 个评审子智能体 |
-| 前置文档 | [并发正确性层设计规范 v1.6](multi-agent-harness-design-final.md) · [定位与路线 v2.0](positioning-and-roadmap.md) |
+| 前置文档 | [并发正确性层设计规范 v1.12](multi-agent-harness-design-final.md) · [定位与路线 v2.0](positioning-and-roadmap.md) |
 | 核心结论 | 计网是我们**最完整的对照系**：分层/窄腰、端到端原则、ARQ/FEC 权衡、拥塞控制、CSMA/CD —— 几乎逐条可迁移 |
 
 ---

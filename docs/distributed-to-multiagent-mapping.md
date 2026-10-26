@@ -5,7 +5,7 @@
 | 版本 | v1.0 |
 | 日期 | 2026-10-26 |
 | 输入 | 4 个调研子智能体（一致性理论 / 存储系统 / 事务与流处理 / 集群调度与协调） |
-| 前置 | [并发正确性层设计规范 v1.9](multi-agent-harness-design-final.md) · [定位与路线 v2.0](positioning-and-roadmap.md) |
+| 前置 | [并发正确性层设计规范 v1.12](multi-agent-harness-design-final.md) · [定位与路线 v2.0](positioning-and-roadmap.md) |
 | 核心结论 | 分布式系统是我们**最深层的设计祖先**：RSC ≈ OCC + Saga；EventLog ≈ WAL/LSM；idem_key ≈ Kafka 幂等生产者（内容指纹 vs 去重计数器，机制不同）；单写者 = **无复制的串行化点**（Raft = 带 quorum 复制的串行化点）；Z0–Z3 是**语义分区**，非一致性哈希分区 |
 
 > **标记约定**：【事实】= 论文/官方文档明确；【推断】= 映射建议（需验证）。

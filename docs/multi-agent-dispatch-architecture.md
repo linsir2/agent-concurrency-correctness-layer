@@ -9,6 +9,7 @@
 | 依据研究 | [四层读写分区与并发上下文设计](multi-agent-rw-partition-design.md) · [OS ↔ 多智能体双向映射](os-to-multiagent-mapping.md) |
 | 修订说明 | v0.2 修复了 v0.1 评审发现的 10 个 P0 数据流缺陷，并吸收独立设计的协议补强（RSC 提交协议、fencing token、effect journal、capability token、预算树、计划版本化、适用性门控） |
 | 形态 | 语言无关的架构规范 + 伪代码 + 时序图 |
+| 状态 | **历史专题稿（已被 supersede）**：机制以 [设计规范 v1.12](multi-agent-harness-design-final.md) 为准；本文的「单调 fencing token」已被「按租约有效性 + `intents.is_valid(lease)`」取代 |
 
 ---
 

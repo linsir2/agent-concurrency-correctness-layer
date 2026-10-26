@@ -4,11 +4,11 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | **v1.11（契约同步收口）** |
+| 版本 | **v1.12（交付前终审收口）** |
 | 日期 | 2026-10-26 |
 | 形态 | 语言无关的架构规范 + 伪代码 + 时序图 + 场景实测 + 无死角图集 |
 | 范围 | IDE 内派生的 sub-agent，共享同一工作区文件系统；单调度器 |
-| 说明 | v1.2–v1.10 累计；**v1.11 契约同步收口**：统一 `commit_batch`/`apply` 的 `mode`；补偿反写接入 `staged`；HITL resume 值入 ACB + 进入 ctx；`BUDGET_EXHAUSTED` 统一；§20 图集与 §4.1/§4.2 对齐；分布式文档删「去协调者 2PC」 |
+| 说明 | v1.2–v1.11 累计；**v1.12 交付前终审**：收口 L5 红线与 §4.1/§4.2 的冲突、§12 验收与「近似重放」的冲突、补偿缺 `COMPENSATING` 的崩溃安全缺口；补状态机缺边；消歧 I 编号；修正 §19 与修订记录的残留错误类比 |
 | 定位配套 | [定位与路线建议 v2.0](positioning-and-roadmap.md)（能力归属见其附录 B） |
 | 对照文档 | [计网 ↔ 多智能体](networking-to-multiagent-mapping.md) · [OS/DB ↔ 多智能体](os-to-multiagent-mapping.md) · [分布式 ↔ 多智能体](distributed-to-multiagent-mapping.md) |
 | 用例文档 | [用例集（4 真实 + 13 对抗）](use-cases-and-adversarial-tests.md) |
@@ -97,11 +97,13 @@
 | **L2 规范** | 阶段二交付 | 资源模型 / 协调协议 / 收据格式 / conformance suite |
 | **L3 托管运行时** | 阶段三交付 | 跨主机 fencing / 分布式租约 / 多租户 / Admin |
 | **L4 编排适配** | **参考实现，可替换** | Planner / PlanValidator(DAG) / Dispatcher(实例化) / Scheduler / Replanner / Aggregator / RunCoordinator / Ingress / Renderer / AgentRuntime / ApplicabilityGate / spawn_child / HITL |
-| **L5 删除/不做** | 红线 | Trace/Audit(OTel) / SecretBroker / MemoryStore |
+| **L5 不交付** | 红线：本文只约定**接口与强制点**，实现由宿主/平台提供 | Trace/Audit(OTel) / SecretBroker / MemoryStore |
 
 > **重要**：L4 组件**不是产品**，是「让我们能独立跑通端到端」的参考实现；实际集成时由 LangGraph/CrewAI 等宿主框架提供。
 >
-> **编号说明**：本文的 **L1–L5 是「交付归属层」**（L1 核心 / L2 规范 / L3 托管运行时 / L4 编排适配 / L5 删除），与定位文档附录 A 的 **Agent OS 栈层 L0–L5**（硬件/内核/运行时/用户态/治理/互联）是**两套正交的编号**。P0–P5 平面（§4.1）与 L1–L5 归属也正交（例如 Dispatcher 是 P3 平面、L1 交付）。
+> **v1.12 修复（P0）**：原表述为「L5 删除/不做」，与 §4.1/§4.2 把 `Trace/Audit`、`SecretBroker`、`MemoryStore` 定义为组件并给出强制点**直接冲突**。现改为「**L5 不交付**」：这些组件在架构图中保留位置（§4.1 以 `†` 标注），本文只规定它们的**接口契约与强制点**（如「每条工具调用一个 span」「密钥不进上下文」），不提供实现，也不进入 `harness/` 基线。
+>
+> **编号说明**：本文的 **L1–L5 是「交付归属层」**（L1 核心 / L2 规范 / L3 托管运行时 / L4 编排适配 / L5 不交付），与定位文档附录 A 的 **Agent OS 栈层 L0–L5**（硬件/内核/运行时/用户态/治理/互联）是**两套正交的编号**。P0–P5 平面（§4.1）与 L1–L5 归属也正交（例如 Dispatcher 是 P3 平面、L1 交付）。
 
 ---
 
@@ -131,6 +133,8 @@
 | **I4** | 隔离与故障域 | 一个单元的失败不能拖垮整体 |
 | **I5** | 权限与最小特权 | 危险操作必须被中介、被审计、可拒绝 |
 | **I6** | 可观测与可恢复 | 必须能看见发生了什么，并能从中断点继续 |
+
+> **v1.12 消歧（P1）**：本节 `I1–I6` 是**根本问题**编号（Root problems），与 §11 的**不变量** `I1–I14` 是**两套独立编号**，同号不同义（例：本节 I1 = 边界与信任；§11 I1 = 单写者提交）。引用时请写 `§1.3 I1` 或 `不变量 I1` 加以区分；`harness/spec/invariants.py` 与 conformance suite 中的 `I*` 一律指 §11 的不变量。
 
 ### 1.4 类比映射表（OS ↔ 多智能体）
 
@@ -269,15 +273,18 @@
 
 ```
 P5 接入面    Ingress（规范化/鉴权/用户幂等/流式输出/HITL 审批台）· Renderer（输出渲染）
-P4 治理面    PolicyEngine · BudgetManager · Trace/Audit · SecretBroker
+P4 治理面    PolicyEngine · BudgetManager · Trace/Audit† · SecretBroker†
 P3 控制面    ApplicabilityGate · Planner · PlanValidator · Dispatcher · Scheduler
              Supervisor · Replanner · Aggregator · RunCoordinator
 P2 执行面    AgentRuntime · ContextAssembler · ModelGateway · ToolGateway
              WorkspaceManager · VerifierRunner
 P1 状态面    EventLog · PlanStore · ArtifactStore · WorkspaceVersionStore · CheckpointStore
-             IntentRegistry · EffectJournal · MemoryStore · SubscriptionRegistry
+             IntentRegistry · EffectJournal · MemoryStore† · SubscriptionRegistry
 P0 底座      沙箱/容器 · FS overlay · 网络出口 · 资源限制
 ```
+
+> **† = L5 不交付**（§0.5）：只在本文约定接口与强制点，实现由宿主/平台提供；`harness/` 基线不含这些组件。
+> **交付归属补充（v1.12）**：`AgentRuntime` 属 **L4 参考实现**（§0.5），与 `P2 执行面` 的平面划分正交；`Dispatcher`/`Supervisor` 属 **P3 控制面 + L1 核心**，两者不矛盾（平面 ≠ 交付归属）。
 
 ### 4.2 组件与职责
 
@@ -308,11 +315,11 @@ P0 底座      沙箱/容器 · FS overlay · 网络出口 · 资源限制
 | **EventLog** | P1 | 追加式全序事件、WAL、重放 | 单序列器 |
 | **SubscriptionRegistry** | P1 | 订阅注册与路由 | 读即订阅 |
 | **CheckpointStore** | P1 | 每步 ACB + workspace commit + effect offset + staged | 恢复不重复副作用 |
-| **PlanStore / ArtifactStore / WorkspaceVersionStore / MemoryStore** | P1 | 计划 / 内容寻址产物 / 资源版本 / 记忆分层 的持久化 | — |
+| **PlanStore / ArtifactStore / WorkspaceVersionStore / MemoryStore†** | P1 | 计划 / 内容寻址产物 / 资源版本 / 记忆分层 的持久化 | — |
 | **BudgetManager** | P4 | 配额树、reserve/consume/release | 父约束不可突破 |
 | **PolicyEngine** | P4 | 能力定义、工具/路径/网络/数据分级；签发 `CapabilityToken`（工具/路径/网络三维 scope） | gateway 调用 |
-| **Trace/Audit** | P4 | OTel span、成本归因、审计 | 每条工具调用一个 span |
-| **SecretBroker** | P4 | 按能力短期发放密钥 | 密钥不进上下文 |
+| **Trace/Audit†** | P4 | OTel span、成本归因、审计 | 每条工具调用一个 span（L5 不交付） |
+| **SecretBroker†** | P4 | 按能力短期发放密钥 | 密钥不进上下文（L5 不交付） |
 
 ### 4.3 边界规则
 
@@ -763,7 +770,7 @@ function ws.apply(acb, w, lease, mode) -> Status:
         unlock(w.resource); return REJECT_STALE
     if mode == COMMIT:                                // v1.9 修复（P0-1）：补偿模式跳过
         if acb.base_version[w.resource] != w.resource.version:
-            unlock(w.resource); return CONFLICT(w.resource.version, null)
+            unlock(w.resource); return CONFLICT(w.resource.version, compute_diff(w.resource))  // v1.12 修复（P1）：必须带 diff，否则 rebase 无输入
         for r in acb.subscriptions ∩ acb.read_set:   // v1.2：apply 内复验读集合（消除陈旧读 TOCTOU）
             if acb.read_set[r] != ws.version(r):
                 unlock(w.resource); return REJECT_STALE_READ(r)
@@ -823,6 +830,7 @@ function compensate(acb, applied):
             mark_pivot(w)                    // 已不可逆 → 记录 pivot，交人工
             compensation_journal.write(PIVOT, w); continue
         acb.staged[w.resource] = reverse     // v1.10 修复（P0）：反写内容接入 staged（否则会重复前写）
+        compensation_journal.write(COMPENSATING, w)      // v1.12 修复（P0）：先落「补偿中」意图，崩溃后可续做
         st = commit_batch(acb, [w], mode = COMPENSATE)   // 带补偿幂等键
         if st == REJECT_COMPENSATE:
             mark_pivot(w); compensation_journal.write(PIVOT, w); continue  // v1.7：期间被改，不得覆写
@@ -839,6 +847,8 @@ function compensate(acb, applied):
 - **补偿前先释放外层租约**（消除 H3 自冲突）。
 - **提交前快照**：`ws.stage()` 时把前像写入 `WorkspaceVersionStore`（消除 H4 无输入）。
 - **补偿崩溃安全**：`compensation_journal`（`COMPENSATING/COMPENSATED/FAILED/PIVOT`）持久化，恢复时对账（对齐 §5.8 的 EffectJournal）。
+  - **v1.12 修复（P0）**：原伪代码只在成功/失败后写 `COMPENSATED/FAILED/PIVOT`，**从不写 `COMPENSATING`**。若崩溃发生在 `commit_batch(mode=COMPENSATE)` 内部，恢复流程⑤′（§5.8）扫描不到该写 → 补偿被静默丢弃。现要求：**进入补偿前先写 `COMPENSATING`**，恢复时对 `COMPENSATING` 的写**续做补偿**（幂等：先查 `compensation_journal` 是否已有 `COMPENSATED`），对 `FAILED` 升级人工，对 `PIVOT` 走人工对账。
+  - **日志条目必须带资源键**：`compensation_journal` 条目 = `(acb.id, resource, 目标内容 hash, 状态)`，否则恢复时无法定位待补偿的写。
 - **补偿失败处理**：重试 N 次 → 写审计事件 → 升级人工（不再静默半回滚）。
 - **pivot 语义**：一旦某写已产生外部副作用（如已发邮件、已部署），标记为 pivot，**不可自动补偿**，升级人工。
 - **承诺边界**：all-or-nothing 的语义是「**要么全部 apply，要么全部回退到 apply 前的版本**」；对含 pivot 的写，降级为「尽力补偿 + pivot 上报」，不承诺物理回滚。
@@ -1006,6 +1016,7 @@ function advance_baseline(acb):          // 每 turn 后调用
 | RETRYING | retry / 超重启窗口 | RUNNING / QUARANTINED |
 | RETRYING | schema 失败（不可重试） | FAILED |
 | QUARANTINED | escalate | REPLANNING |
+| QUARANTINED | 重规划预算耗尽 | DEAD_LETTER |
 | REPLANNING | 新 Plan vN+1 生成 | PLANNED（新任务，旧任务终态为 FAILED） |
 | INADMISSIBLE | escalate | REPLANNING 或 FAILED |
 | RETRYING/REBASING/QUARANTINED/REPLANNING/INADMISSIBLE | 用户取消（RunCoordinator 广播） | CANCELLED |
@@ -1014,8 +1025,11 @@ function advance_baseline(acb):          // 每 turn 后调用
 
 | 当前状态 | 事件 | 下一状态 |
 |---|---|---|
+| NEW | 鉴权 / 用户幂等校验失败 | FAILED |
 | NEW | 规划完成 | PLANNING |
 | PLANNING | 计划校验通过 / 失败 | RUNNING / FAILED |
+| PLANNING | 用户取消 | CANCELLED |
+| RUNNING | 不可恢复错误（EventLog 写失败 / 状态机非法转移） | FAILED |
 | RUNNING | 全部任务 DONE | DONE |
 | RUNNING | 部分任务失败但有产出 | DONE_PARTIAL |
 | RUNNING | 全部任务失败 | DONE_PARTIAL（覆盖度标注） |
@@ -1513,7 +1527,7 @@ reserve 为单写者（或 CAS），保证并发准入不超支
 | 预算 | 子任务请求超过父剩余 | 拒绝；父预算不被突破；结束归还 |
 | 并行度 | N 个独立只读任务 | 墙钟 ≤ 1.5 × 最慢任务 |
 | 能力隔离 | agent 尝试越界 | `DENIED_CAPABILITY`，无副作用 |
-| 上下文可重建 | 重放事件流 | 物化视图与重放结果一致 |
+| 上下文可重建 | 重放事件流 | **因果前缀一致**：已确认 effect 不重复、事件按 seq 有序、视图能复现「每个已提交写之后的状态」；**不要求字节等价**（近似重放契约，见 §5.5） |
 | 语义验证 | 注入已知语义 bug | Verifier 拦截 |
 | 取消传播 | 取消根任务 | 步边界内子任务全 CANCELLED；无孤儿 |
 | HITL 取消 | 审批等待期取消 | 立即 CANCELLED，不阻塞到超时 |
@@ -1598,7 +1612,7 @@ RSC 提交协议、IntentRegistry+fencing、EffectJournal 的 UNKNOWN 对账、�
 | P2 | eval harness | 回归评测（借鉴 LangSmith） |
 | P2 | fork 子 agent | 从当前对话分叉（借鉴 Claude Code） |
 | P2 | 陈旧读粒度优化 | 从「整订阅集拒绝」改为「按依赖图精确拒绝」 |
-| P2 | I1–I14 形式化 | TLA+ 模型（§18.4 已提及，需落地） |
+| P2 | 核心不变量形式化 | TLA+ 建模 **I1–I4、I7**（与 §18.4 范围一致；其余不变量靠 conformance suite 覆盖） |
 
 ---
 
@@ -1764,7 +1778,7 @@ Receipt = {
 | ready_queue 上限 | **credit-based 背压** | ✅ |
 | DEAD_LETTER | **DLQ** | ✅ |
 | 单写者 seq / reserve | **Raft leader / Quorum** | ✅ |
-| Z0–Z3 分区 | **一致性哈希 + vnode** | ✅ |
+| Z0–Z3 分区 | **无对应**（语义分区，非哈希分区；仅「分区」一词同形） | ❌ |
 | 心跳 + 租约 | **Phi Accrual** | 🟡（阶段三引入连续怀疑度） |
 | OOM 驱逐 | **熔断** | ✅ |
 | per-agent 沙箱 | **gVisor / Firecracker** | ✅ |
@@ -1786,18 +1800,22 @@ Receipt = {
 
 ### 20.1 架构总图（分层 + 组件）
 
-> **编号说明（v1.10 修复）**：图中用 **P0–P5 平面**（与 §4.1 一致）+ **L1–L5 交付归属**（与 §0.5 一致）双标签。
+> **编号说明（v1.12 修复）**：图中用 **P0–P5 平面**（与 §4.1 一致）+ **L1–L5 交付归属**（与 §0.5 一致）双标签。**平面与归属正交，不是一一对应**。
 > - P0 隔离基质 = L0（基质）
-> - P1 状态面 = **L1 核心**（我们交付）：WorkspaceManager / VerifierRunner / PolicyEngine / BudgetManager / CheckpointStore / EffectJournal 等
-> - P2 执行面 = **L3 托管运行时**
-> - P3 控制面 = **L4 编排适配**（参考实现）
+> - P1 状态面 = **L1 核心**（我们交付）
+> - P2 执行面 = **L1 核心 + L4 参考实现**（`WorkspaceManager`/`VerifierRunner` 属 L1；`AgentRuntime`/`ContextAssembler`/`ModelGateway`/`ToolGateway` 属 L4）
+> - P3 控制面 = **L1 核心 + L4 参考实现**（`Dispatcher`/`Supervisor` 属 L1；`Planner`/`PlanValidator`/`Scheduler`/`Replanner`/`Aggregator`/`RunCoordinator`/`HITL` 属 L4）
+> - P4 治理面 = **L1 核心 + L5 不交付†**（`PolicyEngine`/`BudgetManager` 属 L1；`Trace/Audit`/`SecretBroker` 属 L5，不交付）
 > - P5 接入面 = **L4**（Ingress/Renderer）
-> - **L2 规范**（阶段二交付，非运行时组件）、**L5 删除**（不做）不在图中。
+> - **L2 规范**（阶段二交付，非运行时组件）不在图中；**L5 不交付**组件以 `†` 标注后保留在图中。
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │ P5 接入面（L4，可替换）                                                        │
 │   Ingress ──▶ Renderer                                                          │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ P4 治理面（L1 核心 + L5 不交付†）                                                │
+│   PolicyEngine ──▶ BudgetManager          Trace/Audit†   SecretBroker†           │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ P3 控制面（L4 编排，参考实现，非差异化）                                         │
 │   ApplicabilityGate ─▶ Planner ─▶ PlanValidator ─▶ Dispatcher ─▶ Scheduler      │
@@ -1810,15 +1828,15 @@ Receipt = {
 │   Supervisor（心跳/租约/取消/孤儿回收）◀──────────────────────────────┘             │
 │   HITL（审批挂起/恢复）                                                          │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ P2 执行面（L3 托管运行时）                                                     │
+│ P2 执行面（L1 核心 + L4 参考实现）                                              │
 │   AgentRuntime ─▶ ContextAssembler ─▶ ModelGateway ─▶ ToolGateway               │
 │        │                │                   │                │                 │
 │        └────────────────┴───────────────────┴────────────────┴─▶ P1 状态面       │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ P1 状态面（L1 核心，我们交付）                                                  │
 │   WorkspaceManager   IntentRegistry   EventLog   SubscriptionRegistry          │
-│   WorkspaceVersionStore   ArtifactStore   PlanStore   BudgetManager             │
-│   VerifierRunner     PolicyEngine     CheckpointStore   EffectJournal           │
+│   WorkspaceVersionStore   ArtifactStore   PlanStore                            │
+│   VerifierRunner     CheckpointStore   EffectJournal                            │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ P0 隔离基质（L0）                                                             │
 │   Sandbox / Worktree(overlay) / 网络出口 / 资源限制(cgroups)                      │
@@ -2362,6 +2380,21 @@ AUTO_MERGED     CONFLICT_MARKERS
 
 ## 附录：修订记录
 
+### v1.12 交付前终审（相对 v1.11，来自三路只读审查：里程碑一致性 / 规范自洽性 / 可实施性）
+
+| 级别 | 问题 | 修复 |
+|---|---|---|
+| **P0** | §0.5 把 `Trace/Audit`、`SecretBroker`、`MemoryStore` 列为「L5 删除/不做」，与 §4.1/§4.2 定义其职责与强制点直接冲突 | 改为「**L5 不交付**」：保留架构位置（`†` 标注），只约定接口与强制点（§0.5 / §4.1 / §4.2） |
+| **P0** | §12 验收要求「物化视图与重放结果**一致**」，与 §5.5「近似重放、不保证字节等价」不可同时成立 | 验收改为**因果前缀一致**（不重复 effect / seq 有序 / 可复现每个已提交写之后的状态）（§12） |
+| **P0** | §5.4 补偿伪代码**从不写 `COMPENSATING`**，崩溃在补偿中途时恢复流程⑤′ 扫不到 → 补偿静默丢失 | 补偿前先写 `COMPENSATING`；日志条目带资源键；恢复时续做/升级/对账（§5.4） |
+| P1 | §5.4 `apply` 返回 `CONFLICT(version, null)`，而 §10 B5/§7.2.1 需要 diff 作为 rebase 输入 | 改为 `CONFLICT(version, compute_diff(...))`（§5.4） |
+| P1 | §19 写「Z0–Z3 = 一致性哈希 + vnode ✅」，与分布式映射文档「★☆☆☆☆ 仅同形」矛盾 | 改为「无对应（语义分区，非哈希分区）❌」（§19） |
+| P1 | §20.1 把 `PolicyEngine` 画入 P1 状态面，且 P2 执行面标「L3 托管运行时」与 §0.5 归属冲突 | 新增 P4 治理面（PolicyEngine/BudgetManager/Trace†/SecretBroker†）；P2 标「L1 核心 + L4 参考实现」（§20.1） |
+| P1 | 状态机表 A 缺 `QUARANTINED→DEAD_LETTER` 主表边；表 B 缺 `NEW→FAILED`、`PLANNING→CANCELLED`、`RUNNING→FAILED` | 补边（§5.9） |
+| P1 | §1.3 的 `I1–I6`（根本问题）与 §11 的 `I1–I14`（不变量）同号不同义 | 加消歧说明；`I*` 默认指 §11 不变量（§1.3） |
+| P1 | §14 称「I1–I14 形式化」，§18.4 只建模 I1–I4、I7 | §14 改为「核心不变量（I1–I4、I7）」（§14） |
+| P2 | 修订记录 v1.9 残留「（去协调者）2PC」「一致性哈希 = Z0–Z3」 | 改为「非 2PC」「语义分区」（附录修订记录） |
+
 ### v1.11 契约同步收口（相对 v1.10）
 
 | 问题 | 修复 |
@@ -2402,7 +2435,7 @@ AUTO_MERGED     CONFLICT_MARKERS
 
 | 新增 | 内容 |
 |---|---|
-| **§19 分布式对照** | RSC = OCC + Saga + （去协调者）2PC；EventLog = LSM/WAL；idem_key = Kafka 幂等生产者；Raft = 单写者；一致性哈希 = Z0–Z3；credit 背压；DLQ；Phi Accrual；gVisor 沙箱；ReconcileLoop = K8s level-triggered |
+| **§19 分布式对照** | RSC = OCC + 租约 fencing + 短临界区 + Saga（**非 2PC**，无协调者、无 prepare/commit 投票）；EventLog = LSM/WAL；idem_key = Kafka 幂等生产者；Raft = 单写者；**Z0–Z3 = 语义分区（非一致性哈希）**；credit 背压；DLQ；Phi Accrual；gVisor 沙箱；ReconcileLoop = K8s level-triggered |
 | **§20 无死角图集** | 12 张图：架构总图 / 端到端数据流 / RSC 时序 / 调用图 / 扇入扇出 / 事件流 / 崩溃恢复 / 隔离数据流 / 背压 / 状态机总图 / 组件依赖 DAG / 一致性视图 |
 | **用例落盘** | [用例集](use-cases-and-adversarial-tests.md)：4 真实 + 13 对抗（可审计） |
 | **映射文档** | [分布式 ↔ 多智能体映射](distributed-to-multiagent-mapping.md) |
