@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Optional, Protocol
 
+from .budget import Reservation
 from .resolver import ConflictResolver                        # noqa: F401  (re-export)
-from .types import (ACB, Event, EventKind, Lease, Mode, Reservation, Result,
-                    Write)
+from .types import ACB, Event, EventKind, Lease, Mode, Result, Write
 
 __all__ = [
     "Clock", "EventLog", "IntentRegistry", "BudgetManager", "Workspace",
@@ -79,13 +79,16 @@ class BudgetManager(Protocol):
     def create_node(self, node_id: str, limits: int, parent_id: str = "run") -> Any:
         ...
 
-    def reserve(self, node_id: str, amount: int) -> Any:
+    def reserve(self, node_id: str, amount: int) -> Optional[Reservation]:
         ...
 
-    def consume(self, node_id: str, amount: int) -> bool:
+    def consume(self, reservation_id: str, amount: int = 1) -> Result:
         ...
 
-    def release(self, node_id: str) -> int:
+    def release(self, reservation_id: str) -> int:
+        ...
+
+    def settle(self, reservation_id: str) -> int:
         ...
 
     def check(self, node_id: str, amount: int = 0) -> bool:
@@ -144,7 +147,8 @@ class EffectJournal(Protocol):
 
 
 class PolicyEngine(Protocol):
-    def issue(self, token) -> None:
+    def issue(self, arg, *, tools=None, paths=None, network=None,
+              data_class: str = "*", allow_legacy: bool = False) -> Any:
         ...
 
     def check_capability(self, agent_id: str, tool: str, path: str = "") -> bool:

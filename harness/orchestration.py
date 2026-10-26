@@ -83,65 +83,133 @@ class Planner:
         return new_plan
 
 
+class SlotTracker:
+    """活跃槽位计数（可回滚的资源，文档 §5.2）。"""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active: set[str] = set()
+        self._lock = threading.Lock()
+
+    def try_acquire(self, key: str) -> bool:
+        with self._lock:
+            if key in self._active:
+                return True                     # 幂等
+            if len(self._active) >= self._limit:
+                return False
+            self._active.add(key)
+            return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._active.discard(key)
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return len(self._active)
+
+    def active_keys(self) -> list[str]:
+        with self._lock:
+            return list(self._active)
+
+
 class Dispatcher:
     def __init__(self, harness) -> None:
         self.h = harness
+        self._attempt_counter = itertools.count(1)
+
+    def _next_attempt(self) -> int:
+        return next(self._attempt_counter)
+
+    def _deny(self, acb: ACB, failure: str) -> ACB:
+        acb.state = TaskState.INADMISSIBLE
+        acb.failure = failure
+        return acb
+
+    def _capability_ok(self, acb: ACB, required_tools: set[str]) -> bool:
+        """与运行时同一判定入口（token → default_token → deny），逐个含 path 判定。"""
+        if isinstance(required_tools, dict):
+            return all(self.h.policy.check_capability(acb.id, tool, path)
+                       for tool, path in required_tools.items())
+        return all(self.h.policy.check_capability(acb.id, tool, "")
+                   for tool in required_tools)
 
     def try_admit(self, task: dict, run_id: str,
                   required_tools: set[str] | None = None) -> ACB:
-        """准入谓词（文档 §5.2⑤）：预算 + 能力 + intents.compatible + slots。
-
-        - 预算：`reserve(min_budget)`
-        - 能力：`required_tools` 必须是已签发 token 的子集
-        - 契约/读-写冲突：`intents.compatible`（**不拦同资源写-写**）
-        - slots：`max_concurrent` 限制
-        """
-        acb = ACB(id=f"A-{task['task_id']}", run_id=run_id, task_id=task["task_id"],
+        """准入谓词（文档 §5）：slots → 能力 → 预算 → 逻辑，失败零残留。"""
+        acb = ACB(id=f"A-{run_id}-{task['task_id']}-{self._next_attempt()}",
+                  run_id=run_id, task_id=task["task_id"],
                   logical_subgoal_id=task["logical_subgoal_id"])
 
-        # ① slots
-        if len(self.h.acbs) >= self.h.max_concurrent:
-            acb.state = TaskState.INADMISSIBLE
-            acb.failure = "NO_SLOT"
-            return acb
-
-        # ② 能力
-        if required_tools:
-            token = self.h.policy.token(acb.id)
-            if token is None or not required_tools.issubset(token.tools):
-                acb.state = TaskState.INADMISSIBLE
-                acb.failure = "DENIED_CAPABILITY"
-                return acb
-
-        # ③ 契约/读-写冲突（文档 §7.3：先声明，再判定他人是否已声明同一依赖）
+        node = None
+        resv = None
         declared: list[str] = []
+        committed = False                           # 哨兵：副作用全部完成才置 True
         try:
+            # ① slots
+            if not self.h.slots.try_acquire(acb.id):
+                return self._deny(acb, "NO_SLOT")
+
+            # ② 能力
+            if required_tools and not self._capability_ok(acb, required_tools):
+                return self._deny(acb, "DENIED_CAPABILITY")
+
+            # ③ 预算：limits 留出重试余量，但只预留 min_budget
+            min_budget = task["footprint"]["min_budget"]
+            limits = min_budget + acb.retry_budget + 1
+            node = self.h.budget.create_node(
+                f"B-{acb.id}", limits,
+                parent_id=task["footprint"].get("parent_budget", "run"))
+            if node is None:
+                return self._deny(acb, "BUDGET_UNAVAILABLE")
+            node.owner = acb.id
+            resv = self.h.budget.reserve(node.node_id, min_budget)
+            if resv is None:
+                return self._deny(acb, "BUDGET_EXHAUSTED")
+            acb.reservation_ids = [resv.reservation_id]
+            acb.budget_node = node
+
+            # ④ 逻辑声明（文档 §7.3：先声明，再判定他人是否已声明同一依赖）
             for dep in task["footprint"].get("logical_deps", []):
                 self.h.intents.declare_logical(dep["id"], acb.id, dep["kind"])
                 declared.append(dep["id"])
                 if not self.h.intents.compatible(dep["id"], acb.id, dep["kind"]):
-                    acb.state = TaskState.INADMISSIBLE
-                    acb.failure = "CONTRACT_CONFLICT"
-                    return acb
+                    return self._deny(acb, "CONTRACT_CONFLICT")
 
-            # ④ 预算
-            node_id = f"B-{task['task_id']}"
-            if not self.h.budget.create_node(node_id, task["footprint"]["min_budget"]):
-                acb.state = TaskState.INADMISSIBLE
-                return acb
-            if not self.h.budget.reserve(node_id, task["footprint"]["min_budget"]):
-                acb.state = TaskState.INADMISSIBLE
-                acb.failure = "BUDGET_EXHAUSTED"
-                return acb
-            acb.budget_node = self.h.budget._nodes[node_id]
             acb.state = TaskState.ADMITTED
+            self.h.event_log.append(EventKind.BUDGET_RESERVED, node.node_id,
+                                    {"amount": resv.amount})
+            committed = True
+            return acb
         finally:
-            if acb.state != TaskState.ADMITTED:        # 失败回滚已声明的逻辑依赖
-                for dep_id in declared:
-                    self.h.intents.undeclare_logical(dep_id, acb.id)
-        self.h.event_log.append(EventKind.BUDGET_RESERVED, node_id,
-                                {"amount": task["footprint"]["min_budget"]})
-        return acb
+            if not committed:
+                self._rollback(acb, node, resv, declared)
+
+    def _rollback(self, acb: ACB, node, resv, declared: list[str]) -> None:
+        """逆序撤销（逻辑 → 预留 → 节点 → 槽位）；不吞原异常。"""
+        for dep_id in declared:
+            try:
+                self.h.intents.undeclare_logical(dep_id, acb.id)
+            except Exception:
+                pass
+        if resv is not None:
+            try:
+                self.h.budget.release(resv.reservation_id)
+                # 准入回滚的预留从未消费：清除 tombstone，保证 T9 快照零残留
+                self.h.budget._reservations.pop(resv.reservation_id, None)
+                if node is not None:
+                    node.reservations.pop(resv.reservation_id, None)
+            except Exception:
+                pass
+        if node is not None:
+            try:
+                self.h.budget.remove_node(node.node_id, owner=acb.id)
+            except Exception:
+                pass
+        acb.reservation_ids = []
+        acb.budget_node = None
+        self.h.slots.release(acb.id)
 
 
 class Scheduler:

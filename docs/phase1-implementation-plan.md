@@ -763,9 +763,10 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S1** | ✅ 完成（2026-10-26） | `harness/storage/atomic.py`（`write_all` 循环写 / 同目录临时文件 / `os.replace` / `fsync` 目录）、`blob.py`（内容寻址 + `canonical_bytes`）、`wal.py`（`magic+len+crc32+payload` 帧、整帧一次 `fdatasync`、恢复校验 seq 连续、尾部截断 vs 中段 `WalCorrupt`）、`WalEventLog` | **49 passed**；`pytest -m ms0` → 14 passed；T1 尾部半帧截断、T2 独立进程读到（真 fsync）、T3 中段坏帧抛 `WalCorrupt`、T4′ 重放重建 seq/索引 |
 | **S2** | ✅ 完成（2026-10-26） | `workspace` manifest+blob 读模型、每资源锁 + 全序批量获取、`put` 推进版本、前像随 WAL 重建、`intent_registry` 注入时钟与过期语义、`commit_batch` 全序提交（读集合加锁、提交点前复验、锁外通知） | **59 passed**（+10）；T4/T5/T5b/T7 + 6 个回归；11 个测试改相对基线；详见 [S2 方案 v1.3](s2-workspace-and-locks.md) §12 |
 | **S3** | ✅ 完成（2026-10-26） | `rebase.py`（结构化冲突 merge3 + `SET` 集合语义）、`runtime.handle_commit_result`（有界 rebase 回路）、`Delete` 哨兵全链路（tombstone / 重建识别 / 补偿版本比对）、`resolver.py`（Scripted/LLM + 白名单）、`QUARANTINED` 预算与 escalate | **69 passed**（+5）；T6/T8/T20/T21/T22；实现后审查修 4 严重 + 5 高；详见 [S3 方案 v1.3](s3-rebase-and-compensation.md) §14 |
-| S4 | ⏳ 待开工 | `budget`（Reservation + 幂等 release）+ `dispatcher`（回滚）+ `policy` 收口 | T9、T10、T14 + `test_a4_budget_double_spend`、`test_a12_concurrent_reserve_no_overcommit`、`test_a13_per_action_guard_budget` |
+| **S4** | ✅ 完成（2026-10-26） | `budget.py` 重写（`Reservation` + `subtree_reserved` + 幂等 release/settle + 三条不变量 + 兼容属性）、`SlotTracker`、`try_admit` 重写（committed 哨兵 + 四级回滚）、`policy.issue` 收口、`Harness.dispatch_and_run` 唯一入口 | **83 passed**（+14）；T9/T10/T14/T23/T24 + 7 回归；实现后评审修 5 P0 + 5 高；详见 [S4 方案 v1.2](s4-budget-and-admission.md) §13 |
+| S5 | ⏳ 待开工 | `EffectJournal`（probe）+ `CompensationJournal`（落盘 + 幂等键）+ `recover`（resume_policy） | T11、T12、T13 + `test_u4_long_task_crash_recovery_idempotent` 绿 |
 
-**S0–S3 的已知偏差（记录在案）**：
+**S0–S4 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。
 2. `TaskState.DONE_PARTIAL` 暂留在枚举里（标注「归属 RunState」），S4 随 `test_a11` 重写时移除。
 3. `IntentRegistry.reserve` / `BudgetManager.reserve` / `CapabilityToken.agent_id` 的签名**未改** —— 按 §2.2「签名随测试重写一起收紧」的规则，分别在 S2 / S4 / S7 执行。

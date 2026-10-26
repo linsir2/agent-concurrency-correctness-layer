@@ -58,7 +58,7 @@ def test_i3_fencing_monotonic():
 
 
 def test_i5_budget_conservation():
-    """I5：consumed ≤ reserved ≤ limits；父约束不被子突破。"""
+    """I5：consumed ≤ self_reserved ≤ subtree_reserved ≤ limits；父约束不被子突破。"""
     h = make_harness(run_limits=100)
     plan = h.planner.plan("I5", [{"task_id": "T1", "min_budget": 60},
                                  {"task_id": "T2", "min_budget": 60}])
@@ -68,10 +68,22 @@ def test_i5_budget_conservation():
     assert t1.state == TaskState.ADMITTED
     assert t2.state == TaskState.INADMISSIBLE
 
-    node = h.budget._nodes["B-T1"]
-    assert node.own_reserved == 60
-    assert node.consumed <= node.own_reserved
-    assert node.own_reserved <= node.limits
+    # 节点身份由 dispatcher 生成（含 run/attempt），不得按固定 'B-T1' 查找
+    node = t1.budget_node
+    assert node is not None and t1.reservation_ids != []
+    assert h.budget._nodes[node.node_id] is node
+    assert all(h.budget._reservations[rid][0] is node for rid in t1.reservation_ids)
+
+    # 预留 / 消费边界
+    assert node.self_reserved == 60
+    assert node.subtree_reserved == 60
+    assert node.consumed == 0
+    assert node.consumed <= node.self_reserved <= node.subtree_reserved <= node.limits
+    assert t2.budget_node is None and t2.reservation_ids == []
+
+    h.budget.check_invariants()
+    assert h.budget.root.subtree_reserved == 60
+    assert h.budget.root.remaining == 40
 
 
 def test_i7_effect_exactly_once():

@@ -16,7 +16,7 @@
 """
 
 from .types import (
-    Resource, Lease, Event, ACB, Write, Decision, Action, Result, Reservation,
+    Resource, Lease, Event, ACB, Write, Decision, Action, Result,
     Status, Mode, EventKind, TaskState, RunState, TASK_TERMINAL, RUN_TERMINAL,
     TRANSITIONS, advance,
 )
@@ -24,14 +24,15 @@ from .clock import Clock, SystemClock, ManualClock
 from .event_log import EventLog, WalEventLog
 from .intent_registry import IntentRegistry
 from .workspace import WorkspaceManager, WorkspaceVersionStore
-from .budget import BudgetManager
+from .budget import BudgetManager, Reservation
 from .checkpoint import CheckpointStore, EffectJournal
 from .subscription import SubscriptionRegistry
 from .policy import CapabilityToken, PolicyEngine
 from .context import ContextAssembler
 from .resolver import ConflictResolver, LLMResolver, ScriptedResolver
 from .runtime import AgentRuntime
-from .orchestration import Planner, Dispatcher, Scheduler, RunCoordinator, ReconcileLoop, HITL
+from .orchestration import (Planner, Dispatcher, Scheduler, SlotTracker,
+                            RunCoordinator, ReconcileLoop, HITL)
 from .harness import Harness
 from .rebase import (MISSING, DELETE, Conflict, MergePolicy, MergeResult, merge3)
 
@@ -45,7 +46,8 @@ __all__ = [
     "BudgetManager", "CheckpointStore", "EffectJournal", "SubscriptionRegistry",
     "PolicyEngine", "CapabilityToken", "ContextAssembler", "AgentRuntime",
     "ConflictResolver", "ScriptedResolver", "LLMResolver",
-    "Planner", "Dispatcher", "Scheduler", "RunCoordinator", "ReconcileLoop", "HITL",
+    "Planner", "Dispatcher", "Scheduler", "SlotTracker", "RunCoordinator",
+    "ReconcileLoop", "HITL",
     "Harness",
     "MISSING", "DELETE", "Conflict", "MergePolicy", "MergeResult", "merge3",
 ]

@@ -137,7 +137,9 @@ def test_ms1_rebase_retry_bounded_then_quarantined():
     assert TaskState.QUARANTINED not in TASK_TERMINAL            # ④ 非终态
     assert h.escalate_quarantined(b) == Status.OK
     assert b.state is TaskState.DEAD_LETTER                       # ⑤ escalate 用合法边
-    assert node.own_reserved == 0                                 # ⑥ 预算已释放
+    # ⑥ 累计账语义：settle 只还未消耗部分，已消耗永久留在 self_reserved
+    assert node.self_reserved == node.consumed
+    h.budget.check_invariants()
 
 
 # ---------------------------------------------------------------- T22

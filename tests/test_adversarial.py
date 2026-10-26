@@ -249,15 +249,27 @@ def test_a8_hitl_crash_budget_compensation():
     h.run_task(acb, [decision(1, stage("r", "x"), hitl())])
     assert acb.hitl_result is not None
     assert acb.staged == {}                       # discard_staged
-    assert len(h.intents._leases) == 0            # release_all_locks（无残留租约）
+    # release_all_locks：无 valid 租约且 active 意图为空（`len(_leases)==0` 恒假）
+    assert not [lease for lease in h.intents._leases.values() if lease.valid]
+    assert not [v for v in h.intents._active.values() if v]
 
     # 崩溃恢复：非终态不判 stale（ReconcileLoop 排除 WAITING_APPROVAL）
     ref = acb.result_ref
     recovered = h.recover(ref)
     assert recovered.state in (TaskState.RUNNING, TaskState.DONE)
 
-    # 预算保持占用直到终态（已 release 归零，但节点仍存在）
-    assert h.budget._nodes["B-T1"] is not None
+    # 节点身份含 run/attempt，不得按固定 'B-T1' 查找；recover 须恢复预留句柄
+    assert recovered.reservation_ids != []
+    assert recovered.budget_node is not None
+    node_id = recovered.budget_node.node_id
+    assert h.budget._nodes[node_id] is recovered.budget_node
+    assert all(rid in h.budget._reservations for rid in recovered.reservation_ids)
+
+    # 预留状态被恢复：checkpoint 保存于 `_finalize` 结算之前（K-3），
+    # 故恢复出来的是「仍占用 30」的活跃预留，且不变量自洽
+    h.budget.check_invariants()
+    assert recovered.budget_node.self_reserved == 30
+    assert h.budget.root.subtree_reserved == 30
 
 
 # ---------------------------------------------------------------- A9

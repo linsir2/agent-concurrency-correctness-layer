@@ -18,9 +18,11 @@ class CheckpointStore:
     def __init__(self) -> None:
         self._store: dict[str, dict] = {}
         self._counter = itertools.count(1)
+        self.slots = None            # 由 Harness 注入，用于快照活跃槽位
 
     def save(self, acb) -> str:
         ref = f"CP{next(self._counter)}"
+        node = acb.budget_node
         self._store[ref] = {
             "acb_id": acb.id,
             "run_id": acb.run_id,
@@ -38,6 +40,18 @@ class CheckpointStore:
             "hitl_result": copy.deepcopy(acb.hitl_result),
             "rebase_attempts": acb.rebase_attempts,
             "retry_budget": acb.retry_budget,
+            "reservation_ids": list(acb.reservation_ids),
+            "needs_readmit": bool(getattr(acb, "needs_readmit", False)),
+            "slots_active": (sorted(self.slots.active_keys())
+                             if self.slots is not None else []),
+            "budget_node_id": node.node_id if node is not None else None,
+            "budget_parent_id": (node.parent.node_id
+                                 if node is not None and node.parent is not None
+                                 else None),
+            "budget_limits": node.limits if node is not None else None,
+            "budget_self": node.self_reserved if node is not None else 0,
+            "budget_subtree": node.subtree_reserved if node is not None else 0,
+            "budget_consumed": node.consumed if node is not None else 0,
         }
         acb.result_ref = ref
         return ref

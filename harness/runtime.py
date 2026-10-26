@@ -78,6 +78,9 @@ class AgentRuntime:
                     if isinstance(st, Result) and st.status in (
                             Status.CONFLICT, Status.REJECT_STALE, Status.REJECT_STALE_READ):
                         st = self.handle_commit_result(acb, st)
+                    if acb.state is TaskState.QUARANTINED:
+                        # 已隔离：直接返回，不改状态、不覆盖 failure（§5.5）
+                        return st
                     if st not in (Status.OK, Status.VALID):
                         acb.state = TaskState.FAILED
                         acb.failure = st.value
@@ -87,6 +90,8 @@ class AgentRuntime:
             st = self._commit_staged(acb)             # 返回值必须被使用（B11）
             if st != Status.OK:
                 st = self.handle_commit_result(acb, st)
+            if acb.state is TaskState.QUARANTINED:
+                return st
             if st != Status.OK:
                 acb.state = TaskState.FAILED
                 acb.failure = st.value
@@ -128,20 +133,22 @@ class AgentRuntime:
             if not self.h.policy.check_capability(acb.id, action.tool, action.resource or ""):
                 return Status.DENIED_CAPABILITY
             idem_key = self.h.idem_key(acb, action, i)
+            if self.h.effects.state(idem_key) == "CONFIRMED":
+                return Status.OK                       # I7：副作用恰好一次
+            # 预算消费先于副作用：消费失败则不执行工具、不写事件
+            st = self._consume_budget(acb, action.cost)
+            if st != Status.OK:
+                if st == Status.BUDGET_EXHAUSTED:
+                    acb.state = TaskState.FAILED
+                    acb.failure = "BUDGET_EXHAUSTED"
+                return st
             self.h.effects.begin(acb, action.tool, action.args, idem_key)
-            prev = self.h.effects.state(idem_key)
-            if prev == "CONFIRMED":
-                return Status.OK
-            if prev == "UNKNOWN":
+            if self.h.effects.state(idem_key) == "UNKNOWN":
                 self.h.effects.mark_unknown(idem_key, acb.id)
             self.h.effects.confirm(idem_key, acb.id)
             self.h.event_log.append(EventKind.TOOL_COMPLETED, idem_key,
                                     {"tool": action.tool}, producer=acb.id,
                                     idempotency_key=idem_key)
-            if not self.h.budget.consume(acb.budget_node.node_id, action.cost):
-                acb.state = TaskState.FAILED
-                acb.failure = "BUDGET_EXHAUSTED"
-                return Status.BUDGET_EXHAUSTED
             return Status.OK
 
         if action.kind == "request_hitl":
@@ -174,8 +181,8 @@ class AgentRuntime:
             acb.state = TaskState.CANCELLED
             return False
         self.h.intents.renew_for(acb)
-        # 预算 guard：要求「还能再消费至少 1 单位」（否则恒真，形同空操作）
-        if not self.h.budget.check(acb.budget_node.node_id, 1):
+        # 预算 guard：要求 ACB 名下有「一笔 ACTIVE 且余额 ≥ 1」的预留
+        if not self.h.budget.check_reservations(acb.reservation_ids, 1):
             acb.failure = "BUDGET_EXHAUSTED"
             return False
         if acb.deadline is not None and acb.step >= acb.deadline:
@@ -187,6 +194,21 @@ class AgentRuntime:
             acb.failure = "NO_PROGRESS"
             return False
         return True
+
+    def _consume_budget(self, acb: ACB, amount: int) -> Status:
+        """按预留消费：找到**第一个**可支付 `amount` 的预留。
+
+        全部失败时：任一为 `BUDGET_EXHAUSTED` → 按耗尽处理；
+        否则（unknown / settled 的 `INVALID_INPUT`）→ 返回 `INVALID_INPUT`。
+        """
+        exhausted = False
+        for rid in list(acb.reservation_ids):
+            result = self.h.budget.consume(rid, amount)
+            if result.status == Status.OK:
+                return Status.OK
+            if result.status == Status.BUDGET_EXHAUSTED:
+                exhausted = True
+        return Status.BUDGET_EXHAUSTED if exhausted else Status.INVALID_INPUT
 
     # ---- 提交 + 补偿（文档 §5.4） --------------------------------
     def _commit_staged(self, acb: ACB) -> Result:
@@ -233,7 +255,7 @@ class AgentRuntime:
                     return outcome
 
             acb.rebase_attempts += 1
-            if not self.h.budget.consume(acb.budget_node.node_id, 1):
+            if self._consume_budget(acb, 1) != Status.OK:
                 self._quarantine(acb, "budget_exhausted")
                 return Result(Status.SEMANTIC_REJECTED, {"reason": "budget_exhausted"})
             if acb.rebase_attempts > acb.retry_budget:
@@ -266,16 +288,26 @@ class AgentRuntime:
         return False
 
     def _ensure_retry_budget(self, acb: ACB) -> bool:
-        """为重试预留预算：不足 `retry_budget + 1` 时从节点 `limits` 补足。
+        """为重试补足预算：已有活跃预留余额不足时追加一笔并登记到 ACB。
 
-        保持 `consumed ≤ own_reserved ≤ limits` 的守恒不变量；预留失败 → 调用方隔离。
+        预留失败 → 调用方隔离。
         """
         node = acb.budget_node
+        if node is None:
+            return False
         needed = acb.retry_budget + 1
-        available = node.own_reserved - node.consumed
+        available = 0
+        for rid in acb.reservation_ids:
+            resv = node.reservations.get(rid)
+            if resv is not None and resv.state == "ACTIVE":
+                available += resv.balance
         if available >= needed:
             return True
-        return self.h.budget.reserve(node.node_id, needed - available)
+        resv = self.h.budget.reserve(node.node_id, needed - available)
+        if resv is None:
+            return False
+        acb.reservation_ids.append(resv.reservation_id)
+        return True
 
     def _rebase_write(self, acb: ACB, result: Result):
         """§5.3：以 pre_image 为 base 做 3-way merge；成功则 _accept，冲突交 resolver。"""

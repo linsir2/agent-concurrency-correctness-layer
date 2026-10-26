@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import os
 import sys
+import uuid
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from harness import (ACB, Action, CapabilityToken, Decision, Harness,  # noqa: E402
+from harness import (ACB, Action, Decision, Harness,  # noqa: E402
                      TaskState, Write)
 
 
@@ -21,7 +22,7 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None) -> Harness:
     `clock`/`blobs` 透传（MS1：注入时钟构造租约过期、共享 blob 目录）。
     """
     h = Harness(run_limits=run_limits, clock=clock, blobs=blobs)
-    h.policy.default_token = CapabilityToken(
+    h.policy.default_token = h.policy.issue(
         "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
     return h
 
@@ -64,9 +65,19 @@ def seed(h: Harness, resource: str, content) -> int:
 
 
 def _acb(h: Harness, resource: str) -> ACB:
-    """构造一个绑定预算节点的 ACB（MS1 测试用）。"""
-    acb = ACB(id=f"A-{resource}", run_id="R", task_id="T")
-    acb.budget_node = h.budget.create_node(f"B-{acb.id}", 100)
+    """构造一个绑定预算节点的 ACB（MS1 测试用）。
+
+    节点 id 与 ACB id 都必须唯一（`B-{task_id}` 会与同 task 重试撞旧节点）；
+    建节点后立刻预留下全额，使 ACB 的 `reservation_ids` 与 `budget_node`
+    同生产路径一致（`_finalize`/`escalate` 都按预留结算）。
+    """
+    acb = ACB(id=f"A-{resource}-{uuid.uuid4().hex[:8]}", run_id="R", task_id="T")
+    node = h.budget.create_node(f"B-{acb.id}", 100)
+    node.owner = acb.id
+    acb.budget_node = node
+    resv = h.budget.reserve(node.node_id, node.limits)
+    if resv is not None:
+        acb.reservation_ids = [resv.reservation_id]
     return acb
 
 

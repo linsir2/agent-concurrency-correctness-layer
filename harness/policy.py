@@ -51,10 +51,26 @@ class PolicyEngine:
         self.default_allow = default_allow
         self.default_token = default_token
 
-    def issue(self, token: CapabilityToken) -> None:
-        if not token.agent_id:
-            raise ValueError("issue() 需要 agent_id")
+    def issue(self, arg, *, tools: Optional[set[str]] = None,
+              paths: Optional[set[str]] = None,
+              network: Optional[set[str]] = None,
+              data_class: str = "*",
+              allow_legacy: bool = False) -> CapabilityToken:
+        """两种用法：
+
+        - `issue(agent_id, tools=...)`        ← 新签名（生产推荐）
+        - `issue(token, allow_legacy=True)`   ← 旧签名，仅测试/兼容
+        """
+        if isinstance(arg, CapabilityToken):
+            if not allow_legacy:
+                raise ValueError(
+                    "issue(token) 仅允许 allow_legacy=True（防自证身份）")
+            token = arg
+        else:
+            token = CapabilityToken(arg, tools=tools, paths=paths,
+                                    network=network, data_class=data_class)
         self._tokens[token.agent_id] = token
+        return token
 
     def check_capability(self, agent_id: str, tool: str, path: str = "") -> bool:
         token = self._tokens.get(agent_id)

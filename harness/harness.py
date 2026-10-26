@@ -8,14 +8,14 @@ from __future__ import annotations
 import hashlib
 import threading
 
-from .budget import BudgetManager
+from .budget import BudgetManager, Reservation
 from .checkpoint import CheckpointStore, EffectJournal
 from .clock import SystemClock
 from .context import ContextAssembler
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
 from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
-                            RunCoordinator, Scheduler)
+                            RunCoordinator, Scheduler, SlotTracker)
 from .policy import PolicyEngine
 from .resolver import ScriptedResolver
 from .runtime import AgentRuntime
@@ -76,6 +76,8 @@ class Harness:
         self.resolver = (resolver if resolver is not None
                          else ScriptedResolver())       # §7 默认 scripted（不联网）
 
+        self.slots = SlotTracker(max_concurrent)
+        self.checkpoints.slots = self.slots        # checkpoint 快照活跃槽位
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)
         self.scheduler = Scheduler(self)
@@ -280,6 +282,21 @@ class Harness:
         self.intents.bump_epoch()
 
     # ---- 端到端运行 -----------------------------------------------
+    def dispatch_and_run(self, plan: dict, task_id: str, decisions, *,
+                         required_tools: set[str] | None = None,
+                         crash_at=None) -> ACB:
+        """唯一生产入口：try_admit → 注册 plan/acb → run_task → 返回 acb。"""
+        run_id = plan["run_id"]
+        acb = self.dispatcher.try_admit(plan["tasks"][task_id], run_id,
+                                        required_tools=required_tools)
+        self.plans[run_id] = plan
+        self.acbs[acb.id] = acb
+        self.run_coordinator.register(acb)
+        if acb.state is not TaskState.ADMITTED:
+            return acb
+        self.run_task(acb, decisions, crash_at=crash_at)
+        return acb
+
     def run_task(self, acb: ACB, decisions, crash_at=None) -> Status:
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
@@ -301,9 +318,10 @@ class Harness:
             plan["tasks"][acb.task_id]["state"] = acb.state
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
                          TaskState.DONE, TaskState.DONE_PARTIAL, TaskState.QUARANTINED):
-            # 终态 + QUARANTINED 释放预算（文档 §5.5：非终态但不再消耗，必须释放防泄漏）
-            if acb.budget_node is not None:
-                self.budget.release(acb.budget_node.node_id)
+            # 终态 + QUARANTINED 结算全部预留（文档 §5.5：未消耗部分归还，已消耗留账）
+            for rid in list(acb.reservation_ids):
+                self.budget.settle(rid)
+        self.slots.release(acb.id)
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
             self.propagate_failure(acb.task_id,
                                    plan["tasks"][acb.task_id].get("plan_version", 1)
@@ -320,8 +338,8 @@ class Harness:
         r = advance(acb, "replan_budget_exhausted")     # QUARANTINED → DEAD_LETTER（合法边）
         if r != Status.OK:
             return r
-        if acb.budget_node is not None:
-            self.budget.release(acb.budget_node.node_id)
+        for rid in list(acb.reservation_ids):
+            self.budget.settle(rid)
         plan = self.plans.get(acb.run_id)
         if plan and acb.task_id in plan["tasks"]:
             self.propagate_failure(acb.task_id,
@@ -345,11 +363,78 @@ class Harness:
         acb.hitl_result = data.get("hitl_result")
         acb.rebase_attempts = data.get("rebase_attempts", 0)
         acb.retry_budget = data.get("retry_budget", 3)
-        if acb.budget_node is None:
-            node_id = f"B-{acb.task_id}"
-            acb.budget_node = self.budget._nodes.get(node_id) or self.budget.create_node(
-                node_id, 10)
+        acb.needs_readmit = bool(data.get("needs_readmit", False))
+        self._restore_budget(acb, data)
+        if not self.slots.try_acquire(acb.id):
+            acb.state = TaskState.QUARANTINED
+            acb.failure = "NO_SLOT"
         self.bump_epoch()
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
         return acb
+
+    def _restore_budget(self, acb: ACB, data: dict) -> None:
+        """恢复预算节点与预留（K-3：不重建对象链，只恢复计数与句柄）。
+
+        - 无 `budget_node_id` → 不建节点、不改 budget，标记 `needs_readmit`；
+        - 有节点 → 复用（或按 `budget_limits`/`budget_parent_id` 重建），
+          且只对**无子**节点恢复快照计数；
+        - 子树计数绝不用快照覆盖，而是 `self_reserved + Σ children.subtree`；
+        - `rid` 与既有 `_reservations` 冲突则跳过。
+        """
+        node_id = data.get("budget_node_id")
+        if not node_id:
+            acb.reservation_ids = []
+            acb.budget_node = None
+            acb.needs_readmit = True
+            return
+
+        reservation_ids = list(data.get("reservation_ids") or [])
+        node = self.budget._nodes.get(node_id)
+        if node is None:
+            limits = int(data.get("budget_limits") or 0)
+            parent_id = data.get("budget_parent_id") or "run"
+            if limits <= 0:
+                raise RuntimeError(
+                    f"无法恢复预算节点 {node_id}：checkpoint 缺少有效 budget_limits；"
+                    "请上层重新 try_admit")
+            node = self.budget.create_node(node_id, limits, parent_id=parent_id)
+            if node is None:
+                raise RuntimeError(
+                    f"无法恢复预算节点 {node_id}"
+                    f"（parent={parent_id}, limits={limits}）；请上层重新 try_admit")
+
+        # 无子节点可恢复快照计数；有子节点则子树必须由「自身 + 子」重算
+        if not node.children:
+            node.self_reserved = int(data.get("budget_self", 0))
+            node.consumed = int(data.get("budget_consumed", 0))
+        old_subtree = node.subtree_reserved
+        node.subtree_reserved = node.self_reserved + sum(
+            c.subtree_reserved for c in node.children)
+        self._propagate_subtree_delta(node, node.subtree_reserved - old_subtree)
+
+        restored: list[str] = []
+        consumed = node.consumed
+        for index, rid in enumerate(reservation_ids):
+            existing = self.budget._reservations.get(rid)
+            if existing is not None and existing[0] is not node:
+                continue                          # 归属冲突 → 跳过该 rid
+            if index == 0:
+                # 聚合计数无法逐笔还原：第一笔承载全部余额，其余置为终态
+                resv = Reservation(rid, node_id, node.self_reserved, consumed)
+            else:
+                resv = Reservation(rid, node_id, 0, 0, "SETTLED")
+            # checkpoint 是崩溃点的真相：同节点旧句柄按快照重建
+            node.reservations[rid] = resv
+            self.budget._reservations[rid] = (node, resv)
+            restored.append(rid)
+        acb.budget_node = node
+        acb.reservation_ids = restored
+        acb.needs_readmit = False
+
+    @staticmethod
+    def _propagate_subtree_delta(node, delta: int) -> None:
+        parent = node.parent
+        while parent is not None:
+            parent.subtree_reserved += delta
+            parent = parent.parent

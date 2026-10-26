@@ -207,17 +207,6 @@ class Lease:
 
 
 @dataclass
-class Reservation:
-    """预算预留句柄（S4 起 `reserve` 返回它，`release` 幂等）。"""
-    reservation_id: str
-    node_id: str
-    amount: int
-
-    def __bool__(self) -> bool:
-        return True
-
-
-@dataclass
 class Event:
     """文档 §4.5 Event。全局单调 seq（B3：只有 EventLog 能分配）。"""
     seq: int
@@ -286,6 +275,8 @@ class ACB:
     subscriptions: set = field(default_factory=set)
     event_log: list = field(default_factory=list)
     budget_node: Any = None
+    reservation_ids: list[str] = field(default_factory=list)
+    needs_readmit: bool = False       # 恢复时无预算信息 → 由调用方重新 try_admit
     leases: list = field(default_factory=list)
     deadline: Optional[int] = None
     step: int = 0
