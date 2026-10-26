@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Optional, Protocol
 
 from .types import (ACB, Event, EventKind, Lease, Mode, Reservation, Result,
-                    Status, Write)
+                    Write)
 
 
 class Clock(Protocol):
@@ -49,7 +49,7 @@ class EventLog(Protocol):
 
 class IntentRegistry(Protocol):
     def reserve(self, resource: str, agent_id: str, base_version: int,
-                ttl_ms: int = 5000, mode: str = "W") -> Lease:
+                ttl_ms: int = 5000, mode: str = "WRITE") -> Lease:
         ...
 
     def is_valid(self, lease: Lease) -> bool:
@@ -86,13 +86,19 @@ class BudgetManager(Protocol):
 
 
 class Workspace(Protocol):
+    def put(self, resource: str, content) -> Any:
+        ...
+
     def stage(self, acb: ACB, resource: str, content) -> None:
         ...
 
-    def prepare(self, acb: ACB, w: Write, lease: Lease, mode: Mode) -> Status:
+    def prepare(self, acb: ACB, w: Write, lease: Lease, mode: Mode) -> Result:
         ...
 
-    def apply(self, acb: ACB, w: Write, lease: Lease, mode: Mode) -> Status:
+    def apply(self, acb: ACB, w: Write, lease: Lease, mode: Mode) -> Result:
+        ...
+
+    def get(self, name: str):
         ...
 
     def version(self, name: str) -> int:
@@ -101,7 +107,7 @@ class Workspace(Protocol):
     def content_hash(self, name: str) -> str:
         ...
 
-    def get(self, name: str):
+    def lock_for(self, resource: str):
         ...
 
     def compute_reverse_patch(self, w: Write):

@@ -62,7 +62,7 @@ def test_i9_plan_valid_acyclic():
 def test_i10_isolation_private_worktree_invisible():
     """I10：Z3 私有 worktree 对共享态不可见（stage 不改变共享态）。"""
     h = make_harness()
-    seed(h, "r", "shared")
+    v0 = seed(h, "r", "shared")
     plan = h.planner.plan("I10", [{"task_id": "T1", "min_budget": 10}])
     h.plans["I10"] = plan
     acb = admit(h, "I10", plan, "T1")
@@ -70,7 +70,7 @@ def test_i10_isolation_private_worktree_invisible():
     h.runtime._do_action(acb, stage("r", "private-edit"), 0)
     assert acb.staged["r"] == "private-edit"      # 写在 worktree
     assert h.workspace.get("r") == "shared"       # 共享态未变
-    assert h.workspace.version("r") == 0
+    assert h.workspace.version("r") == v0
 
 
 def test_i13_receipt_chain():

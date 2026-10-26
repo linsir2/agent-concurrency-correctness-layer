@@ -761,11 +761,12 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 |---|---|---|---|
 | **S0** | ✅ 完成（2026-10-26） | `pyproject.toml`（markers + coverage 配置）、`harness/clock.py`、`harness/types.py`（Event 全字段 / `Result` / `TaskState`+`RunState` / `TRANSITIONS` / `advance` / `Reservation` / ACB 新字段）、`harness/protocols.py`、`EventLog.append_batch`、`Harness` 注入图 + deny-by-default + `default_token` | **44 passed**（原 35 + 新增 9）；`pytest -m ms0` → 9 passed / 35 deselected；`pytest --markers` 含 ms0–ms3、fault |
 | **S1** | ✅ 完成（2026-10-26） | `harness/storage/atomic.py`（`write_all` 循环写 / 同目录临时文件 / `os.replace` / `fsync` 目录）、`blob.py`（内容寻址 + `canonical_bytes`）、`wal.py`（`magic+len+crc32+payload` 帧、整帧一次 `fdatasync`、恢复校验 seq 连续、尾部截断 vs 中段 `WalCorrupt`）、`WalEventLog` | **49 passed**；`pytest -m ms0` → 14 passed；T1 尾部半帧截断、T2 独立进程读到（真 fsync）、T3 中段坏帧抛 `WalCorrupt`、T4′ 重放重建 seq/索引 |
-| S2 | ⏳ 待开工 | `workspace` manifest + blob + 锁序；`intent_registry` 注入时钟 | T5、T7 + T4（提交点 vs manifest 一致） |
+| **S2** | ✅ 完成（2026-10-26） | `workspace` manifest+blob 读模型、每资源锁 + 全序批量获取、`put` 推进版本、前像随 WAL 重建、`intent_registry` 注入时钟与过期语义、`commit_batch` 全序提交（读集合加锁、提交点前复验、锁外通知） | **59 passed**（+10）；T4/T5/T5b/T7 + 6 个回归；11 个测试改相对基线；详见 [S2 方案 v1.3](s2-workspace-and-locks.md) §12 |
 
-**S0 / S1 的已知偏差（记录在案）**：
+**S0 / S1 / S2 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。
 2. `TaskState.DONE_PARTIAL` 暂留在枚举里（标注「归属 RunState」），S4 随 `test_a11` 重写时移除。
 3. `IntentRegistry.reserve` / `BudgetManager.reserve` / `CapabilityToken.agent_id` 的签名**未改** —— 按 §2.2「签名随测试重写一起收紧」的规则，分别在 S2 / S4 / S7 执行。
 4. **T4 从 S1 挪到 S2**：T4 验的是「WAL 已提交但 manifest 未更新 → 重放修复」，而 manifest 在 S2 才存在。S1 先交付 T4′（重放重建 seq / by_subject / event_id），T4 与 manifest 一起验。
 5. WAL 阶段一**不轮转**（单段无上限），因此 T3 的「中段坏帧」判定不需要处理多段拼接；轮转 + 删除随 MS6 的 cursor floor 一起做。
+6. **S2 的实现与文档有 6 处必要偏离**（读集合加锁、租约先于资源锁、复验位置、锁外通知、提交后刷新读版本、`staged` 回退），逐条见 [S2 方案 §5.5.1](s2-workspace-and-locks.md)；7 条已知边界见其 §12.4。

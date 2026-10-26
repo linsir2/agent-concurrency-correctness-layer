@@ -7,30 +7,32 @@ from conftest import (admit, commit, decision, finish, hitl, make_harness,
                       seed, stage, state_of, tool)
 from harness import Mode, Status, TaskState, Write
 from harness.runtime import CrashInjected
+from harness.storage.blob import canonical_bytes
 
 
 # ---------------------------------------------------------------- A1
 def test_a1_compensation_cross_no_overwrite():
     """A1：走**完整 compensate 流程** → REJECT_COMPENSATE → PIVOT，不覆写 B 的值。"""
     h = make_harness()
-    seed(h, "fileX", "base")
+    v0 = seed(h, "fileX", "base")
 
     plan = h.planner.plan("A1", [{"task_id": "T1"}, {"task_id": "T2"}])
     h.plans["A1"] = plan
 
     # A 提交 fileX@v1（内容 A）
     a = admit(h, "A1", plan, "T1")
-    a.base_version["fileX"] = 0
-    a.read_set["fileX"] = 0
+    a.base_version["fileX"] = v0
+    a.read_set["fileX"] = v0
     a.staged["fileX"] = "A"
     assert h.commit_batch(a, [Write("fileX", content="A")]) == Status.OK
     hash_of_A = h.workspace.content_hash("fileX")
-    assert hash_of_A == h.workspace.content_hash("fileX")   # 自洽基线
+    # 内容寻址：指纹必须等于 sha256(canonical_bytes("A"))（而非同值自比）
+    assert hash_of_A == h.workspace._blobs.put(canonical_bytes("A"))
 
     # B 提交 fileX@v2（内容 B）
     b = admit(h, "A1", plan, "T2")
-    b.base_version["fileX"] = 1
-    b.read_set["fileX"] = 1
+    b.base_version["fileX"] = v0 + 1
+    b.read_set["fileX"] = v0 + 1
     b.staged["fileX"] = "B"
     assert h.commit_batch(b, [Write("fileX", content="B")]) == Status.OK
     assert h.workspace.get("fileX") == "B"
@@ -38,7 +40,7 @@ def test_a1_compensation_cross_no_overwrite():
 
     # A 触发补偿（模拟同批后续写失败）→ 反写前复验失败 → PIVOT
     w = Write("fileX", content="A")
-    w.version_before = 0
+    w.version_before = v0
     w.applied_hash = hash_of_A                 # A apply 时的 hash
     h.compensate(a, [w])
 
@@ -74,21 +76,25 @@ def test_a2_parent_done_child_budget_transfer():
 def test_a3_compensation_crash_midway():
     """A3：补偿中途崩溃 → compensation_journal 对账 → 只补未完成部分。"""
     h = make_harness()
-    seed(h, "r1", "base1")
-    seed(h, "r2", "base2")
+    v1 = seed(h, "r1", "base1")
+    v2 = seed(h, "r2", "base2")
 
     plan = h.planner.plan("A3", [{"task_id": "T1"}])
     h.plans["A3"] = plan
     acb = admit(h, "A3", plan, "T1")
-    acb.base_version = {"r1": 0, "r2": 0}
-    acb.read_set = {"r1": 0, "r2": 0}
-
-    w1 = Write("r1", content="v1")
-    w2 = Write("r2", content="v2")
-    assert h.commit_batch(acb, [w1]) == Status.OK
-    assert h.commit_batch(acb, [w2]) == Status.OK
+    acb.staged = {"r1": "v1", "r2": "v2"}
+    # 走框架 commit 路径：提交后由 runtime 刷新 read_set/base_version（无需手工刷新）
+    h.run_task(acb, [decision(1, commit("r1"), commit("r2"))])
+    assert h.workspace.get("r1") == "v1"
+    assert h.workspace.get("r2") == "v2"
 
     # 模拟：w2 补偿完成（journal 记录），w1 补偿中途崩溃 → 恢复后只补 w1
+    w1 = Write("r1", content="v1")
+    w1.version_before = v1
+    w1.applied_hash = h.workspace.content_hash("r1")
+    w2 = Write("r2", content="v2")
+    w2.version_before = v2
+    w2.applied_hash = h.workspace.content_hash("r2")
     w2.compensated = True
     h.compensate(acb, [w1, w2])       # w2 已 compensated → SKIPPED
 

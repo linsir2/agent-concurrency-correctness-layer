@@ -99,24 +99,31 @@ class Dispatcher:
                 return acb
 
         # ③ 契约/读-写冲突（文档 §7.3：先声明，再判定他人是否已声明同一依赖）
-        for dep in task["footprint"].get("logical_deps", []):
-            self.h.intents.declare_logical(dep["id"], acb.id, dep["kind"])
-            if not self.h.intents.compatible(dep["id"], acb.id, dep["kind"]):
-                acb.state = TaskState.INADMISSIBLE
-                acb.failure = "CONTRACT_CONFLICT"
-                return acb
+        declared: list[str] = []
+        try:
+            for dep in task["footprint"].get("logical_deps", []):
+                self.h.intents.declare_logical(dep["id"], acb.id, dep["kind"])
+                declared.append(dep["id"])
+                if not self.h.intents.compatible(dep["id"], acb.id, dep["kind"]):
+                    acb.state = TaskState.INADMISSIBLE
+                    acb.failure = "CONTRACT_CONFLICT"
+                    return acb
 
-        # ④ 预算
-        node_id = f"B-{task['task_id']}"
-        if not self.h.budget.create_node(node_id, task["footprint"]["min_budget"]):
-            acb.state = TaskState.INADMISSIBLE
-            return acb
-        if not self.h.budget.reserve(node_id, task["footprint"]["min_budget"]):
-            acb.state = TaskState.INADMISSIBLE
-            acb.failure = "BUDGET_EXHAUSTED"
-            return acb
-        acb.budget_node = self.h.budget._nodes[node_id]
-        acb.state = TaskState.ADMITTED
+            # ④ 预算
+            node_id = f"B-{task['task_id']}"
+            if not self.h.budget.create_node(node_id, task["footprint"]["min_budget"]):
+                acb.state = TaskState.INADMISSIBLE
+                return acb
+            if not self.h.budget.reserve(node_id, task["footprint"]["min_budget"]):
+                acb.state = TaskState.INADMISSIBLE
+                acb.failure = "BUDGET_EXHAUSTED"
+                return acb
+            acb.budget_node = self.h.budget._nodes[node_id]
+            acb.state = TaskState.ADMITTED
+        finally:
+            if acb.state != TaskState.ADMITTED:        # 失败回滚已声明的逻辑依赖
+                for dep_id in declared:
+                    self.h.intents.undeclare_logical(dep_id, acb.id)
         self.h.event_log.append(EventKind.BUDGET_RESERVED, node_id,
                                 {"amount": task["footprint"]["min_budget"]})
         return acb

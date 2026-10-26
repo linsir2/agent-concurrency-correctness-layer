@@ -76,6 +76,9 @@ class _EventLogBase:
     def subscribe(self, fn: Callable[[Event], None]) -> None:
         self._subscribers.append(fn)
 
+    def notify_events(self, events: list[Event]) -> None:
+        self._notify(events)
+
     def replay(self, subject: Optional[str] = None, from_seq: int = 0) -> Iterable[Event]:
         """按 `(resource, version)` 单调投递（文档 §5.6）。"""
         source = self._by_subject.get(subject, []) if subject else self._events
@@ -94,10 +97,10 @@ class _EventLogBase:
     # 子类必须实现 append / append_batch
     def append(self, kind, subject: str, payload=None, producer: str = "",
                caused_by: str = "", idempotency_key: str = "", *,
-               run_id: str = "") -> Event:
+               run_id: str = "", notify: bool = True) -> Event:
         raise NotImplementedError
 
-    def append_batch(self, drafts: list[dict]) -> list[Event]:
+    def append_batch(self, drafts: list[dict], notify: bool = True) -> list[Event]:
         raise NotImplementedError
 
     def append_in_txn(self, kind, subject: str, payload=None, producer: str = "",
@@ -117,17 +120,18 @@ class EventLog(_EventLogBase):
 
     def append(self, kind, subject: str, payload=None, producer: str = "",
                caused_by: str = "", idempotency_key: str = "", *,
-               run_id: str = "") -> Event:
+               run_id: str = "", notify: bool = True) -> Event:
         with self._lock:
             self._seq += 1
             rec = _draft(kind, subject, payload, producer, caused_by,
                          idempotency_key, run_id, self._clock)
             rec["seq"] = self._seq
             ev = self._index(_event(rec))
-        self._notify([ev])
+        if notify:
+            self._notify([ev])
         return ev
 
-    def append_batch(self, drafts: list[dict]) -> list[Event]:
+    def append_batch(self, drafts: list[dict], notify: bool = True) -> list[Event]:
         events: list[Event] = []
         with self._lock:
             for d in drafts:
@@ -138,7 +142,8 @@ class EventLog(_EventLogBase):
                              self._clock)
                 rec["seq"] = self._seq
                 events.append(self._index(_event(rec)))
-        self._notify(events)
+        if notify:
+            self._notify(events)
         return events
 
 
@@ -159,14 +164,14 @@ class WalEventLog(_EventLogBase):
 
     def append(self, kind, subject: str, payload=None, producer: str = "",
                caused_by: str = "", idempotency_key: str = "", *,
-               run_id: str = "") -> Event:
+               run_id: str = "", notify: bool = True) -> Event:
         return self.append_batch([{
             "kind": kind, "subject": subject, "payload": payload,
             "producer": producer, "caused_by": caused_by,
             "idempotency_key": idempotency_key, "run_id": run_id,
-        }])[0]
+        }], notify=notify)[0]
 
-    def append_batch(self, drafts: list[dict]) -> list[Event]:
+    def append_batch(self, drafts: list[dict], notify: bool = True) -> list[Event]:
         with self._lock:
             prepared = [
                 _draft(d["kind"], d["subject"], d.get("payload"),
@@ -177,7 +182,8 @@ class WalEventLog(_EventLogBase):
             ]
             records = self._wal.append_frame(prepared)      # ← 提交点
             events = [self._index(_event(rec)) for rec in records]
-        self._notify(events)
+        if notify:
+            self._notify(events)
         return events
 
     def close(self) -> None:

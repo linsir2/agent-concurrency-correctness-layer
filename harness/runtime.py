@@ -77,16 +77,21 @@ class AgentRuntime:
             self.h.workspace.stage(acb, action.resource, action.content)
             acb.subscriptions.add(action.resource)
             self.h.subscriptions.add(acb.id, action.resource)   # 读即订阅（文档 §5.6）
-            acb.read_set.setdefault(action.resource, self.h.workspace.version(action.resource))
             return Status.OK
 
         if action.kind == "commit":
+            for w in action.writes:               # 未暂存的资源不得提交
+                if w.resource not in acb.staged:
+                    return Status.INVALID_INPUT
             writes = [Write(resource=w.resource, content=acb.staged.get(w.resource))
                       for w in action.writes]
             st = self.h.commit_batch(acb, writes, Mode.COMMIT)
             if st == Status.OK:
                 for w in action.writes:           # 已提交的从 staged 移除（避免重复提交）
                     acb.staged.pop(w.resource, None)
+                    new_ver = self.h.workspace.version(w.resource)   # 刷新为写入后的新版本
+                    acb.read_set[w.resource] = new_ver
+                    acb.base_version[w.resource] = new_ver
             return st
 
         if action.kind == "tool":

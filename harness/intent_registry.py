@@ -1,9 +1,9 @@
 """IntentRegistry —— 文档 §4.4 / §5.4。
 
 - `reserve`：非阻塞预留（对应 TCC 的 Try）
-- `is_valid`：按租约有效性判定（v1.2 P0-3，替代全局单调 token）
+- `is_valid`：无锁只读，按 `valid`/`epoch`/`expires_at` 判定（§6.4）
 - `revoke`：只作废该租约（不误拒他人）
-- `renew`：只对当前 epoch 生效（revoke 后不可复活）
+- `renew`：检查过期并续期；只对当前 epoch 生效（revoke 后不可复活）
 - `compatible`：准入判定，只拦契约/不变量与读-写方向冲突（**不拦同资源写-写**）
 """
 
@@ -12,11 +12,13 @@ from __future__ import annotations
 import itertools
 import threading
 
+from .clock import SystemClock
 from .types import Lease
 
 
 class IntentRegistry:
-    def __init__(self) -> None:
+    def __init__(self, clock=None) -> None:
+        self._clock = clock or SystemClock()
         self._leases: dict[str, Lease] = {}
         self._active: dict[str, list[Lease]] = {}
         self._logical: dict[str, dict[str, str]] = {}   # dep_id -> {agent_id: kind}
@@ -29,9 +31,21 @@ class IntentRegistry:
         with self._lock:
             self._logical.setdefault(dep_id, {})[agent_id] = kind
 
+    def undeclare_logical(self, dep_id: str, agent_id: str) -> None:
+        """撤销逻辑依赖声明（准入失败回滚用）。"""
+        with self._lock:
+            holders = self._logical.get(dep_id)
+            if not holders or agent_id not in holders:
+                return
+            del holders[agent_id]
+            if not holders:
+                self._logical.pop(dep_id, None)
+
     def reserve(self, resource: str, agent_id: str, base_version: int,
                 ttl_ms: int = 5000, mode: str = "WRITE") -> Lease:
         with self._lock:
+            mode = "W" if mode == "WRITE" else mode
+            expires_at = 0 if ttl_ms <= 0 else self._clock.now_ms() + ttl_ms
             lease = Lease(
                 lease_id=f"L{next(self._counter)}",
                 resource=resource,
@@ -39,14 +53,26 @@ class IntentRegistry:
                 epoch=self._epoch,
                 ttl_ms=ttl_ms,
                 valid=True,
+                mode=mode,
+                expires_at=expires_at,
             )
             self._leases[lease.lease_id] = lease
             self._active.setdefault(resource, []).append(lease)
             return lease
 
     def is_valid(self, lease: Lease) -> bool:
-        cur = self._leases.get(lease.lease_id)
-        return bool(cur and cur.valid and cur.epoch == lease.epoch)
+        """无锁只读：按 `lease_id` 查注册表当前租约，再判 valid/epoch/expires_at。
+
+        注册表无该 `lease_id`（如调用方持有外部租约）时回退到传入对象。
+        """
+        cur = self._leases.get(lease.lease_id, lease)
+        if not cur.valid:
+            return False
+        if cur.epoch != self._epoch:
+            return False
+        if cur.expires_at == 0:
+            return True
+        return self._clock.now_ms() < cur.expires_at
 
     def revoke(self, lease: Lease) -> None:
         """只作废该租约（文档 §5.4 P0-3）。"""
@@ -63,24 +89,34 @@ class IntentRegistry:
                 self.revoke(lease)
 
     def renew(self, lease: Lease) -> bool:
-        """只对当前 epoch 生效；revoke 后不可复活（文档 §4.4）。"""
+        """检查过期并续期；只对当前 epoch 生效（revoke 后不可复活，文档 §3.3/§4.4）。"""
         with self._lock:
-            if self._epoch != lease.epoch:
+            if lease.epoch != self._epoch:
                 return False
             cur = self._leases.get(lease.lease_id)
-            if cur and cur.valid:
-                return True
-            return False
+            if cur is None or not cur.valid:
+                return False
+            now = self._clock.now_ms()
+            if cur.expires_at != 0 and now >= cur.expires_at:
+                return False
+            cur.expires_at = now + cur.ttl_ms
+            lease.expires_at = cur.expires_at
+            return True
 
     def renew_for(self, acb) -> bool:
-        """guard 中调用：续期该 agent 的所有有效租约（v1.10 修复）。"""
+        """guard 中调用：续期该 agent 的所有未过期有效租约（v1.10 修复）。"""
         with self._lock:
-            if self._epoch == 0:
-                return True
+            now = self._clock.now_ms()
             ok = False
             for lease in self._leases.values():
-                if lease.agent_id == acb.id and lease.valid and lease.epoch == self._epoch:
-                    ok = True
+                if lease.agent_id != acb.id or lease.epoch != self._epoch:
+                    continue
+                if not lease.valid:
+                    continue
+                if lease.expires_at != 0 and now >= lease.expires_at:
+                    continue
+                lease.expires_at = now + lease.ttl_ms
+                ok = True
             return ok
 
     def bump_epoch(self) -> None:

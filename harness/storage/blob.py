@@ -14,12 +14,18 @@ from typing import Any, Protocol
 from .atomic import atomic_write
 
 
+_BYTES_PREFIX = b"\x00BYTES\x00"   # 魔数前缀：JSON 输出不会以 \x00 开头
+
+
 def canonical_bytes(obj: Any) -> bytes:
-    """确定性序列化：键排序 + 紧凑分隔符 + 不转义非 ASCII。"""
+    """确定性序列化：键排序 + 紧凑分隔符 + 不转义非 ASCII。
+
+    `bytes` 加魔数前缀，避免 `b'{"a":1}'` 被下游 `json.loads` 误解码成 dict。
+    """
     if isinstance(obj, bytes):
-        return obj
+        return _BYTES_PREFIX + obj
     if isinstance(obj, bytearray):
-        return bytes(obj)
+        return _BYTES_PREFIX + bytes(obj)
     return json.dumps(obj, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, default=str).encode("utf-8")
 

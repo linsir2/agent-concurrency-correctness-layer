@@ -14,7 +14,7 @@ from harness.runtime import CrashInjected
 def test_u1_parallel_refactor_serial_branch():
     """U1 分支 A：committed 写集重叠 → DAG 串行 → 无冲突，顺序提交。"""
     h = make_harness()
-    seed(h, "src/auth/types.ts", {"fields": []})
+    v0 = seed(h, "src/auth/types.ts", {"fields": []})
 
     plan = h.planner.plan("R1", [
         {"task_id": "T1", "committed": ["src/auth/login.ts", "src/auth/types.ts"]},
@@ -28,7 +28,7 @@ def test_u1_parallel_refactor_serial_branch():
     h.run_task(a1, [decision(1, stage("src/auth/types.ts", {"fields": ["JwtPayload"]}),
                              stage("src/auth/login.ts", {"fn": "login"}),
                              commit("src/auth/types.ts", "src/auth/login.ts"))])
-    assert h.workspace.version("src/auth/types.ts") == 1
+    assert h.workspace.version("src/auth/types.ts") == v0 + 1
     assert a1.state == TaskState.DONE
 
     # T2 基于 v1 提交
@@ -36,7 +36,7 @@ def test_u1_parallel_refactor_serial_branch():
     h.run_task(a2, [decision(1, stage("src/auth/types.ts", {"fields": ["JwtPayload", "Session"]}),
                              stage("src/auth/session.ts", {"fn": "session"}),
                              commit("src/auth/types.ts", "src/auth/session.ts"))])
-    assert h.workspace.version("src/auth/types.ts") == 2
+    assert h.workspace.version("src/auth/types.ts") == v0 + 2
 
     # T3 基于 v2 提交
     a3 = admit(h, "R1", plan, "T3")
@@ -44,7 +44,7 @@ def test_u1_parallel_refactor_serial_branch():
                                       {"fields": ["JwtPayload", "Session", "OAuth"]}),
                              stage("src/auth/oauth.ts", {"fn": "oauth"}),
                              commit("src/auth/types.ts", "src/auth/oauth.ts"))])
-    assert h.workspace.version("src/auth/types.ts") == 3
+    assert h.workspace.version("src/auth/types.ts") == v0 + 3
     assert a3.state == TaskState.DONE
     assert state_of(h, "R1", "T1") == TaskState.DONE
 
@@ -52,7 +52,7 @@ def test_u1_parallel_refactor_serial_branch():
 def test_u1_parallel_refactor_concurrent_conflict_and_merge():
     """U1 分支 B：concurrent 写同一资源 → 一方 CONFLICT → 3-way merge。"""
     h = make_harness()
-    seed(h, "src/auth/types.ts", {"fields": []})
+    v0 = seed(h, "src/auth/types.ts", {"fields": []})
 
     plan = h.planner.plan("R1", [{"task_id": "T1", "contingent": ["src/auth/types.ts"]},
                                  {"task_id": "T2", "contingent": ["src/auth/types.ts"]}])
@@ -61,11 +61,11 @@ def test_u1_parallel_refactor_concurrent_conflict_and_merge():
     a1 = admit(h, "R1", plan, "T1")
     h.run_task(a1, [decision(1, stage("src/auth/types.ts", {"fields": ["A"]}),
                              commit("src/auth/types.ts"))])
-    assert h.workspace.version("src/auth/types.ts") == 1
+    assert h.workspace.version("src/auth/types.ts") == v0 + 1
 
     a2 = admit(h, "R1", plan, "T2")
-    a2.base_version["src/auth/types.ts"] = 0          # 陈旧 base
-    a2.read_set["src/auth/types.ts"] = 0
+    a2.base_version["src/auth/types.ts"] = v0          # 陈旧 base
+    a2.read_set["src/auth/types.ts"] = v0
     st = h.commit_batch(a2, [__import__("harness").Write("src/auth/types.ts",
                                                           content={"fields": ["B"]})])
     assert st == Status.CONFLICT
@@ -76,12 +76,12 @@ def test_u1_parallel_refactor_concurrent_conflict_and_merge():
     merged = result["merged"]
     assert merged == {"a": 1, "b": 2, "c": 3}
 
-    a2.base_version["src/auth/types.ts"] = 1
-    a2.read_set["src/auth/types.ts"] = 1
+    a2.base_version["src/auth/types.ts"] = v0 + 1
+    a2.read_set["src/auth/types.ts"] = v0 + 1
     a2.staged["src/auth/types.ts"] = merged
     st2 = h.commit_batch(a2, [__import__("harness").Write("src/auth/types.ts", content=merged)])
     assert st2 == Status.OK
-    assert h.workspace.version("src/auth/types.ts") == 2
+    assert h.workspace.version("src/auth/types.ts") == v0 + 2
     assert h.workspace.get("src/auth/types.ts") == {"a": 1, "b": 2, "c": 3}
 
 
@@ -89,7 +89,7 @@ def test_u1_parallel_refactor_concurrent_conflict_and_merge():
 def test_u2_parallel_review_conflict_and_rebase():
     """U2：reviewer 并发写同一文件 → CONFLICT → rebase → 最终无丢失更新。"""
     h = make_harness()
-    seed(h, "src/a.ts", {"issues": []})
+    v0 = seed(h, "src/a.ts", {"issues": []})
 
     plan = h.planner.plan("R2", [{"task_id": "R1"}, {"task_id": "R2"}])
     h.plans["R2"] = plan
@@ -97,11 +97,11 @@ def test_u2_parallel_review_conflict_and_rebase():
     r1 = admit(h, "R2", plan, "R1")
     h.run_task(r1, [decision(1, stage("src/a.ts", {"issues": ["sql-injection"]}),
                              commit("src/a.ts"))])
-    assert h.workspace.version("src/a.ts") == 1
+    assert h.workspace.version("src/a.ts") == v0 + 1
 
     r2 = admit(h, "R2", plan, "R2")
-    r2.base_version["src/a.ts"] = 0
-    r2.read_set["src/a.ts"] = 0
+    r2.base_version["src/a.ts"] = v0
+    r2.read_set["src/a.ts"] = v0
     from harness import Write
     st = h.commit_batch(r2, [Write("src/a.ts", content={"issues": ["no-index"]})])
     assert st == Status.CONFLICT
@@ -109,18 +109,18 @@ def test_u2_parallel_review_conflict_and_rebase():
     merged = h.workspace.rebase_json({"issues": []},
                                      {"issues": ["sql-injection"]},
                                      {"issues": ["no-index"]})["merged"]
-    r2.base_version["src/a.ts"] = 1
-    r2.read_set["src/a.ts"] = 1
+    r2.base_version["src/a.ts"] = v0 + 1
+    r2.read_set["src/a.ts"] = v0 + 1
     r2.staged["src/a.ts"] = merged
     assert h.commit_batch(r2, [Write("src/a.ts", content=merged)]) == Status.OK
-    assert h.workspace.version("src/a.ts") == 2
+    assert h.workspace.version("src/a.ts") == v0 + 2
 
 
 # ---------------------------------------------------------------- U3
 def test_u3_batch_migration_json_aware_merge():
     """U3：5 个 agent 并发加 strict → JSON-aware merge 消解假冲突。"""
     h = make_harness()
-    seed(h, "tsconfig.json", {"compilerOptions": {}})
+    v0 = seed(h, "tsconfig.json", {"compilerOptions": {}})
 
     plan = h.planner.plan("R3", [
         {"task_id": f"M{i}", "contingent": ["tsconfig.json"],
@@ -145,7 +145,7 @@ def test_u3_batch_migration_json_aware_merge():
 
     assert all(v == Status.OK for v in versions)
     assert h.workspace.get("tsconfig.json")["compilerOptions"]["strict"] is True
-    assert h.workspace.version("tsconfig.json") == 5
+    assert h.workspace.version("tsconfig.json") == v0 + 5
 
 
 # ---------------------------------------------------------------- U4

@@ -19,7 +19,8 @@ from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
 from .policy import PolicyEngine
 from .runtime import AgentRuntime
 from .subscription import SubscriptionRegistry
-from .types import ACB, EventKind, Mode, Status, TaskState, Write
+from .types import ACB, EventKind, Mode, Result, Status, TaskState, Write
+from .storage.blob import InMemoryBlobStore, canonical_bytes
 from .workspace import WorkspaceManager, WorkspaceVersionStore
 
 
@@ -37,7 +38,8 @@ class Harness:
                  clock=None, event_log=None, intents=None, versions=None,
                  workspace=None, budget=None, checkpoints=None, effects=None,
                  policy=None, context=None, subscriptions=None,
-                 decide=None, default_token=None) -> None:
+                 decide=None, default_token=None,
+                 blobs=None, path_of=None, lock_timeout_s: float = 5.0) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -47,10 +49,14 @@ class Harness:
 
         self.clock = clock or SystemClock()
         self.event_log = event_log if event_log is not None else EventLog(clock=self.clock)
-        self.intents = intents if intents is not None else IntentRegistry()
+        self.blobs = blobs if blobs is not None else InMemoryBlobStore()
+        self.intents = intents if intents is not None else IntentRegistry(self.clock)
         self.versions = versions if versions is not None else WorkspaceVersionStore()
+        self.lock_timeout_s = lock_timeout_s
         self.workspace = (workspace if workspace is not None
-                          else WorkspaceManager(self.event_log, self.intents, self.versions))
+                          else WorkspaceManager(self.event_log, self.intents, self.versions,
+                                                blobs=self.blobs, path_of=path_of,
+                                                lock_timeout_s=lock_timeout_s))
         self.budget = budget if budget is not None else BudgetManager(run_limits)
         self.checkpoints = checkpoints if checkpoints is not None else CheckpointStore()
         self.effects = (effects if effects is not None
@@ -91,32 +97,95 @@ class Harness:
         payload = f"{acb.run_id}|{acb.logical_subgoal_id}|{action.tool}|{action.args}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
-    # ---- RSC 提交（文档 §5.4） ------------------------------------
+    # ---- RSC 提交（文档 §5.5） ------------------------------------
     def commit_batch(self, acb: ACB, writes: list[Write],
-                     mode: Mode = Mode.COMMIT) -> Status:
-        leases: list = []
-        applied: list[Write] = []
+                     mode: Mode = Mode.COMMIT) -> Result:
+        """公共写入口。提交点顺序不可调换：
+
+        ① 输入校验 → ② 预留租约(L0) → ③ 全序一次性持锁(L3，锁集合含读集合)
+        → ④ 校验 → ④′ 内容先落盘 → ⑤ 提交点前复验租约
+        → ⑥ 提交点（一次 fdatasync）→ ⑦ 投影 → ⑧ 锁外通知（不掩盖返回值）。
+        """
+        if not writes:
+            return Result(Status.OK, {"noop": True, "seq": None})
+        resources = {w.resource for w in writes}
+        if len(resources) != len(writes):                          # ① 同批重复 resource
+            return Result(Status.INVALID_INPUT,
+                          {"reason": "duplicate_resource", "resources": sorted(resources)})
+        contents = {w.resource: acb.staged.get(w.resource, w.content) for w in writes}
+        for w in writes:                                           # ① None 内容
+            if contents[w.resource] is None:
+                return Result(Status.INVALID_INPUT,
+                              {"reason": "none_content", "resource": w.resource})
+
+        resources |= set(acb.read_set)                             # ③ 读集合一并持锁 → 原子复验
+        leases: dict = {}
+        events = None
+        held: list[str] = []
         try:
-            for w in writes:
-                base = acb.read_set.get(w.resource, self.workspace.version(w.resource))
-                leases.append(self.intents.reserve(w.resource, acb.id, base, self.lease_ms))
+            for w in writes:                                       # ② 预留租约（L0）
+                base = self.workspace._base_of(acb, w.resource)
+                lease = self.intents.reserve(w.resource, acb.id, base, self.lease_ms)
+                if lease is None:
+                    return Result(Status.DENIED, {"resource": w.resource})
+                leases[w.resource] = lease
 
-            for w, lease in zip(writes, leases):
-                st = self.workspace.prepare(acb, w, lease, mode)
-                if st != Status.VALID:
-                    return st
+            held, ok = self.workspace._acquire_all(resources, timeout=self.lock_timeout_s)
+            if not ok:
+                return Result(Status.UPSTREAM_FAILED, {"reason": "lock_timeout", "held": held})
 
-            for w, lease in zip(writes, leases):
-                st = self.workspace.apply(acb, w, lease, mode)
-                if st != Status.OK:
-                    if mode == Mode.COMMIT:
-                        self.compensate(acb, applied)
-                    return st
-                applied.append(w)
-            return Status.OK
+            for w in writes:                                       # ④ 全部校验（锁内）
+                r = self.workspace._validate_locked(acb, w, leases[w.resource], mode)
+                if r != Status.VALID:
+                    return r
+
+            blob_hashes = {w.resource: self.blobs.put(canonical_bytes(contents[w.resource]))
+                           for w in writes}                        # ④′ 内容先落盘
+
+            for w in writes:                                       # ⑤ 提交点前复验租约
+                if not self.intents.is_valid(leases[w.resource]):
+                    return Result(Status.REJECT_STALE,
+                                  {"resource": w.resource,
+                                   "reason": "lease_expired_before_commit"})
+
+            drafts = [self._commit_record(acb, w, blob_hashes[w.resource]) for w in writes]
+            events = self.event_log.append_batch(drafts, notify=False)   # ⑥ 提交点
+
+            for w in writes:                                       # ⑦ 投影（可重放）
+                prev = (self.workspace.manifest[w.resource].blob_hash
+                        if w.resource in self.workspace.manifest else "")
+                self.workspace._apply_locked(acb, w, blob_hashes[w.resource], prev)
+            for w in writes:                                       # ⑦′ 自写后重读：刷新 ACB 读版本
+                new_version = self.workspace.version(w.resource)
+                acb.read_set[w.resource] = new_version
+                acb.base_version[w.resource] = new_version
+            return Result(Status.OK, {"resources": sorted(blob_hashes), "seq": events[-1].seq})
         finally:
-            for lease in leases:
-                self.intents.revoke(lease)
+            self.workspace._release_all(held)                      # 先释放资源锁
+            for lease in leases.values():
+                self.intents.revoke(lease)                         # 再 revoke 租约
+            if events is not None:                                 # ⑧ 锁外通知（不掩盖返回值）
+                try:
+                    self.event_log.notify_events(events)
+                except Exception:
+                    pass
+
+    def _commit_record(self, acb: ACB, w: Write, blob_hash: str) -> dict:
+        cur = self.workspace.manifest.get(w.resource)
+        return {
+            "kind": EventKind.RESOURCE_COMMITTED,          # ← 必须与重建过滤一致
+            "subject": w.resource,
+            "payload": {
+                "resource": w.resource,
+                "version": (cur.version if cur else 0) + 1,
+                "blob_hash": blob_hash,
+                "prev_hash": cur.blob_hash if cur else "",
+                "diff": {"prev_hash": cur.blob_hash if cur else "", "current_hash": blob_hash},
+            },
+            "producer": acb.id,
+            "run_id": acb.run_id,
+            "idempotency_key": f"{acb.run_id}:{acb.id}:{w.resource}",
+        }
 
     def compensate(self, acb: ACB, applied: list[Write]) -> None:
         """Saga 补偿：逆序回滚；`REJECT_COMPENSATE` → PIVOT；带 compensation_journal。"""
@@ -147,15 +216,15 @@ class Harness:
                 self.event_log.append(EventKind.COMPENSATION_FAILED, w.resource, {},
                                       producer=acb.id)
 
-    def _compensate_one(self, acb: ACB, w: Write) -> Status:
+    def _compensate_one(self, acb: ACB, w: Write) -> Result:
         """单写补偿，带**真正的**有界重试（v1.11 修复）。"""
         for _ in range(acb.retry_budget + 1):
             st = self.commit_batch(acb, [w], Mode.COMPENSATE)
             if st == Status.OK:
-                return Status.OK
+                return Result(Status.OK, {})
             if st == Status.REJECT_COMPENSATE:
                 return st
-        return Status.COMMIT_UNRECOVERABLE
+        return Result(Status.COMMIT_UNRECOVERABLE, {})
 
     # ---- 重规划（文档 §5.2④ / §8.1） ------------------------------
     def propagate_failure(self, task_id: str, plan_version: int) -> None:

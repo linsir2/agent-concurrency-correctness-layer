@@ -12,14 +12,14 @@ from harness import Mode, Status, TaskState, Write
 def test_i1_single_writer_commit():
     """I1：同一资源同一时刻只有一个写生效（提交层 CAS）。"""
     h = make_harness()
-    seed(h, "r", "v0")
+    v0 = seed(h, "r", "v0")
     plan = h.planner.plan("I1", [{"task_id": "T1", "min_budget": 10},
                                  {"task_id": "T2", "min_budget": 10}])
     h.plans["I1"] = plan
     a, b = admit(h, "I1", plan, "T1"), admit(h, "I1", plan, "T2")
     for acb in (a, b):
-        acb.base_version["r"] = 0
-        acb.read_set["r"] = 0
+        acb.base_version["r"] = v0
+        acb.read_set["r"] = v0
     a.staged["r"] = "A"
     b.staged["r"] = "B"
 
@@ -31,17 +31,17 @@ def test_i1_single_writer_commit():
 def test_i2_no_lost_update():
     """I2：覆盖写被拒并 rebase（不静默丢失）。"""
     h = make_harness()
-    seed(h, "r", "v0")
+    v0 = seed(h, "r", "v0")
     plan = h.planner.plan("I2", [{"task_id": "T1", "min_budget": 10}])
     h.plans["I2"] = plan
     acb = admit(h, "I2", plan, "T1")
-    acb.base_version["r"] = 0
-    acb.read_set["r"] = 0
+    acb.base_version["r"] = v0
+    acb.read_set["r"] = v0
     acb.staged["r"] = "v1"
     assert h.commit_batch(acb, [Write("r", content="v1")]) == Status.OK
 
-    acb.base_version["r"] = 0                 # 陈旧 base
-    acb.read_set["r"] = 0
+    acb.base_version["r"] = v0                 # 陈旧 base
+    acb.read_set["r"] = v0
     acb.staged["r"] = "v2-stale"
     assert h.commit_batch(acb, [Write("r", content="v2-stale")]) == Status.CONFLICT
     assert h.workspace.get("r") == "v1"       # 未被覆盖
@@ -92,7 +92,7 @@ def test_i7_effect_exactly_once():
 def test_i6_context_consistent_prefix():
     """I6：`materialized + ordered events` 是一个一致前缀（事件按 seq 有序）。"""
     h = make_harness()
-    seed(h, "r", {"v": 0})
+    v0 = seed(h, "r", {"v": 0})
     plan = h.planner.plan("I6", [{"task_id": "T1", "min_budget": 10}])
     h.plans["I6"] = plan
     acb = admit(h, "I6", plan, "T1")
@@ -100,8 +100,8 @@ def test_i6_context_consistent_prefix():
     h.subscriptions.add(acb.id, "r")
 
     for i in range(1, 6):
-        acb.base_version["r"] = i - 1
-        acb.read_set["r"] = i - 1
+        acb.base_version["r"] = v0 + i - 1
+        acb.read_set["r"] = v0 + i - 1
         acb.staged["r"] = {"v": i}
         assert h.commit_batch(acb, [Write("r", content={"v": i})]) == Status.OK
 
@@ -116,14 +116,14 @@ def test_i6_context_consistent_prefix():
 def test_i8_event_atomic_with_replace():
     """I8：资源提交与 WorkspaceEvent 同事务（本实现：同一临界区）。"""
     h = make_harness()
-    seed(h, "r", "v0")
+    v0 = seed(h, "r", "v0")
     plan = h.planner.plan("I8", [{"task_id": "T1", "min_budget": 10}])
     h.plans["I8"] = plan
     acb = admit(h, "I8", plan, "T1")
-    acb.base_version["r"] = 0
-    acb.read_set["r"] = 0
+    acb.base_version["r"] = v0
+    acb.read_set["r"] = v0
     acb.staged["r"] = "v1"
 
     assert h.commit_batch(acb, [Write("r", content="v1")]) == Status.OK
-    assert h.workspace.version("r") == 1
+    assert h.workspace.version("r") == v0 + 1
     assert h.event_log.has("r", __import__("harness").EventKind.RESOURCE_COMMITTED) is True

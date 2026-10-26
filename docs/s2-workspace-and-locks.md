@@ -2,12 +2,12 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | **v1.2（已确认 D-4/D-6 取舍）** |
+| 版本 | **v1.3（实现完成 + 实现后审查修订）** |
 | 日期 | 2026-10-26 |
 | 上游 | [第一阶段方案 v1.1](phase1-implementation-plan.md) §4.5/§4.6/§5.1/§6、[设计规范 v1.12](multi-agent-harness-design-final.md) §5.4/§6.1/§7.4 |
-| 覆盖测试 | T4（提交点 vs manifest + 前像重建）、T5（读集合陈旧 + `detail.resource`）、T5b（租约时钟过期）、T7（锁序不死锁） |
-| 交付判据 | 上述 4 组测试绿 + **原有 49 测试全绿**（其中 11 个需按 §7 调整版本基线） |
-| 修订 | v1.1 → v1.2：`put` 改为**推进版本**（D-4）；前像**随 WAL 重建**（D-6）；补 11 个测试的基线调整清单 |
+| 覆盖测试 | T4（提交点 vs manifest + 前像重建）、T5（读集合陈旧 + `detail.resource`）、T5b（租约时钟过期）、T7（锁序不死锁）+ 6 个回归测试 |
+| 交付判据 | **59 passed**（原 49 + 4 组 S2 用例 + 6 个回归），连跑 3 轮稳定 |
+| 修订 | v1.2 → v1.3：按实现后三路审查修 8 个 P0（§12）；文档回写 6 处必要偏离（§5.5.1） |
 
 ---
 
@@ -82,10 +82,12 @@ class ManifestEntry:
 |---|---|
 | `CONFLICT` | `{resource, version, expected, diff}` |
 | `REJECT_STALE_READ` | `{resource, expected, actual}` |
-| `REJECT_STALE` | `{lease_id, reason}` |
+| `REJECT_STALE` | `{resource, reason}`（`reason ∈ lease_invalid / lease_expired_before_commit`） |
 | `REJECT_COMPENSATE` | `{resource, expected_hash, actual_hash}` |
 | `UPSTREAM_FAILED`（锁超时） | `{reason: "lock_timeout", held: [...]}` |
-| `OK` / `VALID` | `{resource, version}` |
+| `INVALID_INPUT` | `{reason ∈ none_content / duplicate_resource, resource}` |
+| `OK`（正常） | `{resources: [...], seq}` |
+| `OK`（空批） | `{noop: True, seq: None}` |
 
 > 锁超时用 `UPSTREAM_FAILED`（封闭枚举内、语义为瞬态上游失败），**不用** `COMMIT_UNRECOVERABLE` —— 后者只留给「WAL 中段坏帧」这类真不可恢复场景。
 
@@ -340,17 +342,36 @@ def _commit_record(self, acb, w, blob_hash) -> dict:
 - **提交点前复验租约**（③′）：否则 ②→⑤ 之间 `advance` 时钟可绕过 fencing。
 - **`_apply_locked` 只做投影**（manifest + 可选 link），不取锁（已持）。
 
+#### 5.5.1 实现落地时的 6 处必要修正（文档代码 → 实际代码）
+
+实现时发现上面的参考代码有 6 处会直接跑不通或语义有洞，已按下表落地：
+
+| # | 文档代码 | 实际实现 | 原因 |
+|---|---|---|---|
+| 1 | 步骤④ `acb.staged[w.resource]` | `acb.staged.get(w.resource, w.content)` | T4/T5/T7 不写 `staged` 直接 `commit_batch`，硬取会 `KeyError` |
+| 2 | 先取资源锁、再 `intents.reserve` | **先 `reserve`（L0）再取资源锁（L3）**；`finally` 先释放资源锁、再 `revoke` | 否则持 L3 取 L0，违反 §4.6 全局锁序（反向边） |
+| 3 | 锁集合 = `{w.resource}` | 锁集合 = `{w.resource} ∪ acb.read_set` | 否则读集合复验不在锁内 → OCC 隔离失效（读依赖可被并发改） |
+| 4 | 租约复验在 blob 落盘前 | 移到 **blob 落盘之后、`append_batch` 之前** | 缩小「复验→提交点」窗口，防 `bump_epoch` 绕过 fencing |
+| 5 | `notify_events` 直接写在 `finally` | `finally` 里 **try/except 包裹**，且放在释放锁/revoke 之后 | 订阅者抛异常会覆盖 `try` 的返回值，把已提交的成功伪装成失败 |
+| 6 | 投影后直接返回 | 增加 **⑦′ 刷新 `acb.read_set`/`base_version`** 为写入后版本 | 同一 ACB 连续提交同一资源时，不刷新会把自己的写判成「陈旧读」 |
+
+> 另外补了 3 个输入校验：空批 → `OK{noop}`、同批重复 `resource` → `INVALID_INPUT`、`None` 内容 → `INVALID_INPUT`（详见 §12 的 P0-5/P0-6）。
+
 ### 5.6 `_apply_locked` 与可选物化
 
 ```python
 def _apply_locked(self, acb, w, blob_hash, prev_hash):
-    self._versions.record(w.resource, w.version_before, self.get(w.resource))  # 前像（供补偿）
-    self.manifest[w.resource] = ManifestEntry(version=..., blob_hash=blob_hash, prev_hash=prev_hash)
-    w.version_before = ...
+    base_version = self.manifest[w.resource].version if w.resource in self.manifest else 0
+    self._versions.record(w.resource, base_version, self.get(w.resource))  # 前像（供补偿）
+    self.manifest[w.resource] = ManifestEntry(version=base_version + 1,
+                                              blob_hash=blob_hash, prev_hash=prev_hash)
+    w.version_before = base_version
     w.applied_hash = blob_hash
     if self._path_of is not None:                 # 默认 None → 不写磁盘
         self._blobs.link(blob_hash, self._path_of(w.resource))
 ```
+
+> **实现修正**：前像版本必须取「提交前的 manifest 版本」（= 新版本 − 1），**不能**用 `w.version_before` —— 后者在步骤⑥调用时还没赋值（默认 0），会把前像记到错误版本上，导致补偿取不到前像而误判 PIVOT。
 
 - `path_of` **可选注入**（`WorkspaceManager(..., path_of=None)`）：默认不物化，读路径只看 manifest+blob。demo/bench 传 `lambda r: f"/tmp/ws/{r}"`。
 - `_versions.record` 保留：A1/A3 依赖它取前像内容做 reverse patch。
@@ -426,7 +447,7 @@ def _base_of(self, acb, resource) -> int:
 
 | 文件 | 变更 |
 |---|---|
-| `harness/workspace.py` | manifest+blob 读模型；`ManifestEntry`；`lock_for`/`_acquire_all`；`put` 不推版本；`stage` 覆盖；`prepare` 公共取锁 + `_validate_locked`；`_apply_locked`；`_rebuild_from_events`；`get`/`version`/`content_hash` 改走 manifest；`path_of` 可选 |
+| `harness/workspace.py` | manifest+blob 读模型；`ManifestEntry`；`lock_for`/`_acquire_all`/`_release_all`；`put` **推进版本**；`stage` 覆盖并持锁；`prepare` 公共取锁 + `_validate_locked`；`_apply_locked`；`_rebuild_from_events`（manifest + 前像）；`get`/`version`/`content_hash` 走 manifest；`path_of` 可选 |
 | `harness/harness.py` | `commit_batch` 改为 §5.5（全序持锁 + 预留 + 复验 + 提交点 + 锁外通知）；`__init__` 增加 `blobs`/`clock`/`path_of`/`lock_timeout_s` 注入；`compensate`/`_compensate_one` 适配 `Result` |
 | `harness/intent_registry.py` | `__init__(clock=None)`；`reserve` 写 `expires_at` + 归一化 `mode`（`"WRITE"→"W"`）；`is_valid` 查时间（`expires_at==0` 视为不过期）且**无锁**；`renew`/`renew_for` 检查过期并**续期** |
 | `harness/event_log.py` | `append_batch(drafts, notify=True)`；新增 `notify_events(events)` |
@@ -562,12 +583,15 @@ def test_ms1_lock_order_no_deadlock():
 
     assert all(not t.is_alive() for t in ts), "线程未在期限内结束 → 疑似死锁"
     assert not errors
-    assert all(r == Status.OK for r in results), f"提交失败（非 OK）: {results}"
+    # OCC 语义：两个线程用同一 base_version，必然一个 OK 一个 CONFLICT
+    assert sorted(r.status.value for r in results) == ["CONFLICT", "OK"], results
     assert h.workspace.version("a") == v_a + 1 and h.workspace.version("b") == v_b + 1
     assert len(h.workspace._locks) >= 2, "仍是单锁 → 本测试无意义（假通过）"
 ```
 
-**三条反假通过措施**：① 断言两次提交都 `OK`（锁超时会返回 `UPSTREAM_FAILED`，被这条挡住）；② 断言版本真的推进；③ 断言 `_locks >= 2`（证明是每资源锁）。
+**三条反假通过措施**：① 断言结果**恰为 `{OK, CONFLICT}`**（若锁超时被当成通过，会出现 `UPSTREAM_FAILED`；若死锁，线程不会结束）；② 断言两个资源版本都推进到 `v0+1`（证明赢家写成功了两个资源）；③ 断言 `_locks >= 2`（证明是每资源锁）。
+
+> **v1.2 更正**：v1.1 写「两次提交都 `OK`」是**错的** —— 两个线程用同一 `base_version`，OCC 下第二个必然 `CONFLICT`。T7 验证的是「锁序不死锁」，不是「两个并发写都成功」；后者违反 I1 单写者语义。
 
 ### helper
 
@@ -647,3 +671,56 @@ def _acb(h, resource):
 | **D-4** | `put` 不推版本（为保住 11 个测试） | **`put` 推进版本**（upsert） | 11 个测试改为相对基线（§7 清单）；`seed()` 返回版本 |
 | **D-6** | 前像不重建，补偿崩溃后降级 PIVOT | **前像随 WAL 重建**（`prev_hash → blob`） | `_versions.record` 需按 `(resource, version)` 去重；T4 增加前像断言 |
 | D-1 | 未读资源回退 | 不变（**已确认**） | — |
+
+---
+
+## 12. 实现后审查（v1.2 → v1.3）
+
+实现由子智能体分三波完成（独立模块 → workspace/harness → 测试迁移），随后三路只读审查（规范一致性 / 对抗 / 测试强度）。**8 个 P0 已修并补回归测试**，4 个 P1 已修，其余记为已知边界。
+
+### 12.1 P0（已修 + 已补测试）
+
+| # | 问题（反例） | 修法 | 回归测试 |
+|---|---|---|---|
+| P0-1 | 读集合复验只在**写资源**的锁内 → 读依赖被并发改仍能提交（OCC 隔离失效） | 锁集合改为 `writes ∪ acb.read_set` | `test_ms1_readset_lock_contention_upstream_failed` |
+| P0-2 | 租约复验到提交点之间可 `bump_epoch` → 已崩溃的 agent 仍能提交（fencing 绕过） | 复验移到 blob 落盘后、`append_batch` 前 | 内联验证（落盘后 revoke → `REJECT_STALE`，提交点未调用） |
+| P0-3 | 同批重复 `resource`：WAL 两条事件同版本、manifest 推进两次 → **重建后版本回退** | 同批重复 → `INVALID_INPUT` | `test_ms1_duplicate_resource_rejected` |
+| P0-4 | 重建不校验当前 `blob_hash` 是否存在 → `get()` 抛 `KeyError` | 缺失则跳过该事件 | 内联验证 |
+| P0-5 | `commit_batch` 接受 `None` 内容 → 写入 JSON `null`，与「资源不存在」不可区分 | `None` → `INVALID_INPUT` | `test_ms1_none_content_rejected` |
+| P0-6 | `runtime` commit 分支对未 stage 的资源传 `content=None` → 静默写成 null | 未 stage → `INVALID_INPUT` | 内联验证 |
+| P0-7 | `bytes` 内容若恰好是合法 JSON（`b'{"a":1}'`）会被 `json.loads` 解码 → **数据损坏** | `canonical_bytes` 给 bytes 加 `\x00BYTES\x00` 魔数，`_decode` 剥前缀 | `test_ms1_bytes_roundtrip_preserves_type` |
+| P0-8 | `_NULL_HASH == sha256(b"null")` 与「内容为 null」碰撞 → 补偿复验无法区分缺失/null | 资源不存在时 `content_hash` 返回 `""`（删 `_NULL_HASH`） | `test_ms1_content_hash_missing_is_empty` |
+
+### 12.2 P1（已修）
+
+| # | 问题 | 修法 |
+|---|---|---|
+| P1-1 | 持资源锁（L3）再取 intents 锁（L0），违反全局锁序 | 先 `reserve`（L0）再取资源锁（L3）；`finally` 先释放资源锁再 `revoke` |
+| P1-2 | `notify_events` 在 `finally` 内，订阅者抛异常会覆盖已提交的返回值 | `try/except` 包裹，失败不影响提交结果 |
+| P1-3 | `_on_event` 对每个订阅者各调一次 `notify` → inflight 计数 ×k | 每个 subject 只调一次 |
+| P1-4 | `try_admit` 失败不回滚 `declare_logical` → 残留声明永久阻塞后续准入 | 新增 `undeclare_logical`，失败即回滚 |
+| P1-5 | `put` 在资源锁内 `notify`（破坏「通知必在锁外」） | `append(notify=False)` + 出锁后 `notify_events` |
+| P1-6 | 重建对 `version == cur.version` 不跳过 → manifest 与前像快照不一致 | 改为 `version <= cur.version` 跳过 |
+| P1-7 | `_acquire_all` 在 `acquire` 抛异常时泄漏已持有的锁 | `try/except` 释放后 re-raise |
+| P1-8 | 同一 ACB 连续提交同一资源时，不刷新读版本 → 自己的写被判「陈旧读」 | 提交成功后 ⑦′ 刷新 `read_set`/`base_version` |
+
+### 12.3 测试强度修正
+
+| # | 问题 | 修法 |
+|---|---|---|
+| T-1 | T7 的 `len(_locks) >= 2` **恒真**（`seed` 已创建两把锁） | 改为 `lock_for("a") is not lock_for("b")`（证明每资源一把锁） |
+| T-2 | A1 的 `hash_of_A == content_hash("fileX")` 是 `x == x` 恒真 | 改为验证指纹等于 `sha256(canonical_bytes("A"))` |
+| T-3 | A3 手工补 `read_set` 掩盖了「提交后不刷新读版本」的缺口 | 框架修好后删除手工行，改走正常提交路径 |
+| T-4 | T4 的 `WorkspaceManager` 与 `Harness` 各建一个 `IntentRegistry`（租约注册表错配） | 共用同一个实例 |
+
+### 12.4 已知边界（未修，记录在案）
+
+| # | 边界 | 影响 | 归属 |
+|---|---|---|---|
+| K-1 | `tuple`/`set` 经 `default=str` 变字符串（类型漂移） | 只保证 JSON 可逆类型；文档 §5.1 已声明 | 阶段二类型标签 |
+| K-2 | 数字键 `{1: ...}` 往返成 `{"1": ...}` | JSON 键只能是字符串 | 同上 |
+| K-3 | `stage`/`put` 用无超时阻塞锁（`commit_batch` 有超时） | 持锁方卡在 fsync 时会无限等 | MS4 统一 |
+| K-4 | `commit_batch` 持锁跨越 `blob.put`/WAL `fdatasync` | 临界区偏长（正确性无影响） | 阶段二评估 group commit |
+| K-5 | 前像 `version-1` 假设在版本不连续时可能错位 | 正常连续提交成立 | S3 用事件自带的 `version_before` |
+| K-6 | `prev_hash` 对应 blob 缺失时静默跳过 | 补偿退化为 PIVOT（无告警） | S3 孤儿检测 |
+| K-7 | `ttl_ms<=0` 被解释为「不过期」 | `lease_ms=0` 会静默关闭过期 | 配置校验（MS4） |
