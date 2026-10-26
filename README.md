@@ -11,8 +11,9 @@
 
 | 文档 | 内容 |
 |---|---|
-| [设计规范 v1.11](docs/multi-agent-harness-design-final.md) | 主设计规范：定位与承诺边界、Z0–Z3 分区、组件契约、RSC 提交与补偿、不变量 I1–I14、20 张数据流/架构/调用/扇入扇出图 |
-| [里程碑与模块划分](docs/milestones.md) | MS0–MS10 共 11 个里程碑，每个含目标 / 新增模块 / 依赖 / 出入口条件 / 扩展点 / 承上启下 |
+| [第一阶段实现方案 v1.1](docs/phase1-implementation-plan.md) | 阶段一 MVP 的落地设计：提交点（WAL+blob）、补偿幂等键、EffectJournal 去重语义、全局锁序、S0–S8 实施步骤、19 个可判定测试、基准防作弊 |
+| [设计规范 v1.12](docs/multi-agent-harness-design-final.md) | 主设计规范：定位与承诺边界、Z0–Z3 分区、组件契约、RSC 提交与补偿、不变量 I1–I14、20 张数据流/架构/调用/扇入扇出图 |
+| [里程碑与模块划分](docs/milestones.md) | MS0–MS10 共 11 个里程碑，每个含目标 / 新增模块 / 依赖 / 出入口条件 / 扩展点 / 承上启下；含实现前决策 D1–D16 |
 | [用例与对抗测试](docs/use-cases-and-adversarial-tests.md) | 4 个真实用例 + 13 个对抗用例，逐步推演表 + 跑通判定标准 |
 | [定位与路线图](docs/positioning-and-roadmap.md) | 为什么不是 Agent OS、能力边界、演进路线 |
 | [分布式 → 多智能体映射](docs/distributed-to-multiagent-mapping.md) | Paxos/Raft/OCC/MVCC/Saga/WAL/LSM/背压 等机制的投射与「机制差异」 |
