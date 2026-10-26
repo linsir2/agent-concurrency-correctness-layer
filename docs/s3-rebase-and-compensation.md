@@ -2,13 +2,13 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | **v1.1（已按三路评审修订）** |
+| 版本 | **v1.2（数组删除改为自动合并：3-way 集合语义）** |
 | 日期 | 2026-10-26 |
 | 上游 | [第一阶段方案 v1.1](phase1-implementation-plan.md) §4.6/§4.10、[S2 方案 v1.3](s2-workspace-and-locks.md)、[设计规范 v1.12](multi-agent-harness-design-final.md) §5.4/§7.2.1 |
-| 覆盖测试 | T6（create 可补偿）、T8（数组 grow-only）、**T20**（rebase 回路端到端）、**T21**（重试有界 → QUARANTINED → DEAD_LETTER）、**T22**（Delete 哨兵 + 补偿交叉） |
+| 覆盖测试 | T6（create 可补偿）、T8（数组集合语义）、**T20**（rebase 回路端到端）、**T21**（重试有界 → QUARANTINED → DEAD_LETTER）、**T22**（Delete 哨兵 + 补偿交叉） |
 | 交付判据 | 上述 5 组测试绿 + **原有 64 测试全绿** + `test_a1_compensation_cross_no_overwrite` 仍绿 |
 | 模型接入 | DashScope `qwen3.7-flash`（**仅可选路径**；CI 默认 scripted，不联网） |
-| 修订 | v1.0 → v1.1：修 12 个 P0 + 13 个 P1（逐条见 §12）；测试编号改用 T20–T22（避开 phase1 已占用的 T9–T11） |
+| 修订 | v1.1 → v1.2：数组默认策略改为 **`SET`（增并删减）**，删除自动合并；`GROW_ONLY` 降为可选（用于审计日志等不可缩短的列表） |
 
 ---
 
@@ -44,7 +44,7 @@
 - `logical_deps` 的**提交期** hash 校验、Run 级不变量校验（MS5）
 - 完整文本 diff3（阶段一：非重叠自动合并 / 重叠 → PIVOT）
 - `compensation_journal` 的 `COMPENSATING` 落盘与崩溃续做（S5）
-- CRDT / tombstone-based 集合删除（明确不采纳：数组删除一律 PIVOT）
+- **tombstone 存储 / CRDT 收敛保证**：数组删除用**快照 3-way 集合语义**（增并删减、remove-wins），不保存每个元素的墓碑，也不承诺任意交错下的收敛
 
 ---
 
@@ -99,20 +99,21 @@ class MergeResult:
 
 ```python
 class MergePolicy(str, Enum):
-    GROW_ONLY = "GROW_ONLY"
-    REPLACE = "REPLACE"
-    PIVOT = "PIVOT"
+    SET = "SET"               # 默认（数组）：增并删减（3-way 集合语义），删除自动合并
+    GROW_ONLY = "GROW_ONLY"   # 可选：只增不删；出现删除 → PIVOT（审计日志等不可缩短的列表）
+    REPLACE = "REPLACE"       # 整值取 committed（单写者键）
+    PIVOT = "PIVOT"           # 不自动合并，直接升级
 ```
 
 `footprint.merge_policy: dict[str, MergePolicy]`（key 为 JSON Pointer 前缀）。
 
-**解析规则（v1.1 明确）**：
+**解析规则**：
 1. **最长前缀优先**（`/compilerOptions/paths` 覆盖 `/compilerOptions`）。
 2. 同长度多个前缀命中且策略不同 → **歧义 → `PIVOT`**（不静默取第一条）。
-3. 无命中 → 按类型缺省：数组 `GROW_ONLY`、object 递归、标量走 §4.1。
-4. 顶层数组没有 key → 用 `""` 作为顶层策略键；未声明则 `GROW_ONLY`。
+3. 无命中 → 按类型缺省：**数组 `SET`**、object 递归、标量走 §4.1。
+4. 顶层数组没有 key → 用 `""` 作为顶层策略键；未声明则 `SET`。
 
-`spec/resources.py` 的旧枚举 `replace|json-merge|grow-only` 迁移：`json-merge → GROW_ONLY`；默认值从 `"replace"` 改为 `""`（表示按类型缺省）。
+`spec/resources.py` 的旧枚举 `replace|json-merge|grow-only` 迁移：`json-merge → SET`；默认值从 `"replace"` 改为 `""`（表示按类型缺省）。
 
 ### 3.3 `Delete` 哨兵
 
@@ -152,35 +153,46 @@ def merge3(base, local, committed, policy: dict[str, MergePolicy] | None = None)
 **为什么 ① 在 ② 之前**：`1 == True`、`1 == 1.0` 在 Python 里成立；若不先比类型，`bool/int` 与 `int/float` 会被静默合并（type_change 永不触发）。
 **类型分组**：`bool` 独立；`int/float` 同为 `number`；`str` / `list` / `dict` / `null` 各自独立。
 
-### 4.2 数组（`_merge_array`，v1.1 修正）
+### 4.2 数组（`_merge_array`，v1.2：`SET` 默认，删除自动合并）
 
 ```python
 def _merge_array(base, local, committed, path, policy, conflicts):
     p = _resolve_policy(path, policy)          # §3.2
     if p is MergePolicy.REPLACE: return committed
     if p is MergePolicy.PIVOT:  return _conflict(path, "pivot", ...)
-    # GROW_ONLY 只支持标量元素（对象数组无身份，按值去重会造出重复项）
+    # 对象数组无身份：按值合并会把「同元素被改」变成「新增两项」→ 直接升级
     if not all(_is_scalar(x) for x in (base or []) + local + committed):
         return _conflict(path, "pivot", ...)
+
     b, l, c = list(base or []), list(local), list(committed)
-    removed_l = [x for x in b if x not in l]
-    removed_c = [x for x in b if x not in c]
-    # 双方删了同一元素 → 收敛（都删 = 一致）
-    one_sided = ([x for x in removed_l if x not in removed_c] +
-                 [x for x in removed_c if x not in removed_l])
-    if one_sided:
-        return _conflict(path, "pivot", ...)   # 单方删除：grow-only 不支持，升级
-    out = list(l)                               # 并集保序去重（先 local 后 committed 的新增）
-    for x in c:
-        if x not in out:
+
+    if p is MergePolicy.GROW_ONLY:             # 可选：只增不删
+        if any(x not in l or x not in c for x in b):
+            return _conflict(path, "pivot", ...)
+        return _union(l, c)
+
+    # SET（默认）：增并删减 —— remove-wins
+    removals = {x for x in b if x not in l or x not in c}   # 任一方删了 → 删
+    additions = [x for x in l if x not in b]
+    additions += [x for x in c if x not in b and x not in additions]
+    out = [x for x in b if x not in removals]               # 保 base 序
+    for x in additions:
+        if x not in out and x not in removals:
             out.append(x)
     return out
 ```
 
-**三条语义（写进 T8）**：
-1. 双方各 append 一项 → 并集，无冲突。
-2. **单方删除** → `pivot`（grow-only 不静默忽略删除）。
-3. **双方删同一元素** → 收敛（v1.0 的「任一方删除即 pivot」是错的）。
+**四条语义（写进 T8）**：
+1. 双方各 append 一项 → 并集（保序去重），无冲突。
+2. **单方删除 → 自动合并为「删掉」**（不是 PIVOT）。
+3. 双方删同一元素 → 删掉（一致）。
+4. 一方删 `b`、另一方加 `c` → 结果既删 `b` 又加 `c`（增删互不干扰）。
+
+**`SET` 的语义边界（必须写清）**：
+- **remove-wins**：某元素被一方删除、另一方「保留」（或先删后加），快照上无法区分 → 判为删除。
+- **不是 CRDT**：不引入 tombstone 存储、不承诺任意交错下的收敛；只保证「同一份 `(base, local, committed)` 快照 → 同一结果」。
+- 需要「永不可缩短」的列表（审计日志、事件索引）显式声明 `GROW_ONLY`。
+- 对象数组（元素是 dict/list）一律 `PIVOT` 或 `REPLACE`（无身份无法安全合并）。
 
 ### 4.3 对象（`_merge_object`）
 
@@ -423,18 +435,30 @@ assert h.workspace.version("new.ts") == v_after + 1        # ③ tombstone 保�
 assert h.workspace._blobs is not None                      # ④ 无 DELETE 哨兵被落盘（见 T6b 断言）
 ```
 
-### T8 `test_ms1_rebase_array_grow_only`
+### T8 `test_ms1_rebase_array_set_semantics`
 
 ```python
+# ① 双方各 append → 并集保序去重
 r = merge3({"deps": ["a"]}, {"deps": ["a", "b"]}, {"deps": ["a", "c"]})
-assert r.ok and r.merged == {"deps": ["a", "b", "c"]}      # 并集保序去重
+assert r.ok and r.merged == {"deps": ["a", "b", "c"]}
+# ② 单方删除 → 自动合并为「删掉」
 r2 = merge3({"deps": ["a", "b"]}, {"deps": ["a"]}, {"deps": ["a", "b"]})
-assert not r2.ok and r2.conflicts[0].kind == "pivot"       # 单方删除 → pivot
+assert r2.ok and r2.merged == {"deps": ["a"]}
+# ③ 双方删同一元素
 r3 = merge3({"deps": ["a", "b"]}, {"deps": ["b"]}, {"deps": ["b"]})
-assert r3.ok and r3.merged == {"deps": ["b"]}              # 双方删同一元素 → 收敛
-r4 = merge3({"x": [{"id": 1}]}, {"x": [{"id": 1}, {"id": 2}]}, {"x": [{"id": 1}, {"id": 3}]})
-assert not r4.ok and r4.conflicts[0].kind == "pivot"       # 对象数组 → pivot
-assert merge3({"deps": ["a"]}, {"deps": ["a", "b"]}, {"deps": ["a", "c"]}) == r   # 确定性
+assert r3.ok and r3.merged == {"deps": ["b"]}
+# ④ 一方删 b、另一方加 c → 增删互不干扰
+r4 = merge3({"deps": ["a", "b"]}, {"deps": ["a"]}, {"deps": ["a", "b", "c"]})
+assert r4.ok and r4.merged == {"deps": ["a", "c"]}
+# ⑤ 对象数组无身份 → PIVOT
+r5 = merge3({"x": [{"id": 1}]}, {"x": [{"id": 1}, {"id": 2}]}, {"x": [{"id": 1}, {"id": 3}]})
+assert not r5.ok and r5.conflicts[0].kind == "pivot"
+# ⑥ GROW_ONLY 显式声明 + 删除 → PIVOT（用于不可缩短的列表）
+r6 = merge3({"log": ["a", "b"]}, {"log": ["a"]}, {"log": ["a", "b"]},
+            policy={"": MergePolicy.GROW_ONLY})
+assert not r6.ok and r6.conflicts[0].kind == "pivot"
+# ⑦ 确定性
+assert merge3({"deps": ["a"]}, {"deps": ["a", "b"]}, {"deps": ["a", "c"]}) == r
 ```
 
 ### T20 `test_ms1_rebase_loop_merges_and_commits`
@@ -592,8 +616,19 @@ assert h.workspace.get("n.ts") == {"code": 999}
 
 ## 13. 待确认的 3 个决策
 
-| # | 问题 | 建议 |
+| # | 问题 | 结论 |
 |---|---|---|
 | **Q1** | 冲突 resolver 默认 `ScriptedResolver`（CI 不联网），LLM 仅显式注入时启用？ | **是** |
-| **Q2** | 数组删除一律 `PIVOT`（不引入 tombstone 集合语义）？ | **是** |
+| **Q2** | 数组删除如何处理？ | **已确认：自动合并**（`SET` = 增并删减、remove-wins，默认策略）；`GROW_ONLY` 保留给不可缩短的列表 |
 | **Q3** | rebase 超限先 `QUARANTINED`，再 `escalate_quarantined()` 转 `DEAD_LETTER`？ | **是** |
+
+### 13.1 v1.1 → v1.2 变更（Q2 定案后）
+
+| 项 | v1.1 | v1.2 |
+|---|---|---|
+| 数组默认策略 | `GROW_ONLY`，单方删除 → `PIVOT` | **`SET`**，单方删除 → 自动合并为「删掉」 |
+| 元素删除语义 | 不支持 | 支持（增并删减，remove-wins） |
+| `GROW_ONLY` | 默认 | 可选（审计日志等不可缩短列表） |
+| 是否需要 tombstone | — | **不需要**（快照 3-way 集合运算即可，不存墓碑） |
+| T8 用例 | 3 条 | **7 条**（含「一方删 b、另一方加 c」与 `GROW_ONLY` 显式 PIVOT） |
+| 定位一致性 | — | 仍是「3-way merge，非 CRDT」；只增加集合语义，不引入收敛保证 |
