@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from .types import EventKind, Mode, Result, Status, Write
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
+from .rebase import DELETE, MISSING, merge3
+from .storage.atomic import atomic_delete
 from .storage.blob import InMemoryBlobStore, _BYTES_PREFIX, canonical_bytes
 
 
@@ -35,6 +37,10 @@ class WorkspaceVersionStore:
             if v == version:
                 return
         lst.append((version, copy.deepcopy(content)))
+
+    def has(self, resource: str, version: int) -> bool:
+        """是否存在该版本的前像（区分「无前像」与「前像就是 None」）。"""
+        return any(v == version for v, _ in self._snapshots.get(resource, []))
 
     def get(self, resource: str, version: int):
         for v, content in self._snapshots.get(resource, []):
@@ -56,6 +62,7 @@ class WorkspaceManager:
                  versions: WorkspaceVersionStore | None = None, *,
                  blobs=None, path_of=None, lock_timeout_s: float = 5.0) -> None:
         self.manifest: dict[str, ManifestEntry] = {}
+        self._tombstones: dict[str, int] = {}
         self._event_log = event_log
         self._intents = intents
         self._versions = versions or WorkspaceVersionStore()
@@ -120,9 +127,34 @@ class WorkspaceManager:
     def content(self, resource: str):
         return self.get(resource)
 
+    def pre_image(self, resource: str, version: int):
+        """§5.3：取某版本的提交前快照（3-way merge 的 base）；不存在返回 `MISSING`。
+
+        「无前像」与「前像就是 None」必须可区分（用 `has()` 而非 `get()` 的返回值）。
+        """
+        if self._versions.has(resource, version):
+            return self._versions.get(resource, version)
+        return MISSING
+
     def version(self, resource: str) -> int:
         entry = self.manifest.get(resource)
-        return entry.version if entry else 0
+        if entry is not None:
+            return entry.version
+        return self._tombstones.get(resource, 0)   # manifest → tombstone → 0
+
+    def _next_version(self, resource: str) -> int:
+        """下一个单调版本号：`max(manifest.version, tombstone, 0) + 1`。
+
+        统一 put / _apply_locked / _commit_record 的版本来源，
+        避免「删除后重建」用 manifest 缺失去回绕到 1（文档 §3.3 / §19）。
+        """
+        entry = self.manifest.get(resource)
+        cur = entry.version if entry is not None else 0
+        return max(cur, self._tombstones.get(resource, 0), 0) + 1
+
+    def _guard_version(self, resource: str) -> int:
+        """当前最高已见版本（manifest 或 tombstone），供重放做版本守卫。"""
+        return self._next_version(resource) - 1
 
     def content_hash(self, resource: str) -> str:
         entry = self.manifest.get(resource)
@@ -139,7 +171,7 @@ class WorkspaceManager:
         with self.lock_for(resource):
             blob_hash = self._blobs.put(canonical_bytes(content))
             cur = self.manifest.get(resource)
-            version = (cur.version if cur else 0) + 1
+            version = self._next_version(resource)
             entry = ManifestEntry(version=version, blob_hash=blob_hash,
                                   prev_hash=cur.blob_hash if cur else "")
             self.manifest[resource] = entry
@@ -186,10 +218,17 @@ class WorkspaceManager:
                                   {"resource": r, "expected": v,
                                    "actual": self.version(r)})
         if mode == Mode.COMPENSATE:
-            if self.content_hash(w.resource) != w.applied_hash:
+            actual_hash = self.content_hash(w.resource)
+            if actual_hash != w.applied_hash:
                 return Result(Status.REJECT_COMPENSATE,
                               {"resource": w.resource, "expected_hash": w.applied_hash,
-                               "actual_hash": self.content_hash(w.resource)})
+                               "actual_hash": actual_hash})
+            actual_version = self.version(w.resource)
+            if actual_version != w.version_before + 1:
+                return Result(Status.REJECT_COMPENSATE,
+                              {"resource": w.resource,
+                               "expected_version": w.version_before + 1,
+                               "actual_version": actual_version})
         return Result(Status.VALID,
                       {"resource": w.resource, "version": self.version(w.resource)})
 
@@ -207,14 +246,26 @@ class WorkspaceManager:
                 "current_hash": entry.blob_hash if entry else ""}
 
     # ---- 投影（文档 §5.6） ----------------------------------------
-    def _apply_locked(self, acb, w: Write, blob_hash: str, prev_hash: str) -> None:
+    def _apply_locked(self, acb, w: Write, blob_hash: str, prev_hash: str,
+                      deleted: bool = False) -> None:
         """只做投影（manifest + 可选 link）+ 前像记录；不取锁（调用方已持）。"""
         cur = self.manifest.get(w.resource)
-        base_version = cur.version if cur else 0
-        self._versions.record(w.resource, base_version, self.get(w.resource))
-        new_version = base_version + 1
+        base_version = max(cur.version if cur is not None else 0,
+                           self._tombstones.get(w.resource, 0))
+        new_version = self._next_version(w.resource)
+        if deleted:                                   # Delete 哨兵：删除并写 tombstone
+            self.manifest.pop(w.resource, None)
+            self._tombstones[w.resource] = new_version
+            w.version_before = base_version
+            w.applied_hash = ""
+            if self._path_of is not None:             # 可选物化：原子删除
+                atomic_delete(self._path_of(w.resource))
+            return
+        if cur is not None:                           # create 无前像 → 不记录（否则 has() 误判）
+            self._versions.record(w.resource, base_version, self.get(w.resource))
         self.manifest[w.resource] = ManifestEntry(
             version=new_version, blob_hash=blob_hash, prev_hash=prev_hash)
+        self._tombstones.pop(w.resource, None)       # 重建：清墓碑
         w.version_before = base_version
         w.applied_hash = blob_hash
         if self._path_of is not None:                 # 默认 None → 不写磁盘
@@ -222,21 +273,29 @@ class WorkspaceManager:
 
     # ---- 重建（文档 §5.7） ----------------------------------------
     def _rebuild_from_events(self) -> None:
-        """从同一份 WAL 重放，重建 manifest 与前像（manifest 是纯逻辑投影）。"""
+        """从同一份 WAL 重放，重建 manifest、tombstone 与前像（manifest 是纯逻辑投影）。"""
         for ev in self._event_log.replay():
             p = ev.payload or {}
             if ev.kind not in (EventKind.RESOURCE_COMMITTED,
                                EventKind.WORKSPACE_COMMITTED):
                 continue
             resource = p.get("resource") or ev.subject
+            if not resource:
+                continue
+            version = int(p.get("version", 0))
+            guard = self._guard_version(resource)     # max(manifest, tombstone)
+            if bool(p.get("deleted")):                # 删除事件：pop + tombstone
+                if version <= guard:
+                    continue                          # 版本未推进（含已删资源）：忽略，防复活
+                self.manifest.pop(resource, None)
+                self._tombstones[resource] = version
+                continue
             blob_hash = p.get("blob_hash")
             prev_hash = p.get("prev_hash", "")
-            if not resource or not blob_hash:
+            if not blob_hash:
                 continue                              # 旧格式事件：跳过
-            version = int(p.get("version", 0))
-            cur = self.manifest.get(resource)
-            if cur is not None and version <= cur.version:
-                continue                              # 版本未推进：忽略（不静默覆盖）
+            if version <= guard:
+                continue                              # 版本未推进（含已删资源）：忽略，防复活
             if not self._blobs.exists(blob_hash):
                 continue                              # 当前 blob 不存在：跳过
             # D-6：前像重建 —— 上一版本的 blob 就是 version-1 的内容
@@ -244,36 +303,29 @@ class WorkspaceManager:
                 self._versions.record(resource, version - 1, self._decode(prev_hash))
             self.manifest[resource] = ManifestEntry(
                 version=version, blob_hash=blob_hash, prev_hash=prev_hash)
+            self._tombstones.pop(resource, None)     # 重建：清墓碑
 
     # ---- 合并算法（文档 §7.2.1） ----------------------------------
     def rebase_json(self, base, ours, theirs):
-        """JSON-aware merge：键级合并；数组默认 grow-only（删除需 pivot）。"""
-        if not isinstance(base, dict) or not isinstance(ours, dict) or not isinstance(theirs, dict):
-            return self._rebase_text(base, ours, theirs)
-        result = {}
-        conflicts = []
-        for key in set(base) | set(ours) | set(theirs):
-            b, o, t = base.get(key), ours.get(key), theirs.get(key)
-            if o == t:
-                result[key] = copy.deepcopy(o)
-            elif b == o:
-                result[key] = copy.deepcopy(t)
-            elif b == t:
-                result[key] = copy.deepcopy(o)
-            else:
-                conflicts.append(key)
-        return {"merged": result, "conflicts": conflicts}
+        """`merge3` 的兼容薄封装（K-1）：返回旧 dict 结构。
 
-    def _rebase_text(self, base, ours, theirs):
-        """文本 3-way merge（简化版：非重叠则合并，重叠则标记冲突）。"""
-        if base == ours:
-            return {"merged": copy.deepcopy(theirs), "conflicts": []}
-        if base == theirs:
-            return {"merged": copy.deepcopy(ours), "conflicts": []}
-        if ours == theirs:
-            return {"merged": copy.deepcopy(ours), "conflicts": []}
-        return {"merged": None, "conflicts": ["<text-overlap>"]}
+        `{"merged": <完整结果或 None>, "conflicts": [path, ...]}`；
+        有冲突时 `merged=None`、`conflicts` 为冲突路径列表（按 path 排序）。
+        """
+        mr = merge3(base, ours, theirs)
+        if mr.ok:
+            return {"merged": mr.merged, "conflicts": []}
+        return {"merged": None, "conflicts": [c.path for c in mr.conflicts]}
 
     def compute_reverse_patch(self, w: Write):
-        """基于 WorkspaceVersionStore 的「提交前快照」计算反向 patch。"""
-        return self._versions.get(w.resource, w.version_before)
+        """基于 WorkspaceVersionStore 的「提交前快照」计算反向 patch。
+
+        - 有前像 → 返回前像内容；
+        - 无前像且 `version_before == 0`（create 型写）→ `DELETE` 哨兵；
+        - 其他（前像被淘汰 / 版本不连续）→ `None`（不可补偿 → PIVOT）。
+        """
+        if self._versions.has(w.resource, w.version_before):
+            return self._versions.get(w.resource, w.version_before)
+        if w.version_before == 0:
+            return DELETE
+        return None

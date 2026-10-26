@@ -2,27 +2,27 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | **v1.2（数组删除改为自动合并：3-way 集合语义）** |
+| 版本 | **v1.3（实现完成 + 实现后审查修订）** |
 | 日期 | 2026-10-26 |
 | 上游 | [第一阶段方案 v1.1](phase1-implementation-plan.md) §4.6/§4.10、[S2 方案 v1.3](s2-workspace-and-locks.md)、[设计规范 v1.12](multi-agent-harness-design-final.md) §5.4/§7.2.1 |
-| 覆盖测试 | T6（create 可补偿）、T8（数组集合语义）、**T20**（rebase 回路端到端）、**T21**（重试有界 → QUARANTINED → DEAD_LETTER）、**T22**（Delete 哨兵 + 补偿交叉） |
-| 交付判据 | 上述 5 组测试绿 + **原有 64 测试全绿** + `test_a1_compensation_cross_no_overwrite` 仍绿 |
-| 模型接入 | DashScope `qwen3.7-flash`（**仅可选路径**；CI 默认 scripted，不联网） |
-| 修订 | v1.1 → v1.2：数组默认策略改为 **`SET`（增并删减）**，删除自动合并；`GROW_ONLY` 降为可选（用于审计日志等不可缩短的列表） |
+| 覆盖测试 | T6（create 可补偿 + 幂等）、T8（数组集合语义）、T20（rebase 回路 + 状态回边）、T21（重试有界 + 预算消耗）、T22（Delete 哨兵 + 补偿交叉 + 幂等） |
+| 交付判据 | **69 passed**（S3 新增 5 组用例，连跑 3 轮稳定）+ `test_a1_compensation_cross_no_overwrite` 仍绿 |
+| 模型接入 | DashScope `qwen3.7-flash`（`LLMResolver` 可选；默认 `ScriptedResolver`，CI 不联网；端点白名单） |
+| 修订 | v1.2 → v1.3：按实现后三路审查修 4 个严重 + 5 个高（§14） |
 
 ---
 
-## 0. 现状：这是「文档已定、代码未落地」的缺口
+## 0. 落地结果（v1.3：已实现）
 
-| 关注点 | 文档要求 | 代码现状 |
-|---|---|---|
-| `handle_commit_result` | `CONFLICT`/`REJECT_STALE_READ` → 有界语义 rebase | **不存在**；`runtime` 对非 OK 一律 `FAILED` |
-| `rebase_json` | 三档 + per-key `merge_policy` | 只在测试里**手工调用**；不读 policy、数组不 grow-only |
-| `CONFLICT` 载荷 | 必须带 `diff` | ✅ S2 已带 `{resource, version, expected, diff}` |
-| Delete 哨兵 | create 无前像 → 哨兵 → 删除 | **未实现**；无前像一律 `None` → PIVOT |
-| `QUARANTINED` | 非终态，可 escalate 转 `DEAD_LETTER` | 无产生路径；`_finalize` **不释放**其预算（会泄漏） |
+| 关注点 | 状态 |
+|---|---|
+| `handle_commit_result` | ✅ 有界循环（≤ `retry_budget+1`），冲突→merge3→resolver→重试→`QUARANTINED` |
+| `merge3` | ✅ 结构化冲突（path/kind/三方值）、`SET` 集合语义、policy 最长前缀 |
+| Delete 哨兵 | ✅ 六改动点全落地（含 tombstone、重建识别 `deleted`、补偿版本比对） |
+| `QUARANTINED` | ✅ 可产生、预算不泄漏、`escalate_quarantined()` 转 `DEAD_LETTER` |
+| resolver | ✅ `ScriptedResolver`（默认）/ `LLMResolver`（白名单 + 输出校验） |
 
-**一句话**：「冲突 → 语义 rebase」目前是**空承诺**——U1/U2/U3 是测试手工调 `rebase_json` 再手工改 `base_version`。S3 把这条路径接上。
+> v1.2 之前的「未实现」缺口已全部关闭；剩余边界见 §15。
 
 ---
 
@@ -632,3 +632,64 @@ assert h.workspace.get("n.ts") == {"code": 999}
 | 是否需要 tombstone | — | **不需要**（快照 3-way 集合运算即可，不存墓碑） |
 | T8 用例 | 3 条 | **7 条**（含「一方删 b、另一方加 c」与 `GROW_ONLY` 显式 PIVOT） |
 | 定位一致性 | — | 仍是「3-way merge，非 CRDT」；只增加集合语义，不引入收敛保证 |
+
+---
+
+## 14. 实现后审查（v1.2 → v1.3）
+
+实现由子智能体分两波完成（`rebase.py` + T8 → `handle_commit_result` + Delete 全链路 + T6/T20/T21/T22），随后三路只读审查（一致性 / 对抗 / 测试强度）。**4 个严重 + 5 个高已修**，测试强度问题已改。
+
+### 14.1 严重（已修）
+
+| # | 问题（反例） | 修法 |
+|---|---|---|
+| S-1 | **生产路径没有 rebase 外部循环**：`run` 只调一次 `handle_commit_result`，内部只重试一次；第二次冲突直接 `FAILED`，合并结果只留在 `staged` → **丢写** | `handle_commit_result` 内部改为有界循环（≤ `retry_budget+1`），直到 `OK` 或隔离 |
+| S-2 | `run` 把 `QUARANTINED` 覆写成 `FAILED` → 隔离态在生产不可达、`escalate_quarantined` 成死代码，且 `FAILED` 会传播 failure **误杀后继** | `run` 入口判 `QUARANTINED` 直接返回，不覆写状态 |
+| S-3 | **删除后重建版本回绕**（2 → 1）：`_commit_record`/`_apply_locked` 用 `(cur or 0)+1`，`cur` 已被删除 | 统一 `_next_version = max(manifest, tombstone, 0)+1` |
+| S-4 | **resolver 校验与接受语义矛盾**：校验只允许「冲突键」，`_accept` 却整体替换 → 要么隔离、要么丢非冲突键 | 校验要求完整内容（非冲突键必须等于 committed）；`_accept` 深合并到 committed |
+
+### 14.2 高（已修）
+
+| # | 问题 | 修法 |
+|---|---|---|
+| H-1 | `_enter_rebasing` 把任意非 RUNNING（含 QUARANTINED）置 REBASING → 隔离可被「复活」 | 只允许 `RUNNING→REBASING` 或已在 REBASING；隔离/终态拒绝 |
+| H-2 | `budget.consume(1)` 返回值被忽略 → 「重试烧预算」是假的 | 判返回值，失败即隔离；重试前补足预留 |
+| H-3 | 重复补偿 create 型写 → 因 `version_before` 被就地改写而误判 PIVOT | 幂等判定前移到 `compute_reverse_patch` 之前（`tombstone == version_before+2` → `COMPENSATED`） |
+| H-4 | `ScriptedResolver`/`LLMResolver`/`ConflictResolver` 完全未实现 | 新增 `harness/resolver.py`；`Harness` 默认装 `ScriptedResolver` |
+| H-5 | 旧词表 `replace/json-merge/grow-only` 直接 `MergePolicy(v)` → `ValueError` 崩溃 | `_coerce_policy` 做映射，未知 → `PIVOT` |
+
+### 14.3 中/低（已修或记录）
+
+| 问题 | 处置 |
+|---|---|
+| `REJECT_STALE_READ` 只刷 `read_set` 不刷 `base_version` | 两者同时刷，且一次刷新**所有**陈旧读依赖 |
+| `rebase_attempts` 未进 checkpoint → 崩溃后重试无界 | checkpoint 保存/恢复 `rebase_attempts` 与 `retry_budget` |
+| `_rebuild_from_events` 非删除分支忽略 tombstone → 已删资源复活 | 两分支统一用 `max(manifest, tombstone)` 守卫 |
+| 数组成员用 `==` 判定 → `True`/`1` 混淆丢写 | 成员判定改类型严格比较 |
+| `DASHSCOPE_BASE_URL` 无白名单 → 可把 key 与内容 POST 到攻击者端点 | `ALLOWED_BASE_URL_HOSTS` 白名单 + `validate_base_url()` |
+| `spec/resources.py` 的 `merge_policy` 仍是旧枚举/默认 `"replace"` | 默认 `""`、枚举对齐 `SET/GROW_ONLY/REPLACE/PIVOT` |
+
+### 14.4 测试强度修正
+
+| # | 问题 | 修法 |
+|---|---|---|
+| T-1 | T6 的 `_blobs is not None` 是**恒真断言**，注释还推给不存在的「T6b」 | 改为真实判据：删除事件 `deleted is True` 且 `blob_hash == ""`、blob 数未增 |
+| T-2 | T20 只验终态 `RUNNING`，未验「REBASING→RUNNING」回边 | monkeypatch `advance` 记录转移，断言两条边都出现 |
+| T-3 | T21 用 `while` 无界循环 → 实现不隔离时是**挂起**而非失败 | 改 `for _ in range(20)`，未达 `QUARANTINED` 即断言失败；并断言 `budget.consumed > 0` |
+| T-4 | 重复补偿幂等无覆盖 | T6/T22 各加一条「二次补偿 → `COMPENSATED`、不二次删、不 PIVOT」 |
+| T-5 | `test_llm_config` 断言「任意 base_url 可覆盖」与白名单冲突 | 拆成「白名单内可覆盖」+「非白名单抛 `DisallowedBaseURL`」 |
+
+---
+
+## 15. 已知边界（v1.3）
+
+| # | 边界 | 影响 |
+|---|---|---|
+| K-8 | `_ensure_retry_budget`：节点「有 limits 但未预留」时会补预留（测试夹具路径；生产 `admit` 已预留则不触发） | 预算守恒仍成立（`consumed ≤ own_reserved ≤ limits`） |
+| K-9 | U1-B/U2/U3 仍手工调 `rebase_json`（未改走 `handle_commit_result`） | 真实路径由 T20 覆盖；两者都保留 |
+| K-10 | `merge_policy` 放在 task 顶层，而非文档 §3.2 的 `footprint` 内 | 读取口径一致，位置待 MS5 统一 |
+| K-11 | `rebase_json` 不透传 policy | 兼容入口走默认策略；新代码用 `merge3` |
+| K-12 | 状态机保留 `(QUARANTINED,"escalate")→REPLANNING` 旧边 | 正确路径用 `replan_budget_exhausted`；旧边待 MS4 清理 |
+| K-13 | tombstone 只靠 WAL 重建，不随 checkpoint 持久化 | WAL 保留窗口足够时无损；截断场景归 MS6 |
+| K-14 | 删除不可 rebase（删除分支不记前像） | 删除冲突走 `PIVOT` |
+| K-15 | 文本 diff3 未实现（重叠即 PIVOT） | 代码文件冲突升级人工/LLM |

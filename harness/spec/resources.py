@@ -37,7 +37,7 @@ class ResourceSpec:
     kind: ResourceKind
     path: str
     base_version: int | None = None
-    merge_policy: str = "replace"        # replace | json-merge | grow-only
+    merge_policy: str = ""           # "" | SET | GROW_ONLY | REPLACE | PIVOT
     logical_deps: tuple = ()
 
     def version_semantics(self) -> str:

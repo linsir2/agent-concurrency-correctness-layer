@@ -9,8 +9,22 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
 
-from .types import ACB, Action, Decision, EventKind, Mode, Status, TaskState, Write
+from .rebase import (MISSING, MergeResult, _kind, _strict_eq, merge3)
+from .types import (
+    ACB,
+    Action,
+    Decision,
+    EventKind,
+    Mode,
+    Result,
+    Status,
+    TaskState,
+    Write,
+    advance,
+    ok,
+)
 
 
 class AgentRuntime:
@@ -24,6 +38,9 @@ class AgentRuntime:
 
         `decisions` 由 Planner/模型提供；`crash_at=(turn, action)` 用于测试崩溃恢复。
         """
+        if acb.state is TaskState.QUARANTINED:
+            # 已隔离：不得覆写为 FAILED（文档 §5.5）
+            return Status.SEMANTIC_REJECTED
         acb.state = TaskState.RUNNING
         for decision in decisions:
             acb.turn_seq = decision.turn_seq
@@ -57,12 +74,24 @@ class AgentRuntime:
                 if st == Status.NEEDS_APPROVAL:
                     continue
                 if st not in (Status.OK, Status.VALID):
-                    acb.state = TaskState.FAILED
-                    acb.failure = st.value
-                    self.h.checkpoints.save(acb)
-                    return st
+                    # 冲突类失败走语义 rebase 回路（§5.1）；其余失败交上层分类
+                    if isinstance(st, Result) and st.status in (
+                            Status.CONFLICT, Status.REJECT_STALE, Status.REJECT_STALE_READ):
+                        st = self.handle_commit_result(acb, st)
+                    if st not in (Status.OK, Status.VALID):
+                        acb.state = TaskState.FAILED
+                        acb.failure = st.value
+                        self.h.checkpoints.save(acb)
+                        return st
 
-            self._commit_staged(acb)
+            st = self._commit_staged(acb)             # 返回值必须被使用（B11）
+            if st != Status.OK:
+                st = self.handle_commit_result(acb, st)
+            if st != Status.OK:
+                acb.state = TaskState.FAILED
+                acb.failure = st.value
+                self.h.checkpoints.save(acb)
+                return st
             self.h.checkpoints.save(acb)
             acb.step += 1
 
@@ -160,14 +189,220 @@ class AgentRuntime:
         return True
 
     # ---- 提交 + 补偿（文档 §5.4） --------------------------------
-    def _commit_staged(self, acb: ACB) -> Status:
+    def _commit_staged(self, acb: ACB) -> Result:
         if not acb.staged:
-            return Status.OK
+            return ok()
         writes = [Write(resource=r, content=c) for r, c in acb.staged.items()]
         st = self.h.commit_batch(acb, writes, Mode.COMMIT)
         if st == Status.OK:
             acb.staged.clear()
         return st
+
+    # ---- 冲突处理回路（文档 §5） ----------------------------------
+    def handle_commit_result(self, acb: ACB, result: Result) -> Result:
+        """提交失败 → **有界**语义 rebase（§5.1）。
+
+        - `REJECT_STALE`：租约失效 → 重新 reserve 重试一次（§5.4）；
+        - `REJECT_STALE_READ`：读依赖被推进 → 重读刷新 read_set（不做 merge3）；
+        - `CONFLICT`：取 pre_image → merge3 → 成功则 _accept 重试，否则 resolver；
+        - 内部有界循环（≤ `retry_budget + 1` 次）直到 OK 或隔离，
+          避免「第二次冲突直接 FAILED」丢写；
+        - 每次尝试 `budget.consume(1)`（失败即隔离），超限 → `QUARANTINED`；
+          成功 → `RUNNING`。
+        """
+        st = result.status
+        if st == Status.REJECT_STALE:
+            return self._retry_with_fresh_lease(acb, result)
+        if st not in (Status.CONFLICT, Status.REJECT_STALE_READ):
+            return result
+
+        if not self._enter_rebasing(acb):
+            acb.failure = "not_rebasable"
+            return Result(Status.SEMANTIC_REJECTED, {"reason": "not_rebasable"})
+
+        if not self._ensure_retry_budget(acb):
+            self._quarantine(acb, "budget_exhausted")
+            return Result(Status.SEMANTIC_REJECTED, {"reason": "budget_exhausted"})
+
+        for _ in range(acb.retry_budget + 1):
+            if st == Status.REJECT_STALE_READ:
+                self._refresh_read_dep(acb, result.detail.get("resource"))
+            else:
+                outcome = self._rebase_write(acb, result)
+                if outcome is not None:
+                    return outcome
+
+            acb.rebase_attempts += 1
+            if not self.h.budget.consume(acb.budget_node.node_id, 1):
+                self._quarantine(acb, "budget_exhausted")
+                return Result(Status.SEMANTIC_REJECTED, {"reason": "budget_exhausted"})
+            if acb.rebase_attempts > acb.retry_budget:
+                self._quarantine(acb, "rebase_budget_exhausted")
+                return Result(Status.SEMANTIC_REJECTED, {"reason": "rebase_budget_exhausted"})
+
+            retry = self._commit_staged(acb)          # 返回值必须被使用（B11）
+            if retry == Status.OK:
+                advance(acb, "patch_applied")        # REBASING → RUNNING
+                return Result(Status.OK, {"rebased": True, "attempts": acb.rebase_attempts})
+            if retry.status not in (Status.CONFLICT, Status.REJECT_STALE_READ):
+                return retry
+            # 第二次（及以后）冲突：不丢写，继续有界重试
+            result = retry
+            st = retry.status
+            self._enter_rebasing(acb)
+        return Result(Status.SEMANTIC_REJECTED, {"reason": "rebase_budget_exhausted"})
+
+    def _enter_rebasing(self, acb: ACB) -> bool:
+        """§5.2 状态归一化：仅允许 `RUNNING→REBASING` 或已在 `REBASING`。
+
+        `QUARANTINED` 与终态一律拒绝（返回 `False`），不再强行置 REBASING
+        （避免对已隔离/已结束任务做无意义 rebase 而丢写）。
+        """
+        if acb.state is TaskState.REBASING:
+            return True
+        if acb.state is TaskState.RUNNING:
+            advance(acb, "verifier_failed")           # 表 A 的合法边
+            return True
+        return False
+
+    def _ensure_retry_budget(self, acb: ACB) -> bool:
+        """为重试预留预算：不足 `retry_budget + 1` 时从节点 `limits` 补足。
+
+        保持 `consumed ≤ own_reserved ≤ limits` 的守恒不变量；预留失败 → 调用方隔离。
+        """
+        node = acb.budget_node
+        needed = acb.retry_budget + 1
+        available = node.own_reserved - node.consumed
+        if available >= needed:
+            return True
+        return self.h.budget.reserve(node.node_id, needed - available)
+
+    def _rebase_write(self, acb: ACB, result: Result):
+        """§5.3：以 pre_image 为 base 做 3-way merge；成功则 _accept，冲突交 resolver。"""
+        resource = result.detail["resource"]
+        base = self.h.workspace.pre_image(resource, acb.base_version.get(resource, 0))
+        local = acb.staged.get(resource)
+        committed = self.h.workspace.get(resource)
+        if base is MISSING:                           # 前像缺失 → 不能自动合并
+            self._quarantine(acb, "no_pre_image")
+            return Result(Status.SEMANTIC_REJECTED, {"reason": "no_pre_image"})
+
+        mr = merge3(base, local, committed, self.h.planner.merge_policy_of(resource))
+        if mr.ok:
+            self._accept(acb, resource, mr.merged, merge=False)
+            return None
+
+        ctx = {"attempt": acb.rebase_attempts + 1,
+               "task": acb.task_id, "subgoal": acb.logical_subgoal_id,
+               "script": acb.spec.get("script")}
+        resolved = None
+        if self.h.resolver is not None:
+            resolved = self.h.resolver(acb, resource, mr.conflicts, ctx)
+        if resolved is None or not _validate_resolution(resolved, mr, base, committed):
+            # resolver 放弃 / 输出不合 schema → 计入一次尝试，由 retry_budget 隔离
+            acb.failure = "resolver_failed"
+            return None
+        self._accept(acb, resource, resolved, merge=True)
+        return None
+
+    def _accept(self, acb: ACB, resource: str, content: Any, *, merge: bool = True) -> None:
+        """接受合并结果：写 staged 并刷新 base_version 与 read_set（P0-9）。
+
+        `merge=True`（resolver 输出）：深合并到 committed（保留非冲突内容）；
+        `merge=False`（merge3 已成功）：整体替换（mr.merged 已权威）。
+        """
+        if merge:
+            committed = self.h.workspace.get(resource)
+            if isinstance(committed, dict) and isinstance(content, dict):
+                content = _deep_merge(committed, content)
+        acb.staged[resource] = content
+        v = self.h.workspace.version(resource)
+        acb.base_version[resource] = v
+        acb.read_set[resource] = v
+
+    def _refresh_read_dep(self, acb: ACB, resource: str | None = None) -> None:
+        """§5.4：REJECT_STALE_READ → 一次刷新**所有**陈旧读依赖（不做 merge3）。
+
+        同时刷新 `read_set` 与 `base_version`（否则 base 仍是旧值 → 再冲突）。
+        """
+        targets = list(acb.read_set)
+        if resource is not None and resource not in targets:
+            targets.append(resource)
+        for r in targets:
+            actual = self.h.workspace.version(r)
+            if acb.read_set.get(r) != actual:
+                acb.read_set[r] = actual
+                acb.base_version[r] = actual
+
+    def _retry_with_fresh_lease(self, acb: ACB, result: Result) -> Result:
+        """§5.4：REJECT_STALE → 重新 reserve（不是 renew）后重试一次。"""
+        resource = result.detail.get("resource")
+        if resource is None:
+            return result
+        base = self.h.workspace._base_of(acb, resource)
+        lease = self.h.intents.reserve(resource, acb.id, base, self.h.lease_ms)
+        if lease is None:
+            acb.state = TaskState.FAILED
+            acb.failure = "RESERVE_FAILED"
+            return result
+        acb.leases.append(lease)
+        retry = self._commit_staged(acb)
+        if retry == Status.OK:
+            return Result(Status.OK, {"rebased": True, "attempts": acb.rebase_attempts})
+        if retry == Status.REJECT_STALE:              # 再失败 → FAILED
+            acb.state = TaskState.FAILED
+            acb.failure = retry.status.value
+        return retry
+
+    def _quarantine(self, acb: ACB, reason: str) -> None:
+        """隔离：REBASING --replan_budget_exhausted--> QUARANTINED（合法边，§5.5）。"""
+        if acb.state is not TaskState.QUARANTINED:
+            if acb.state is TaskState.REBASING:
+                advance(acb, "replan_budget_exhausted")
+            else:
+                acb.state = TaskState.QUARANTINED
+        acb.failure = reason
+        self.h.checkpoints.save(acb)
+
+
+def _deep_merge(base: Any, override: Any) -> Any:
+    """深合并：`override` 覆盖 `base`（同为 dict 时递归），返回新对象。"""
+    if isinstance(base, dict) and isinstance(override, dict):
+        out = copy.deepcopy(base)
+        for k, v in override.items():
+            out[k] = _deep_merge(out[k], v) if k in out else copy.deepcopy(v)
+        return out
+    return copy.deepcopy(override)
+
+
+def _validate_resolution(resolved: Any, mr: MergeResult, base: Any, committed: Any) -> bool:
+    """§7.1 输出注入防护 + 语义完整性：resolver 必须给出**完整内容**。
+
+    - 是 dict；
+    - 键集合 == `committed` 顶层键 ∪ 冲突路径顶层键（不多不少）；
+    - 非冲突键：值必须**严格等于** `committed`；
+    - 冲突键：值类型必须与 `committed`（缺失时退到 `base`）同类。
+    任一不满足 → `False`（→ 隔离）。
+    """
+    if not isinstance(resolved, dict):
+        return False
+    conflict_tops = {c.path.strip("/").split("/")[0] if c.path else ""
+                     for c in mr.conflicts}
+    if not isinstance(committed, dict):
+        return False
+    if set(resolved) != (set(committed) | conflict_tops):
+        return False
+    for key, value in resolved.items():
+        if key in conflict_tops:
+            ref = committed.get(key, MISSING)
+            if ref is MISSING and isinstance(base, dict):
+                ref = base.get(key, MISSING)
+            if ref is not MISSING and _kind(value) != _kind(ref):
+                return False
+        else:
+            if not _strict_eq(value, committed[key]):
+                return False
+    return True
 
 
 class CrashInjected(Exception):

@@ -36,6 +36,8 @@ class CheckpointStore:
             "aging_deadline": acb.aging_deadline,
             "effect_journal_offset": acb.step,
             "hitl_result": copy.deepcopy(acb.hitl_result),
+            "rebase_attempts": acb.rebase_attempts,
+            "retry_budget": acb.retry_budget,
         }
         acb.result_ref = ref
         return ref

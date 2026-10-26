@@ -29,6 +29,7 @@ from .checkpoint import CheckpointStore, EffectJournal
 from .subscription import SubscriptionRegistry
 from .policy import CapabilityToken, PolicyEngine
 from .context import ContextAssembler
+from .resolver import ConflictResolver, LLMResolver, ScriptedResolver
 from .runtime import AgentRuntime
 from .orchestration import Planner, Dispatcher, Scheduler, RunCoordinator, ReconcileLoop, HITL
 from .harness import Harness
@@ -43,6 +44,7 @@ __all__ = [
     "EventLog", "WalEventLog", "IntentRegistry", "WorkspaceManager", "WorkspaceVersionStore",
     "BudgetManager", "CheckpointStore", "EffectJournal", "SubscriptionRegistry",
     "PolicyEngine", "CapabilityToken", "ContextAssembler", "AgentRuntime",
+    "ConflictResolver", "ScriptedResolver", "LLMResolver",
     "Planner", "Dispatcher", "Scheduler", "RunCoordinator", "ReconcileLoop", "HITL",
     "Harness",
     "MISSING", "DELETE", "Conflict", "MergePolicy", "MergeResult", "merge3",

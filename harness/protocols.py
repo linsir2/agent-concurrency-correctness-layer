@@ -11,8 +11,15 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Optional, Protocol
 
+from .resolver import ConflictResolver                        # noqa: F401  (re-export)
 from .types import (ACB, Event, EventKind, Lease, Mode, Reservation, Result,
                     Write)
+
+__all__ = [
+    "Clock", "EventLog", "IntentRegistry", "BudgetManager", "Workspace",
+    "CheckpointStore", "EffectJournal", "PolicyEngine", "Decider",
+    "ConflictResolver",
+]
 
 
 class Clock(Protocol):

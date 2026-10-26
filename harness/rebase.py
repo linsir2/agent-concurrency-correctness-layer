@@ -66,6 +66,17 @@ class MergePolicy(str, Enum):
     PIVOT = "PIVOT"         # 不自动合并，直接升级
 
 
+# 旧词表兼容（spec 早期用 `replace` / `json-merge` / `grow-only`）
+_POLICY_ALIASES: dict = {
+    "set": MergePolicy.SET,
+    "grow_only": MergePolicy.GROW_ONLY,
+    "replace": MergePolicy.REPLACE,
+    "pivot": MergePolicy.PIVOT,
+    "json-merge": MergePolicy.SET,
+    "grow-only": MergePolicy.GROW_ONLY,
+}
+
+
 # ---------------------------------------------------------------- §3.3 Delete 哨兵
 class DeleteResource:
     """create 型写的反向操作：删除该资源（不是写入某个值）。
@@ -118,11 +129,11 @@ def _escape(key: str) -> str:
 
 
 def _union(*lists) -> list:
-    """保序去重并集（保持首次出现顺序）。"""
+    """保序去重并集（保持首次出现顺序；成员判定用类型严格比较）。"""
     out: list = []
     for lst in lists:
         for x in lst:
-            if x not in out:
+            if not _strict_in(x, out):
                 out.append(x)
     return out
 
@@ -133,6 +144,15 @@ def _conflict(conflicts: list, path: str, kind: str,
     conflicts.append(Conflict(path=path, kind=kind, local=local,
                               committed=committed, base=base))
     return MISSING
+
+
+def _coerce_policy(v: Any) -> MergePolicy:
+    """兼容旧词表：`replace`→REPLACE、`json-merge`→SET、`grow-only`→GROW_ONLY；
+    未知词 → PIVOT（不抛 ValueError，避免脏配置击穿合并）。"""
+    if isinstance(v, MergePolicy):
+        return v
+    key = str(v).strip().lower()
+    return _POLICY_ALIASES.get(key, MergePolicy.PIVOT)
 
 
 def _resolve_policy(path: str, policy: Optional[dict]) -> Optional[MergePolicy]:
@@ -151,8 +171,8 @@ def _resolve_policy(path: str, policy: Optional[dict]) -> Optional[MergePolicy]:
             continue
         if len(key) > best_len:
             best_len = len(key)
-            best_policy = MergePolicy(v)
-        elif len(key) == best_len and MergePolicy(v) != best_policy:
+            best_policy = _coerce_policy(v)
+        elif len(key) == best_len and _coerce_policy(v) != best_policy:
             return MergePolicy.PIVOT             # 歧义 → PIVOT（不静默取第一条）
     return best_policy
 
@@ -173,6 +193,11 @@ def _strict_eq(a: Any, b: Any) -> bool:
             return False
         return all(_strict_eq(x, y) for x, y in zip(a, b))
     return a == b
+
+
+def _strict_in(x: Any, seq) -> bool:
+    """类型严格的成员判定（`True` 与 `1` 不得互相命中）。"""
+    return any(_strict_eq(x, y) for y in seq)
 
 
 def _merge(base: Any, local: Any, committed: Any, path: str,
@@ -261,17 +286,17 @@ def _merge_array(base: Any, local: Any, committed: Any, path: str,
     b, l, c = list(base or []), list(local), list(committed)
 
     if p is MergePolicy.GROW_ONLY:              # 可选：只增不删
-        if any(x not in l or x not in c for x in b):
+        if any(not _strict_in(x, l) or not _strict_in(x, c) for x in b):
             return _conflict(conflicts, path, "pivot", local, committed, base)
         return _union(l, c)
 
     # SET（默认）：增并删减 —— remove-wins
-    removals = {x for x in b if x not in l or x not in c}   # 任一方删了 → 删
-    additions = [x for x in l if x not in b]
-    additions += [x for x in c if x not in b and x not in additions]
-    out = [x for x in b if x not in removals]               # 保 base 序
+    removals = [x for x in b if not _strict_in(x, l) or not _strict_in(x, c)]  # 任一方删了 → 删
+    additions = [x for x in l if not _strict_in(x, b)]
+    additions += [x for x in c if not _strict_in(x, b) and not _strict_in(x, additions)]
+    out = [x for x in b if not _strict_in(x, removals)]          # 保 base 序
     for x in additions:
-        if x not in out and x not in removals:
+        if not _strict_in(x, out) and not _strict_in(x, removals):
             out.append(x)
     return out
 

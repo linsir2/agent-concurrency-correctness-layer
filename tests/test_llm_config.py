@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from harness.llm import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMConfig, MissingAPIKey
+from harness.llm import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    DisallowedBaseURL,
+    LLMConfig,
+    MissingAPIKey,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 # 真实密钥形态：sk- 后跟 >=20 位十六进制（本文件里的字面量不满足，不会自匹配）
@@ -29,13 +35,21 @@ def test_config_from_env_uses_qwen_flash_default():
 
 
 def test_env_overrides_base_url_and_model():
+    # ① 白名单内端点（dashscope.aliyuncs.com）可覆盖
     cfg = LLMConfig.from_env({
         "DASHSCOPE_API_KEY": "dummy",
-        "DASHSCOPE_BASE_URL": "https://example.invalid/v1/",
+        "DASHSCOPE_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v2/",
         "DASHSCOPE_MODEL": "other-model",
     })
-    assert cfg.base_url == "https://example.invalid/v1"
+    assert cfg.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v2"
     assert cfg.model == "other-model"
+
+    # ② 非白名单端点必须抛异常（防密钥/内容外泄，见 harness/llm.py 白名单）
+    with pytest.raises(DisallowedBaseURL):
+        LLMConfig.from_env({
+            "DASHSCOPE_API_KEY": "dummy",
+            "DASHSCOPE_BASE_URL": "https://example.invalid/v1/",
+        })
 
 
 def test_missing_key_raises():

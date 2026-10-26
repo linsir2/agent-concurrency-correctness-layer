@@ -7,7 +7,7 @@
 ## 运行
 
 ```bash
-cd /workspace && python3 -m pytest tests/ -q     # 59 passed
+cd /workspace && python3 -m pytest tests/ -q     # 69 passed
 ```
 
 无第三方依赖（仅标准库 + pytest）。
@@ -37,15 +37,17 @@ cd /workspace && python3 -m pytest tests/ -q     # 59 passed
 | `tests/test_ms0_event_log.py` | MS0 出口：seq 单调（2 个测试） |
 | `tests/test_ms0_skeleton.py` | MS0 出口：Event 全字段 / `append_batch` 连续 seq / `Result` 带载 / 状态机表驱动 / Task·Run 终态分离 / `ManualClock`（9 个测试） |
 | `tests/test_ms0_wal.py` | MS0 出口：WAL 尾部半帧截断 / 跨进程 fsync 持久 / 中段坏帧 `WalCorrupt` / 重放重建 seq / 原子写无残留（5 个测试） |
-| `tests/test_ms1_workspace_locks.py` | MS1 出口：提交点=WAL + 前像重建 / 读集合陈旧拒绝 / 租约时钟过期 / 锁序不死锁 + 6 个回归（None 内容、重复资源、bytes 往返、空批、content_hash 缺失、读集合锁争用）（10 个测试） |
+| `tests/test_ms1_workspace_locks.py` | MS1 出口：提交点=WAL + 前像重建 / 读集合陈旧拒绝 / 租约时钟过期 / 锁序不死锁 + 6 个回归（10 个测试） |
+| `tests/test_ms1_rebase.py` | MS1 出口：`merge3` 的 `SET` 集合语义（增并删减 / 单方删除 / 对象数组 PIVOT / GROW_ONLY / 嵌套类型）（1 个测试，8 条断言） |
+| `tests/test_ms1_rebase_loop.py` | MS1 出口：create 可补偿 + 幂等 / rebase 回路与状态回边 / 重试有界与预算消耗 / Delete 哨兵补偿交叉（4 个测试） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |
 | `tests/test_adversarial.py` | A1–A13（含 A7b 背压） |
 | `tests/test_ms7_capability.py` | MS7 出口：能力强制（2 个测试） |
 | `tests/test_ms8_conformance.py` | MS8 出口：I1/I2/I3/I5/I6/I7/I8 |
 | `tests/test_ms8_spec.py` | MS8 出口：I9/I10/I13 + 资源模型 + 协调协议 + 收据链 |
 
-> **总计 59 个测试**：19 个用例测试 + 40 个里程碑出口/规范测试。
-> 按里程碑切子集：`pytest -m ms0`（14 个）、`pytest -m ms1`（10 个）；markers 见 `pyproject.toml`。
+> **总计 69 个测试**：19 个用例测试 + 50 个里程碑出口/规范测试。
+> 按里程碑切子集：`pytest -m ms0`（14 个）、`pytest -m ms1`（15 个）；markers 见 `pyproject.toml`。
 
 ## 设计要点
 

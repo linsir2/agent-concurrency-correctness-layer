@@ -299,6 +299,7 @@ class ACB:
     no_progress_steps: int = 0
     last_action_sig: Optional[str] = None
     retry_budget: int = 3
+    rebase_attempts: int = 0          # 冲突 rebase 已尝试次数（跨调用累加，§5.5）
     trace_id: str = ""
     span_id: str = ""
     parent: "ACB | None" = None

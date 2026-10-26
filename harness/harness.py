@@ -17,11 +17,14 @@ from .intent_registry import IntentRegistry
 from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
                             RunCoordinator, Scheduler)
 from .policy import PolicyEngine
+from .resolver import ScriptedResolver
 from .runtime import AgentRuntime
 from .subscription import SubscriptionRegistry
-from .types import ACB, EventKind, Mode, Result, Status, TaskState, Write
+from .types import (ACB, EventKind, Mode, Result, Status, TaskState, Write,
+                    advance)
 from .storage.blob import InMemoryBlobStore, canonical_bytes
 from .workspace import WorkspaceManager, WorkspaceVersionStore
+from .rebase import DELETE
 
 
 class Harness:
@@ -38,7 +41,7 @@ class Harness:
                  clock=None, event_log=None, intents=None, versions=None,
                  workspace=None, budget=None, checkpoints=None, effects=None,
                  policy=None, context=None, subscriptions=None,
-                 decide=None, default_token=None,
+                 decide=None, default_token=None, resolver=None,
                  blobs=None, path_of=None, lock_timeout_s: float = 5.0) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
@@ -70,6 +73,8 @@ class Harness:
                         else ContextAssembler(self.event_log, self.workspace, retention))
         self.compensation_journal: list[dict] = []      # 文档 §5.4
         self.decide = decide
+        self.resolver = (resolver if resolver is not None
+                         else ScriptedResolver())       # §7 默认 scripted（不联网）
 
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)
@@ -139,8 +144,13 @@ class Harness:
                 if r != Status.VALID:
                     return r
 
-            blob_hashes = {w.resource: self.blobs.put(canonical_bytes(contents[w.resource]))
-                           for w in writes}                        # ④′ 内容先落盘
+            blob_hashes = {}                              # ④′ 内容先落盘（DELETE 跳过）
+            for w in writes:
+                if contents[w.resource] is DELETE:
+                    blob_hashes[w.resource] = ""
+                else:
+                    blob_hashes[w.resource] = self.blobs.put(
+                        canonical_bytes(contents[w.resource]))
 
             for w in writes:                                       # ⑤ 提交点前复验租约
                 if not self.intents.is_valid(leases[w.resource]):
@@ -148,13 +158,16 @@ class Harness:
                                   {"resource": w.resource,
                                    "reason": "lease_expired_before_commit"})
 
-            drafts = [self._commit_record(acb, w, blob_hashes[w.resource]) for w in writes]
+            drafts = [self._commit_record(acb, w, blob_hashes[w.resource],
+                                          contents[w.resource] is DELETE)
+                      for w in writes]
             events = self.event_log.append_batch(drafts, notify=False)   # ⑥ 提交点
 
             for w in writes:                                       # ⑦ 投影（可重放）
                 prev = (self.workspace.manifest[w.resource].blob_hash
                         if w.resource in self.workspace.manifest else "")
-                self.workspace._apply_locked(acb, w, blob_hashes[w.resource], prev)
+                self.workspace._apply_locked(acb, w, blob_hashes[w.resource], prev,
+                                             deleted=contents[w.resource] is DELETE)
             for w in writes:                                       # ⑦′ 自写后重读：刷新 ACB 读版本
                 new_version = self.workspace.version(w.resource)
                 acb.read_set[w.resource] = new_version
@@ -170,18 +183,23 @@ class Harness:
                 except Exception:
                     pass
 
-    def _commit_record(self, acb: ACB, w: Write, blob_hash: str) -> dict:
+    def _commit_record(self, acb: ACB, w: Write, blob_hash: str,
+                       deleted: bool = False) -> dict:
         cur = self.workspace.manifest.get(w.resource)
+        version = self.workspace._next_version(w.resource)
+        payload = {
+            "resource": w.resource,
+            "version": version,
+            "blob_hash": blob_hash,
+            "prev_hash": cur.blob_hash if cur else "",
+            "diff": {"prev_hash": cur.blob_hash if cur else "", "current_hash": blob_hash},
+        }
+        if deleted:                                  # Delete 哨兵事件（可重放）
+            payload["deleted"] = True
         return {
             "kind": EventKind.RESOURCE_COMMITTED,          # ← 必须与重建过滤一致
             "subject": w.resource,
-            "payload": {
-                "resource": w.resource,
-                "version": (cur.version if cur else 0) + 1,
-                "blob_hash": blob_hash,
-                "prev_hash": cur.blob_hash if cur else "",
-                "diff": {"prev_hash": cur.blob_hash if cur else "", "current_hash": blob_hash},
-            },
+            "payload": payload,
             "producer": acb.id,
             "run_id": acb.run_id,
             "idempotency_key": f"{acb.run_id}:{acb.id}:{w.resource}",
@@ -194,13 +212,26 @@ class Harness:
             if w.compensated:
                 self.compensation_journal.append({"resource": w.resource, "state": "SKIPPED"})
                 continue
+            # 幂等（前置）：资源已不在 manifest 且 tombstone == version_before + 2 → 直接 COMPENSATED。
+            # 删除产生的版本 = 删除前版本 + 1，而补偿校验保证删除前版本 == w.version_before + 1。
+            expected_tombstone = w.version_before + 2
+            if (w.resource not in self.workspace.manifest
+                    and self.workspace.version(w.resource) == expected_tombstone):
+                w.compensated = True
+                self.compensation_journal.append({"resource": w.resource, "state": "COMPENSATED"})
+                self.event_log.append(EventKind.COMPENSATION_DONE, w.resource, {},
+                                      producer=acb.id)
+                continue
             reverse = self.workspace.compute_reverse_patch(w)
             if reverse is None:
                 w.pivot = True
                 self.compensation_journal.append({"resource": w.resource, "state": "PIVOT"})
                 self.event_log.append(EventKind.PIVOT, w.resource, {}, producer=acb.id)
                 continue
-            acb.staged[w.resource] = reverse
+            if reverse is DELETE:
+                acb.staged[w.resource] = DELETE
+            else:
+                acb.staged[w.resource] = reverse
             st = self._compensate_one(acb, w)
             if st == Status.REJECT_COMPENSATE:
                 w.pivot = True
@@ -269,8 +300,8 @@ class Harness:
         if plan and acb.task_id in plan["tasks"]:
             plan["tasks"][acb.task_id]["state"] = acb.state
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
-                         TaskState.DONE, TaskState.DONE_PARTIAL):
-            # 终态释放预算（文档 §9.1：结束必 release）
+                         TaskState.DONE, TaskState.DONE_PARTIAL, TaskState.QUARANTINED):
+            # 终态 + QUARANTINED 释放预算（文档 §5.5：非终态但不再消耗，必须释放防泄漏）
             if acb.budget_node is not None:
                 self.budget.release(acb.budget_node.node_id)
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
@@ -281,6 +312,21 @@ class Harness:
         if plan:
             self.reconcile.reconcile_events(acb.run_id)
             self.reconcile.rebuild_ready_set(acb.run_id)
+
+    def escalate_quarantined(self, acb: ACB) -> Result:
+        """人工 escalate：QUARANTINED → DEAD_LETTER，释放预算并传播 failure（文档 §5.5）。"""
+        if acb.state is not TaskState.QUARANTINED:
+            return Result(Status.INVALID_INPUT, {"state": acb.state.value})
+        r = advance(acb, "replan_budget_exhausted")     # QUARANTINED → DEAD_LETTER（合法边）
+        if r != Status.OK:
+            return r
+        if acb.budget_node is not None:
+            self.budget.release(acb.budget_node.node_id)
+        plan = self.plans.get(acb.run_id)
+        if plan and acb.task_id in plan["tasks"]:
+            self.propagate_failure(acb.task_id,
+                                   plan["tasks"][acb.task_id].get("plan_version", 1))
+        return Result(Status.OK, {"state": acb.state.value})
 
     # ---- 恢复（文档 §5.8） ----------------------------------------
     def recover(self, ref: str) -> ACB:
@@ -297,6 +343,8 @@ class Harness:
         acb.aging_deadline = data.get("aging_deadline")
         acb.step = data["effect_journal_offset"]
         acb.hitl_result = data.get("hitl_result")
+        acb.rebase_attempts = data.get("rebase_attempts", 0)
+        acb.retry_budget = data.get("retry_budget", 3)
         if acb.budget_node is None:
             node_id = f"B-{acb.task_id}"
             acb.budget_node = self.budget._nodes.get(node_id) or self.budget.create_node(

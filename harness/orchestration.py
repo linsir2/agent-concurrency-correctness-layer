@@ -36,6 +36,7 @@ class Planner:
                     "min_budget": spec.get("min_budget", 10),
                     "logical_deps": spec.get("logical_deps", []),
                 },
+                "merge_policy": spec.get("merge_policy") or {},
                 "state": TaskState.PLANNED,
                 "plan_version": 1,
             }
@@ -44,6 +45,20 @@ class Planner:
 
     def add_logical_edge(self, plan: dict, from_id: str, to_id: str) -> None:
         plan["edges"].append({"from": from_id, "to": to_id, "kind": "LOGICAL"})
+
+    def merge_policy_of(self, resource: str) -> dict:
+        """§3.2：从 task spec 的 `merge_policy` 读 per-key 策略（缺省空 dict）。
+
+        按 resource 归属（committed/contingent）定位任务；未命中 → `{}`。
+        """
+        for plan in self.h.plans.values():
+            for task in plan.get("tasks", {}).values():
+                fp = task.get("footprint", {})
+                if (resource in fp.get("committed", ())
+                        or resource in fp.get("contingent", ())):
+                    mp = task.get("merge_policy")
+                    return dict(mp) if isinstance(mp, dict) else {}
+        return {}
 
     def patch(self, plan: dict, diagnosis: dict) -> dict:
         """文档 §8.1：诊断 → PlanPatch（复用 logical_subgoal_id）。"""
