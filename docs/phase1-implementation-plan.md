@@ -617,7 +617,7 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 |---|---|---|
 | **S0** | `pyproject.toml` + markers + `protocols.py` + `types.py`（Event/Result/TaskState/RunState/TRANSITIONS）+ `clock.py` + 注入图 + deny-by-default | ① `pytest --markers` 输出含 `ms0..ms3`；② `-m ms0` 能选出子集；③ **原有 35 测试全绿 + 新增 9 个骨架测试**（共 44） |
 | **S1** | `storage/atomic.py` + `blob.py` + `wal.py` + `WalEventLog` + `InMemoryBlobStore`/`FileBlobStore` | T1、T2、T3 绿 + 重放重建 seq/索引（T4 的 manifest 一致性随 S2 的 manifest 一起验） |
-| **S2** | `intent_registry`（注入时钟）+ `workspace`（manifest/blob/锁序/base_version 恒等） | T5、T7 + `test_a9_lease_renew_revoke_race` 绿 |
+| **S2** | `intent_registry`（注入时钟）+ `workspace`（manifest/blob/锁序/base_version 恒等）+ `Harness.commit_batch` 全序持锁 | T4、T5、T5b、T7 绿 + `test_a9_lease_renew_revoke_race` 绿（详见 [S2 详细方案](s2-workspace-and-locks.md)） |
 | **S3** | `rebase.py` + `handle_commit_result` + `Delete` 哨兵补偿 | T6、T8 + `test_a1_compensation_cross_no_overwrite` 绿 |
 | **S4** | `budget`（Reservation + 幂等 release）+ `dispatcher`（回滚）+ `policy`（deny-by-default + default_token） | T9、T10、T14 + `test_a4_budget_double_spend`、`test_a12_concurrent_reserve_no_overcommit`、`test_a13_per_action_guard_budget` 绿 |
 | **S5** | `EffectJournal`（probe）+ `CompensationJournal`（落盘 + 幂等键）+ `recover`（resume_policy） | T11、T12、T13 + `test_u4_long_task_crash_recovery_idempotent` 绿 |
@@ -627,6 +627,7 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 
 > 每步结束打 tag `phase1-s0`…`phase1-s8`；任一步不达标回退到上一个 tag，不带着红灯前进。
 > **Step ↔ 里程碑映射**：S1→MS0，S2/S3→MS1，S4→MS2，S5→MS3-lite，S6→E2E，S7→Bench。每步判据里列的测试名就是该里程碑的出口条件（满足 D14「出口必须全 ✅」）。
+> **S2 判据的口径澄清**：「`base_version` 恒等」指**已读资源**恒等（`stage` 同时写 `read_set` 与 `base_version`）；未读资源按「无读依赖」以提交时版本为基线 —— 详见 [S2 方案 §6.1](s2-workspace-and-locks.md)。
 
 ---
 
