@@ -288,8 +288,8 @@ def test_ms2_run_task_goes_through_dispatcher():
     assert len(calls) == 1                                            # ① 走 dispatcher
     assert acb.reservation_ids != []                                  # ② 拿到预留
     assert acb.state is TaskState.DONE
-    # ③ 同步结束后预算已结算：finish 不消耗 → 全额归还
-    assert all(h.budget._reservations[rid][1].state == "SETTLED"
+    # ③ 同步结束后预算已结算：finish 不消耗 → 全额归还；终态归档 → ARCHIVED
+    assert all(h.budget._reservations[rid][1].state == "ARCHIVED"
                for rid in acb.reservation_ids)
     assert h.budget.root.remaining == h.budget.root.limits
     assert h.budget.root.subtree_reserved == 0
@@ -299,19 +299,19 @@ def test_ms2_run_task_goes_through_dispatcher():
 # ================================================================ T14
 def test_i4_capability_production_no_self_issue():
     """T14：能力收口——新签名可用、旧路径默认拒绝、deny-by-default、准入同一判定。"""
-    # ① 新签名可用
+    # ① 新签名可用（token 显式传入，§5.9）
     h = Harness()
     token = h.policy.issue("A1", tools={"read"}, paths={"/src"})
     assert isinstance(token, CapabilityToken)
-    assert h.policy.check_capability("A1", "read", "/src/a.ts") is True
-    assert h.policy.check_capability("A1", "write", "/src/a.ts") is False
+    assert h.policy.check_capability("A1", token, "read", "/src/a.ts") is True
+    assert h.policy.check_capability("A1", token, "write", "/src/a.ts") is False
 
     # ② 生产路径不能自证身份（默认 allow_legacy=False）
     with pytest.raises(ValueError):
         h.policy.issue(CapabilityToken("A1", tools={"*"}))
 
-    # ③ deny-by-default
-    assert h.policy.check_capability("A-unknown", "read", "/x") is False
+    # ③ deny-by-default（未签发 token → 显式传 None）
+    assert h.policy.check_capability("A-unknown", None, "read", "/x") is False
 
     # ④ 准入与运行时同一判定：required_tools ⊄ token → DENIED_CAPABILITY
     plan = h.planner.plan("T14", [{"task_id": "T1", "min_budget": 10}])
@@ -476,9 +476,13 @@ def test_ms2_admit_limits_margin_and_dispatch_and_run():
     acb = h.dispatch_and_run(plan, "T1", [decision(1, finish())])
 
     assert acb.state is TaskState.DONE
-    assert acb.budget_node.limits == 10 + acb.retry_budget + 1
+    # K-13：终态且无 ACTIVE 预留 → 节点归档，budget_node 置 None
+    assert acb.budget_node is None
     rid = acb.reservation_ids[0]
-    assert h.budget._reservations[rid][1].amount == 10     # 只预留 min_budget
+    resv = h.budget._reservations[rid][1]
+    assert resv.amount == 10                               # 只预留 min_budget
+    assert resv.state == "ARCHIVED"                       # 归档后预留置 ARCHIVED
+    assert h.budget.root.remaining == h.budget.root.limits  # 结算：未消耗部分已归还
     assert h.plans["D"] is plan and h.acbs[acb.id] is acb
     assert h.slots.active == 0
 

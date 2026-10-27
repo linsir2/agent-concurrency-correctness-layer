@@ -24,10 +24,12 @@ from .clock import Clock, SystemClock, ManualClock
 from .event_log import EventLog, WalEventLog
 from .intent_registry import IntentRegistry
 from .workspace import WorkspaceManager, WorkspaceVersionStore
-from .budget import BudgetManager, Reservation
-from .checkpoint import CheckpointStore, EffectJournal
+from .budget import BudgetManager, InvariantError, Reservation
+from .checkpoint import CheckpointStore, EffectJournal, EffectEntry
+from .compensation import CompensationJournal, CompEntry
 from .subscription import SubscriptionRegistry
 from .policy import CapabilityToken, PolicyEngine
+from .auth import Signer, MissingSecret
 from .context import ContextAssembler
 from .resolver import ConflictResolver, LLMResolver, ScriptedResolver
 from .runtime import AgentRuntime
@@ -43,8 +45,12 @@ __all__ = [
     "TASK_TERMINAL", "RUN_TERMINAL", "TRANSITIONS", "advance",
     "Clock", "SystemClock", "ManualClock",
     "EventLog", "WalEventLog", "IntentRegistry", "WorkspaceManager", "WorkspaceVersionStore",
-    "BudgetManager", "CheckpointStore", "EffectJournal", "SubscriptionRegistry",
-    "PolicyEngine", "CapabilityToken", "ContextAssembler", "AgentRuntime",
+    "BudgetManager", "CheckpointStore", "EffectJournal", "EffectEntry",
+    "CompensationJournal", "CompEntry",
+    "SubscriptionRegistry",
+    "PolicyEngine", "CapabilityToken", "Signer", "MissingSecret",
+    "ContextAssembler", "AgentRuntime",
+    "InvariantError",
     "ConflictResolver", "ScriptedResolver", "LLMResolver",
     "Planner", "Dispatcher", "Scheduler", "SlotTracker", "RunCoordinator",
     "ReconcileLoop", "HITL",

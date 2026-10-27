@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 import uuid
@@ -13,15 +14,39 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from harness import (ACB, Action, Decision, Harness,  # noqa: E402
                      TaskState, Write)
+from harness.runtime import CrashInjected
 
 
-def make_harness(run_limits: int = 1000, *, clock=None, blobs=None) -> Harness:
+def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
+                 toolgw=None, compensate_crash_at=None,
+                 auth_secret: str | None = None) -> Harness:
     """默认 Harness + 通配能力 token（D13：deny-by-default 下的测试夹具）。
 
     安全用例必须用**不装 default_token** 的 `Harness()` 自行断言拒绝。
     `clock`/`blobs` 透传（MS1：注入时钟构造租约过期、共享 blob 目录）。
+
+    MS3 注入参数（§7）：
+    - `probe`：注入 `EffectJournal._probe`（三态反查）；
+    - `toolgw`：挂到 `h.toolgw`（工具网关占位；当前 runtime 内联执行）；
+    - `compensate_crash_at`：补偿第 N 条后抛 `CrashInjected`（真实崩溃注入）；
+    - `auth_secret`：注入 HMAC 签名密钥（缺失 → `MissingSecret`）。
     """
-    h = Harness(run_limits=run_limits, clock=clock, blobs=blobs)
+    h = Harness(run_limits=run_limits, clock=clock, blobs=blobs,
+                auth_secret=auth_secret)
+    if probe is not None:
+        h.effects._probe = probe
+    if toolgw is not None:
+        h.toolgw = toolgw
+    if compensate_crash_at is not None:
+        _orig_run_one = h._run_one_compensation
+        _counter = itertools.count(1)
+
+        def _crashy(acb, e, w=None, _orig=_orig_run_one, _n=compensate_crash_at):
+            if next(_counter) > _n:
+                raise CrashInjected(0, 0)
+            return _orig(acb, e, w)
+
+        h._run_one_compensation = _crashy
     h.policy.default_token = h.policy.issue(
         "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
     return h

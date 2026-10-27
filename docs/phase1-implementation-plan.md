@@ -764,7 +764,8 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S2** | ✅ 完成（2026-10-26） | `workspace` manifest+blob 读模型、每资源锁 + 全序批量获取、`put` 推进版本、前像随 WAL 重建、`intent_registry` 注入时钟与过期语义、`commit_batch` 全序提交（读集合加锁、提交点前复验、锁外通知） | **59 passed**（+10）；T4/T5/T5b/T7 + 6 个回归；11 个测试改相对基线；详见 [S2 方案 v1.3](s2-workspace-and-locks.md) §12 |
 | **S3** | ✅ 完成（2026-10-26） | `rebase.py`（结构化冲突 merge3 + `SET` 集合语义）、`runtime.handle_commit_result`（有界 rebase 回路）、`Delete` 哨兵全链路（tombstone / 重建识别 / 补偿版本比对）、`resolver.py`（Scripted/LLM + 白名单）、`QUARANTINED` 预算与 escalate | **69 passed**（+5）；T6/T8/T20/T21/T22；实现后审查修 4 严重 + 5 高；详见 [S3 方案 v1.3](s3-rebase-and-compensation.md) §14 |
 | **S4** | ✅ 完成（2026-10-26） | `budget.py` 重写（`Reservation` + `subtree_reserved` + 幂等 release/settle + 三条不变量 + 兼容属性）、`SlotTracker`、`try_admit` 重写（committed 哨兵 + 四级回滚）、`policy.issue` 收口、`Harness.dispatch_and_run` 唯一入口 | **83 passed**（+14）；T9/T10/T14/T23/T24 + 7 回归；实现后评审修 5 P0 + 5 高；详见 [S4 方案 v1.2](s4-budget-and-admission.md) §13 |
-| S5 | ⏳ 待开工 | `EffectJournal`（probe）+ `CompensationJournal`（落盘 + 幂等键）+ `recover`（resume_policy） | T11、T12、T13 + `test_u4_long_task_crash_recovery_idempotent` 绿 |
+| **S5** | ✅ 完成（2026-10-26） | `EffectJournal` 落盘+probe 三态（INTENT 也 probe）、`CompensationJournal` 落盘+`comp_id`+批量原子+续做、`recover` 带 `resume_policy`、`auth.py`（HMAC+`jti`）、K-6/K-7/K-8/K-9/K-11/K-13/K-14 收口 | **91 passed**（+8，连跑 10 轮稳定）；T11/T12/T13/T25–T29；实现后评审修 4 P0 + 5 高 + 1 flaky；详见 [S5 方案 v1.2](s5-recovery-and-journals.md) §12 |
+| S6 | ⏳ 待开工 | `runtime`（表驱动+guard+续租）+`run_task` 走 dispatcher+`snapshot` | T19 + U1×2/U2/U3 绿 |
 
 **S0–S4 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。

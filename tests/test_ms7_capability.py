@@ -12,14 +12,14 @@ from harness import CapabilityToken, Harness, TaskState
 def test_capability_denied_blocks_tool():
     # D13：不装 default_token → deny-by-default（I4 能力封闭）
     h = Harness()
-    h.policy.issue(CapabilityToken("A-T1", tools={"read"}, paths={"/src"}),
-                   allow_legacy=True)
+    token = h.policy.issue(CapabilityToken("A-T1", tools={"read"}, paths={"/src"}),
+                           allow_legacy=True)
 
-    assert h.policy.check_capability("A-T1", "read", "/src/a.ts") is True
-    assert h.policy.check_capability("A-T1", "write", "/src/a.ts") is False
-    assert h.policy.check_capability("A-T1", "read", "/etc/passwd") is False
-    # 未签发 token 且无 default_token → 拒绝（不是放行）
-    assert h.policy.check_capability("A-UNKNOWN", "read", "/src/a.ts") is False
+    assert h.policy.check_capability("A-T1", token, "read", "/src/a.ts") is True
+    assert h.policy.check_capability("A-T1", token, "write", "/src/a.ts") is False
+    assert h.policy.check_capability("A-T1", token, "read", "/etc/passwd") is False
+    # 未签发 token 且无 default_token → 拒绝（不是放行）；显式传 None
+    assert h.policy.check_capability("A-UNKNOWN", None, "read", "/src/a.ts") is False
 
 
 def test_toolgateway_enforces_capability():
@@ -29,9 +29,9 @@ def test_toolgateway_enforces_capability():
     h.plans["CAP"] = plan
     acb = admit(h, "CAP", plan, "T1")
 
-    h.policy.issue(CapabilityToken(acb.id, tools={"read"}, paths={"/src"}),
-                   allow_legacy=True)
-    assert h.policy.check_capability(acb.id, "deploy") is False
+    token = h.policy.issue(CapabilityToken(acb.id, tools={"read"}, paths={"/src"}),
+                           allow_legacy=True)
+    assert h.policy.check_capability(acb.id, token, "deploy") is False
 
     # 即使模型发出该动作，也会被能力检查拦下
     act = __import__("conftest").tool("deploy")

@@ -8,9 +8,11 @@ from __future__ import annotations
 import hashlib
 import threading
 
-from .budget import BudgetManager, Reservation
+from .auth import Signer
+from .budget import BudgetManager, InvariantError, Reservation
 from .checkpoint import CheckpointStore, EffectJournal
 from .clock import SystemClock
+from .compensation import CompensationJournal
 from .context import ContextAssembler
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
@@ -20,8 +22,8 @@ from .policy import PolicyEngine
 from .resolver import ScriptedResolver
 from .runtime import AgentRuntime
 from .subscription import SubscriptionRegistry
-from .types import (ACB, EventKind, Mode, Result, Status, TaskState, Write,
-                    advance)
+from .types import (ACB, TASK_TERMINAL, EventKind, Mode, Result, Status,
+                    TaskState, Write, advance)
 from .storage.blob import InMemoryBlobStore, canonical_bytes
 from .workspace import WorkspaceManager, WorkspaceVersionStore
 from .rebase import DELETE
@@ -42,7 +44,10 @@ class Harness:
                  workspace=None, budget=None, checkpoints=None, effects=None,
                  policy=None, context=None, subscriptions=None,
                  decide=None, default_token=None, resolver=None,
-                 blobs=None, path_of=None, lock_timeout_s: float = 5.0) -> None:
+                 blobs=None, path_of=None, lock_timeout_s: float = 5.0,
+                 auth_secret: str | None = None,
+                 tombstone_ttl_s: float = 86400.0,
+                 auth_gc_every: int = 256) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -60,15 +65,24 @@ class Harness:
                           else WorkspaceManager(self.event_log, self.intents, self.versions,
                                                 blobs=self.blobs, path_of=path_of,
                                                 lock_timeout_s=lock_timeout_s))
-        self.budget = budget if budget is not None else BudgetManager(run_limits)
+        self.budget = (budget if budget is not None
+                       else BudgetManager(run_limits, tombstone_ttl_s=tombstone_ttl_s))
         self.checkpoints = checkpoints if checkpoints is not None else CheckpointStore()
         self.effects = (effects if effects is not None
                         else EffectJournal(self.event_log))
+        self.comp_journal = CompensationJournal(self.event_log)
+        self._applied_event_ids: set[str] = set()
+        self.checkpoints.applied_event_ids = self._applied_event_ids
+        self.auth_gc_every = max(1, int(auth_gc_every))
+        self._event_count = 0
+        self._auth_secret = auth_secret
+        self._auth: Signer | None = Signer(auth_secret) if auth_secret else None
         self.subscriptions = (subscriptions if subscriptions is not None
                               else SubscriptionRegistry(self.event_log))
         self.policy = (policy if policy is not None
                        else PolicyEngine(default_allow=policy_default_allow,
                                          default_token=default_token))
+        self.policy._signer_factory = self._get_signer
         self.context = (context if context is not None
                         else ContextAssembler(self.event_log, self.workspace, retention))
         self.compensation_journal: list[dict] = []      # 文档 §5.4
@@ -94,9 +108,39 @@ class Harness:
 
     # ---- 事件 → 订阅失效（文档 §5.6） ----------------------------
     def _on_event(self, ev) -> None:
+        # 周期性清理已过期的 jti（按注入时钟，避免 `_seen` 无界增长）
+        self._event_count += 1
+        if (self._auth is not None
+                and self._event_count % self.auth_gc_every == 0):
+            self._auth.gc_seen(self.clock.now_ms() / 1000.0)
         if ev.kind == EventKind.RESOURCE_COMMITTED:
             for agent_id in self.subscriptions.subscribers(ev.subject):
                 self.subscriptions.notify(ev.subject, ev)
+
+    # ---- 签名 / token ---------------------------------------------
+    def _get_signer(self) -> Signer:
+        """惰性构造 `Signer`：优先注入 secret，否则读 `HARNESS_AUTH_SECRET`。"""
+        if self._auth is None:
+            self._auth = Signer.from_env()
+        return self._auth
+
+    @property
+    def auth(self) -> Signer:
+        return self._get_signer()
+
+    def _effective_token(self, acb: ACB):
+        """取该 ACB 的有效 token：`acb.capability` → `policy._tokens` → `default_token`。
+
+        无 token → `None`（`_gateway_check` 据此 deny-by-default）。
+        """
+        token = getattr(acb, "capability", None)
+        if token is not None:
+            return token
+        token = self.policy.token(acb.id)
+        if token is not None:
+            return token
+        return self.policy.default_token
+
 
     # ---- 幂等键（文档 §5.8 / I7） --------------------------------
     def idem_key(self, acb: ACB, action, action_index: int) -> str:
@@ -208,46 +252,88 @@ class Harness:
         }
 
     def compensate(self, acb: ACB, applied: list[Write]) -> None:
-        """Saga 补偿：逆序回滚；`REJECT_COMPENSATE` → PIVOT；带 compensation_journal。"""
+        """Saga 补偿（§4.2）：批量原子计划 → 释放租约 → 逐条续做。
+
+        - `comp_journal.plan`：**一次 `append_batch`** 写全部条目 + 批次标记（同帧）；
+        - `revoke_all`：补偿前先释放租约；
+        - 逆序 `_run_one_compensation`：先按 `state` 分支，`deleted` 用版本号判定。
+        """
+        entries = self.comp_journal.plan(acb, applied)
         self.intents.revoke_all(acb.id)
-        for w in reversed(applied):
-            if w.compensated:
-                self.compensation_journal.append({"resource": w.resource, "state": "SKIPPED"})
-                continue
-            # 幂等（前置）：资源已不在 manifest 且 tombstone == version_before + 2 → 直接 COMPENSATED。
-            # 删除产生的版本 = 删除前版本 + 1，而补偿校验保证删除前版本 == w.version_before + 1。
-            expected_tombstone = w.version_before + 2
-            if (w.resource not in self.workspace.manifest
-                    and self.workspace.version(w.resource) == expected_tombstone):
-                w.compensated = True
-                self.compensation_journal.append({"resource": w.resource, "state": "COMPENSATED"})
-                self.event_log.append(EventKind.COMPENSATION_DONE, w.resource, {},
-                                      producer=acb.id)
-                continue
-            reverse = self.workspace.compute_reverse_patch(w)
-            if reverse is None:
-                w.pivot = True
-                self.compensation_journal.append({"resource": w.resource, "state": "PIVOT"})
-                self.event_log.append(EventKind.PIVOT, w.resource, {}, producer=acb.id)
-                continue
-            if reverse is DELETE:
-                acb.staged[w.resource] = DELETE
-            else:
-                acb.staged[w.resource] = reverse
-            st = self._compensate_one(acb, w)
-            if st == Status.REJECT_COMPENSATE:
-                w.pivot = True
-                self.compensation_journal.append({"resource": w.resource, "state": "PIVOT"})
-                self.event_log.append(EventKind.PIVOT, w.resource, {}, producer=acb.id)
-            elif st == Status.OK:
-                w.compensated = True
-                self.compensation_journal.append({"resource": w.resource, "state": "COMPENSATED"})
-                self.event_log.append(EventKind.COMPENSATION_DONE, w.resource, {},
-                                      producer=acb.id)
-            else:
-                self.compensation_journal.append({"resource": w.resource, "state": "FAILED"})
-                self.event_log.append(EventKind.COMPENSATION_FAILED, w.resource, {},
-                                      producer=acb.id)
+        by_id = {e.comp_id: w for e, w in zip(entries, applied)}
+        for e in reversed(entries):
+            self._run_one_compensation(acb, e, by_id.get(e.comp_id))
+
+    def _run_one_compensation(self, acb: ACB, e, w: Write | None = None) -> None:
+        """单条补偿（§4.2）：先按 journal 状态分支，再按 hash / 版本号判定。"""
+        if w is not None and w.compensated:
+            self.compensation_journal.append({"resource": e.resource, "state": "SKIPPED"})
+            return
+        if e.state == "COMPENSATED":
+            self._mark_write(w, "COMPENSATED")
+            self.compensation_journal.append({"resource": e.resource, "state": "COMPENSATED"})
+            return
+        if e.state == "PIVOT":
+            self._mark_write(w, "PIVOT")
+            self.compensation_journal.append({"resource": e.resource, "state": "PIVOT"})
+            return
+        exists = self.workspace.get(e.resource) is not None
+        current = self.workspace.content_hash(e.resource)
+        if e.deleted:
+            # 删除类：必须用版本号判定（空 hash 无法区分「不存在」与「删除后」）
+            if not exists and self.workspace.version(e.resource) == e.version_before + 1:
+                self.comp_journal.mark(e.comp_id, "COMPENSATED")
+                self._mark_write(w, "COMPENSATED")
+                self.compensation_journal.append({"resource": e.resource, "state": "COMPENSATED"})
+                return
+            if exists and current != e.applied_hash:
+                self.comp_journal.mark(e.comp_id, "PIVOT")
+                self._mark_write(w, "PIVOT")
+                self.compensation_journal.append({"resource": e.resource, "state": "PIVOT"})
+                return
+        else:
+            if current == e.target_hash:
+                self.comp_journal.mark(e.comp_id, "COMPENSATED")
+                self._mark_write(w, "COMPENSATED")
+                self.compensation_journal.append({"resource": e.resource, "state": "COMPENSATED"})
+                return
+            if current != e.applied_hash:
+                self.comp_journal.mark(e.comp_id, "PIVOT")
+                self._mark_write(w, "PIVOT")
+                self.compensation_journal.append({"resource": e.resource, "state": "PIVOT"})
+                return
+        # 执行反写
+        rw = Write(e.resource, content=None, version_before=e.version_before,
+                   applied_hash=e.applied_hash)
+        reverse = self.workspace.compute_reverse_patch(rw)
+        if reverse is None:
+            self.comp_journal.mark(e.comp_id, "PIVOT")
+            self._mark_write(w, "PIVOT")
+            self.compensation_journal.append({"resource": e.resource, "state": "PIVOT"})
+            return
+        acb.staged[e.resource] = DELETE if reverse is DELETE else reverse
+        st = self._compensate_one(acb, rw)
+        if st == Status.OK:
+            self.comp_journal.mark(e.comp_id, "COMPENSATED")
+            self._mark_write(w, "COMPENSATED")
+            self.compensation_journal.append({"resource": e.resource, "state": "COMPENSATED"})
+        elif st == Status.REJECT_COMPENSATE:
+            self.comp_journal.mark(e.comp_id, "PIVOT")
+            self._mark_write(w, "PIVOT")
+            self.compensation_journal.append({"resource": e.resource, "state": "PIVOT"})
+        else:
+            self.comp_journal.mark(e.comp_id, "FAILED")
+            self.compensation_journal.append({"resource": e.resource, "state": "FAILED"})
+
+    @staticmethod
+    def _mark_write(w: Write | None, state: str) -> None:
+        """兼容旧 `compensation_journal` / `Write.compensated|pivot` 语义。"""
+        if w is None:
+            return
+        if state == "COMPENSATED":
+            w.compensated = True
+        elif state == "PIVOT":
+            w.pivot = True
 
     def _compensate_one(self, acb: ACB, w: Write) -> Result:
         """单写补偿，带**真正的**有界重试（v1.11 修复）。"""
@@ -284,11 +370,12 @@ class Harness:
     # ---- 端到端运行 -----------------------------------------------
     def dispatch_and_run(self, plan: dict, task_id: str, decisions, *,
                          required_tools: set[str] | None = None,
-                         crash_at=None) -> ACB:
+                         crash_at=None, token=None) -> ACB:
         """唯一生产入口：try_admit → 注册 plan/acb → run_task → 返回 acb。"""
         run_id = plan["run_id"]
         acb = self.dispatcher.try_admit(plan["tasks"][task_id], run_id,
-                                        required_tools=required_tools)
+                                        required_tools=required_tools,
+                                        token=token)
         self.plans[run_id] = plan
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
@@ -308,9 +395,15 @@ class Harness:
             self._drain_scheduler()
 
     def _drain_scheduler(self) -> None:
-        """消费 ready_queue（避免只写不读的死代码）。"""
+        """消费 ready_queue（避免只写不读的死代码）。
+
+        `needs_readmit` 的 ACB 不进调度（§5.7）：需先 `requeue_readmit`。
+        """
         while not self.scheduler.is_empty():
-            self.scheduler.pop()
+            task_id = self.scheduler.pop()
+            acb = next((a for a in self.acbs.values() if a.task_id == task_id), None)
+            if acb is not None and acb.needs_readmit:
+                continue
 
     def _finalize(self, acb: ACB) -> None:
         plan = self.plans.get(acb.run_id)
@@ -321,6 +414,10 @@ class Harness:
             # 终态 + QUARANTINED 结算全部预留（文档 §5.5：未消耗部分归还，已消耗留账）
             for rid in list(acb.reservation_ids):
                 self.budget.settle(rid)
+        if acb.state in TASK_TERMINAL and acb.budget_node is not None:
+            # §5.3（K-13）：终态且无 ACTIVE 预留 → 归档（consumed 折入父级）
+            if self.budget.archive_node(acb.budget_node.node_id):
+                acb.budget_node = None
         self.slots.release(acb.id)
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
             self.propagate_failure(acb.task_id,
@@ -340,47 +437,160 @@ class Harness:
             return r
         for rid in list(acb.reservation_ids):
             self.budget.settle(rid)
+        self.slots.release(acb.id)
         plan = self.plans.get(acb.run_id)
         if plan and acb.task_id in plan["tasks"]:
             self.propagate_failure(acb.task_id,
                                    plan["tasks"][acb.task_id].get("plan_version", 1))
         return Result(Status.OK, {"state": acb.state.value})
 
-    # ---- 恢复（文档 §5.8） ----------------------------------------
-    def recover(self, ref: str) -> ACB:
+    # ---- 恢复（文档 §5.8 / §4.3） -------------------------------
+    def recover(self, ref: str, *, resume_policy: str = "RESUME") -> ACB:
+        """崩溃恢复（§4.3）：journal 重建 → ACB 重建 → 事件重放 → probe → 终态策略。
+
+        - `resume_policy="RESUME"`：probe 三态对账（`True` → CONFIRMED；`None` → 隔离）；
+        - `resume_policy="COMPENSATE"`：**终态策略**（清 staged，补偿后不恢复执行）。
+        """
         data = self.checkpoints.load(ref)
-        acb = ACB(id=data["acb_id"], run_id=data["run_id"], task_id=data["task_id"],
-                  logical_subgoal_id=data.get("logical_subgoal_id", ""))
-        acb.generation = data["generation"] + 1
-        acb.state = TaskState(data["state"])
-        acb.turn_seq = data["turn_seq"]
-        acb.staged = dict(data["staged"])
-        acb.read_set = dict(data["read_set"])
-        acb.base_version = dict(data["base_version"])
-        acb.cursor = data["cursor"]
-        acb.aging_deadline = data.get("aging_deadline")
-        acb.step = data["effect_journal_offset"]
-        acb.hitl_result = data.get("hitl_result")
-        acb.rebase_attempts = data.get("rebase_attempts", 0)
-        acb.retry_budget = data.get("retry_budget", 3)
-        acb.needs_readmit = bool(data.get("needs_readmit", False))
-        self._restore_budget(acb, data)
-        if not self.slots.try_acquire(acb.id):
+        events = self.event_log.all()                  # 锁内快照（单一数据源）
+        mine = [e for e in events if e.producer == data.get("acb_id")]
+        self.effects.rebuild_from(mine)
+        self.comp_journal.rebuild_from(mine)
+        acb = self._restore_acb(data, resume_policy)
+        # 恢复已应用事件集合（去重键持久化，避免重放重复投影）
+        persisted = data.get("applied_event_ids")
+        if persisted:
+            self._applied_event_ids.update(persisted)
+        # ① 先重放事件（把外部状态对齐），再 probe
+        self._replay_events(from_seq=int(data.get("event_cursor") or 0), dedup=True)
+        for entry in self.effects.pending(acb.id):     # 含 INTENT
+            probe = self.effects.probe_one(entry.idem_key)
+            if probe == "True":
+                self.effects.confirm(entry.idem_key, {"recovered": True})
+            elif probe == "None":
+                acb.state = TaskState.QUARANTINED
+                acb.failure = "NEEDS_RECONCILIATION"
+        # ② COMPENSATE 是终态策略：补偿前丢弃 staged，补偿后不恢复执行
+        if resume_policy == "COMPENSATE":
+            acb.staged = {}
+            plan = self.comp_journal.resume(acb, self.workspace)
+            for e in plan["retry"]:
+                self._run_one_compensation(acb, e)
+            acb.staged = {}                     # 终态策略：补偿后不恢复执行
+            # 重试后重新读取条目终态：escalate（FAILED）/ pivot 必须被消费
+            entries = [e for e in self.comp_journal._entries.values()
+                       if e.acb_id == acb.id]
+            escalate = bool(plan["escalate"]) or any(
+                e.state == "FAILED" for e in entries)
+            pivot = bool(plan["pivot"]) or any(
+                e.state == "PIVOT" for e in entries)
+            if escalate:
+                acb.state = TaskState.QUARANTINED
+                acb.failure = "COMPENSATE_FAILED"
+            elif pivot:
+                acb.state = TaskState.DEAD_LETTER
+                acb.failure = "COMPENSATE_PIVOT"
+            else:
+                acb.state = TaskState.DONE_PARTIAL
+                acb.failure = None
+            # 终态策略：结算全部预留 → 归档预算节点 → 持久化终态
+            for rid in list(acb.reservation_ids):
+                self.budget.settle(rid)
+            if (acb.budget_node is not None
+                    and self.budget.archive_node(acb.budget_node.node_id)):
+                acb.budget_node = None
+            if acb.state in (TaskState.DONE_PARTIAL, TaskState.DEAD_LETTER):
+                self.slots.release(acb.id)
+            self.checkpoints.save(acb)
+        # ③ 恢复后全树必查（K-14）；失败 → QUARANTINED + slots.release
+        try:
+            self.budget.check_invariants()
+        except InvariantError:
             acb.state = TaskState.QUARANTINED
-            acb.failure = "NO_SLOT"
-        self.bump_epoch()
+            acb.failure = acb.failure or "INVARIANT_BROKEN"
+            self.slots.release(acb.id)
+            self.checkpoints.save(acb)
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
         return acb
 
-    def _restore_budget(self, acb: ACB, data: dict) -> None:
-        """恢复预算节点与预留（K-3：不重建对象链，只恢复计数与句柄）。
+    def requeue_readmit(self, acb: ACB) -> ACB:
+        """§5.7（K-9）：`needs_readmit` 的 ACB 重新准入（清标记 → 走 dispatcher）。
 
-        - 无 `budget_node_id` → 不建节点、不改 budget，标记 `needs_readmit`；
-        - 有节点 → 复用（或按 `budget_limits`/`budget_parent_id` 重建），
-          且只对**无子**节点恢复快照计数；
-        - 子树计数绝不用快照覆盖，而是 `self_reserved + Σ children.subtree`；
-        - `rid` 与既有 `_reservations` 冲突则跳过。
+        成功重新准入后必须清理旧 ACB 的槽位 / 预留 / 预算节点，否则旧账会
+        与新准入叠加（槽位泄漏 + `subtree_reserved` 虚高）。
+        """
+        acb.needs_readmit = False
+        plan = self.plans.get(acb.run_id)
+        task = plan.get("tasks", {}).get(acb.task_id) if plan else None
+        if task is None:
+            return acb
+        token = self._effective_token(acb)
+        old_node = acb.budget_node
+        old_rids = list(acb.reservation_ids)
+        # 先释放旧槽位，避免 max_concurrent 下自阻塞；失败分支再补回
+        self.slots.release(acb.id)
+        fresh = self.dispatcher.try_admit(task, acb.run_id, token=token)
+        if fresh.state is TaskState.ADMITTED:
+            for rid in old_rids:
+                self.budget.settle(rid)
+            acb.reservation_ids = []
+            if old_node is not None:
+                if not self.budget.remove_node(old_node.node_id):
+                    self.budget.archive_node(old_node.node_id)
+                acb.budget_node = None
+            self.acbs.pop(acb.id, None)
+            self.acbs[fresh.id] = fresh
+            return fresh
+        self.slots.try_acquire(acb.id)
+        acb.needs_readmit = True
+        return acb
+
+    def _restore_acb(self, data: dict, resume_policy: str = "RESUME") -> ACB:
+        """从 checkpoint 重建 ACB；失败改 `needs_readmit`（**不抛**，§4.3）。"""
+        try:
+            acb = ACB(id=data["acb_id"], run_id=data["run_id"],
+                      task_id=data["task_id"],
+                      logical_subgoal_id=data.get("logical_subgoal_id", ""))
+            acb.generation = data["generation"] + 1
+            acb.state = TaskState(data["state"])
+            acb.turn_seq = data["turn_seq"]
+            acb.staged = dict(data["staged"])
+            acb.read_set = dict(data["read_set"])
+            acb.base_version = dict(data["base_version"])
+            acb.cursor = data["cursor"]
+            acb.aging_deadline = data.get("aging_deadline")
+            acb.step = data.get("effect_journal_offset", 0)
+            acb.hitl_result = data.get("hitl_result")
+            acb.rebase_attempts = data.get("rebase_attempts", 0)
+            acb.retry_budget = data.get("retry_budget", 3)
+            acb.failure = data.get("failure")
+            acb.spec = dict(data.get("spec") or {})
+            acb.deadline = data.get("deadline")
+            acb.no_progress_steps = data.get("no_progress_steps", 0)
+            acb.needs_readmit = bool(data.get("needs_readmit", False))
+            self._restore_budget(acb, data)
+            if not self.slots.try_acquire(acb.id):
+                acb.state = TaskState.QUARANTINED
+                acb.failure = "NO_SLOT"
+            self.bump_epoch()
+            return acb
+        except Exception:  # noqa: BLE001  # 恢复失败 → needs_readmit，不抛
+            acb = ACB(id=data.get("acb_id", ""), run_id=data.get("run_id", ""),
+                      task_id=data.get("task_id", ""))
+            acb.state = TaskState.QUARANTINED
+            acb.failure = "restore_failed"
+            acb.needs_readmit = True
+            return acb
+
+    def _restore_budget(self, acb: ACB, data: dict) -> None:
+        """恢复预算节点与预留（§5.1 / K-6）。
+
+        - **逐笔账本为准**：ACTIVE 按 `amount`、已结算按 `consumed` 重建
+          `self_reserved`；`consumed = Σconsumed`；
+        - 聚合快照仅作交叉校验，不一致 → 保持 `needs_readmit=True`；
+        - 无 `reservations`（旧 checkpoint）→ 退回聚合快照兼容路径，
+          但**不能**据此把 `needs_readmit` 清成 False（无逐笔依据）。
         """
         node_id = data.get("budget_node_id")
         if not node_id:
@@ -389,48 +599,161 @@ class Harness:
             acb.needs_readmit = True
             return
 
-        reservation_ids = list(data.get("reservation_ids") or [])
         node = self.budget._nodes.get(node_id)
         if node is None:
-            limits = int(data.get("budget_limits") or 0)
-            parent_id = data.get("budget_parent_id") or "run"
-            if limits <= 0:
-                raise RuntimeError(
-                    f"无法恢复预算节点 {node_id}：checkpoint 缺少有效 budget_limits；"
-                    "请上层重新 try_admit")
-            node = self.budget.create_node(node_id, limits, parent_id=parent_id)
+            path = data.get("budget_path") or []
+            if path:
+                limits = data.get("budget_path_limits")
+                if not isinstance(limits, dict):
+                    limits = {node_id: data.get("budget_limits")}
+                try:
+                    self._restore_path(path, limits=limits)
+                except Exception:  # noqa: BLE001
+                    acb.reservation_ids = []
+                    acb.budget_node = None
+                    acb.needs_readmit = True
+                    return
+                node = self.budget._nodes.get(node_id)
             if node is None:
-                raise RuntimeError(
-                    f"无法恢复预算节点 {node_id}"
-                    f"（parent={parent_id}, limits={limits}）；请上层重新 try_admit")
+                limits = int(data.get("budget_limits") or 0)
+                parent_id = data.get("budget_parent_id") or "run"
+                if limits <= 0:
+                    acb.reservation_ids = []
+                    acb.budget_node = None
+                    acb.needs_readmit = True
+                    return
+                node = self.budget.create_node(node_id, limits, parent_id=parent_id)
+                if node is None:
+                    acb.reservation_ids = []
+                    acb.budget_node = None
+                    acb.needs_readmit = True
+                    return
 
-        # 无子节点可恢复快照计数；有子节点则子树必须由「自身 + 子」重算
-        if not node.children:
-            node.self_reserved = int(data.get("budget_self", 0))
-            node.consumed = int(data.get("budget_consumed", 0))
+        # `reservations` 键存在（含空列表）→ 新格式逐笔账本；缺失 → 旧格式
+        has_ledger = isinstance(data.get("reservations"), list)
+        consistent = True
+        if has_ledger:
+            restored: list[str] = []
+            for item in data.get("reservations") or []:
+                rid = item.get("rid")
+                if not rid:
+                    continue
+                existing = self.budget._reservations.get(rid)
+                # 仅当既有句柄属于**另一活节点**时跳过；已归档的 tombstone 可复用
+                if (existing is not None and existing[0] is not node
+                        and existing[0] in self.budget._nodes.values()):
+                    continue
+                resv = Reservation(rid, item.get("node_id") or node_id,
+                                   int(item.get("amount", 0)),
+                                   int(item.get("consumed", 0)),
+                                   item.get("state", "ACTIVE"))
+                node.reservations[rid] = resv
+                self.budget._reservations[rid] = (node, resv)
+                restored.append(rid)
+            # 逐笔重建：ACTIVE 占 amount；SETTLED/RELEASED/ARCHIVED 只占 consumed
+            node.folded_consumed = int(data.get("budget_folded_consumed", 0) or 0)
+            node.self_reserved = sum(
+                r.amount if r.state == "ACTIVE" else r.consumed
+                for r in node.reservations.values()) + node.folded_consumed
+            node.consumed = (sum(r.consumed for r in node.reservations.values())
+                             + node.folded_consumed)
+            # 聚合快照只作交叉校验；不一致 → 保持 needs_readmit（不覆盖）
+            expected_self = int(data.get("budget_self", node.self_reserved))
+            expected_consumed = int(data.get("budget_consumed", node.consumed))
+            consistent = (node.self_reserved == expected_self
+                          and node.consumed == expected_consumed)
+            acb.reservation_ids = restored
+        else:
+            # 兼容路径：旧 checkpoint 无逐笔账本 → 用聚合快照（不可清 needs_readmit）
+            node.folded_consumed = int(data.get("budget_folded_consumed", 0) or 0)
+            if not node.children:
+                node.self_reserved = int(data.get("budget_self", 0))
+                node.consumed = int(data.get("budget_consumed", 0))
+            restored = []
+            consumed = node.consumed
+            for index, rid in enumerate(list(data.get("reservation_ids") or [])):
+                existing = self.budget._reservations.get(rid)
+                if (existing is not None and existing[0] is not node
+                        and existing[0] in self.budget._nodes.values()):
+                    continue
+                if index == 0:
+                    resv = Reservation(rid, node_id, node.self_reserved, consumed)
+                else:
+                    resv = Reservation(rid, node_id, 0, 0, "SETTLED")
+                node.reservations[rid] = resv
+                self.budget._reservations[rid] = (node, resv)
+                restored.append(rid)
+            acb.reservation_ids = restored
+            consistent = False
+
         old_subtree = node.subtree_reserved
         node.subtree_reserved = node.self_reserved + sum(
             c.subtree_reserved for c in node.children)
         self._propagate_subtree_delta(node, node.subtree_reserved - old_subtree)
-
-        restored: list[str] = []
-        consumed = node.consumed
-        for index, rid in enumerate(reservation_ids):
-            existing = self.budget._reservations.get(rid)
-            if existing is not None and existing[0] is not node:
-                continue                          # 归属冲突 → 跳过该 rid
-            if index == 0:
-                # 聚合计数无法逐笔还原：第一笔承载全部余额，其余置为终态
-                resv = Reservation(rid, node_id, node.self_reserved, consumed)
-            else:
-                resv = Reservation(rid, node_id, 0, 0, "SETTLED")
-            # checkpoint 是崩溃点的真相：同节点旧句柄按快照重建
-            node.reservations[rid] = resv
-            self.budget._reservations[rid] = (node, resv)
-            restored.append(rid)
         acb.budget_node = node
-        acb.reservation_ids = restored
-        acb.needs_readmit = False
+        acb.needs_readmit = acb.needs_readmit or not consistent
+
+    def _restore_path(self, path: list[str], limits=None) -> list:
+        """§5.2（K-7）：自顶向下重建**任意深度**路径。
+
+        - `parent` 恒为路径上的前一个节点（首节点挂到 `run`）；
+        - checkpoint 只持久化目标节点的 limits 时，中间节点用同一上限兜底；
+        - 环检测 + 失败时逆序回滚已建节点。
+        """
+        if len(path) != len(set(path)):
+            raise ValueError("path has cycle")
+        limits = limits or {}
+        default_limit = 0
+        for value in limits.values():
+            try:
+                default_limit = max(default_limit, int(value or 0))
+            except (TypeError, ValueError):
+                continue
+        built: list = []
+        try:
+            for i, nid in enumerate(path):
+                existing = self.budget._nodes.get(nid)
+                if existing is not None:
+                    built.append(existing)
+                    continue
+                parent_id = path[i - 1] if i > 0 else "run"
+                lim = int(limits.get(nid) or 0)
+                if lim <= 0:
+                    lim = default_limit
+                if lim <= 0:
+                    raise RuntimeError(f"path restore failed at {nid}")
+                node = self.budget.create_node(nid, lim, parent_id=parent_id)
+                if node is None:
+                    raise RuntimeError(f"path restore failed at {nid}")
+                built.append(node)
+            return built
+        except Exception:
+            for b in reversed(built):
+                if b is not self.budget.root:
+                    try:
+                        self.budget.remove_node(b.node_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+            raise
+
+    def _replay_events(self, from_seq: int, dedup: bool = True) -> int:
+        """§4.3：从 `from_seq` 重放事件，真正调用 workspace 投影。
+
+        投影按 `(resource, version)` 做版本守卫（幂等）；`event_id` 去重集合
+        会写入 checkpoint（`applied_event_ids`），跨进程恢复后仍可去重。
+        """
+        applied = 0
+        for ev in self.event_log.all():
+            if ev.seq < from_seq:
+                continue
+            if (dedup and ev.event_id
+                    and ev.event_id in self._applied_event_ids):
+                continue
+            self.workspace.apply_event(ev)
+            if dedup and ev.event_id:
+                self._applied_event_ids.add(ev.event_id)
+            applied += 1
+        return applied
 
     @staticmethod
     def _propagate_subtree_delta(node, delta: int) -> None:

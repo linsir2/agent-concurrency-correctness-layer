@@ -272,38 +272,52 @@ class WorkspaceManager:
             self._blobs.link(blob_hash, self._path_of(w.resource))
 
     # ---- 重建（文档 §5.7） ----------------------------------------
+    def _project_event(self, ev) -> bool:
+        """把单条资源事件投影到 manifest（版本守卫，幂等）。返回是否推进。"""
+        p = ev.payload or {}
+        if ev.kind not in (EventKind.RESOURCE_COMMITTED,
+                           EventKind.WORKSPACE_COMMITTED):
+            return False
+        resource = p.get("resource") or ev.subject
+        if not resource:
+            return False
+        version = int(p.get("version", 0))
+        guard = self._guard_version(resource)         # max(manifest, tombstone)
+        if bool(p.get("deleted")):                    # 删除事件：pop + tombstone
+            if version <= guard:
+                return False                          # 版本未推进（含已删资源）：忽略，防复活
+            self.manifest.pop(resource, None)
+            self._tombstones[resource] = version
+            return True
+        blob_hash = p.get("blob_hash")
+        prev_hash = p.get("prev_hash", "")
+        if not blob_hash:
+            return False                              # 旧格式事件：跳过
+        if version <= guard:
+            return False                              # 版本未推进（含已删资源）：忽略，防复活
+        if not self._blobs.exists(blob_hash):
+            return False                              # 当前 blob 不存在：跳过
+        # D-6：前像重建 —— 上一版本的 blob 就是 version-1 的内容
+        if prev_hash and self._blobs.exists(prev_hash):
+            self._versions.record(resource, version - 1, self._decode(prev_hash))
+        self.manifest[resource] = ManifestEntry(
+            version=version, blob_hash=blob_hash, prev_hash=prev_hash)
+        self._tombstones.pop(resource, None)         # 重建：清墓碑
+        return True
+
+    def apply_event(self, ev) -> bool:
+        """公共投影入口（恢复重放用）：按资源加锁后幂等投影。"""
+        p = ev.payload or {}
+        resource = p.get("resource") or ev.subject
+        if not resource:
+            return False
+        with self.lock_for(resource):
+            return self._project_event(ev)
+
     def _rebuild_from_events(self) -> None:
         """从同一份 WAL 重放，重建 manifest、tombstone 与前像（manifest 是纯逻辑投影）。"""
         for ev in self._event_log.replay():
-            p = ev.payload or {}
-            if ev.kind not in (EventKind.RESOURCE_COMMITTED,
-                               EventKind.WORKSPACE_COMMITTED):
-                continue
-            resource = p.get("resource") or ev.subject
-            if not resource:
-                continue
-            version = int(p.get("version", 0))
-            guard = self._guard_version(resource)     # max(manifest, tombstone)
-            if bool(p.get("deleted")):                # 删除事件：pop + tombstone
-                if version <= guard:
-                    continue                          # 版本未推进（含已删资源）：忽略，防复活
-                self.manifest.pop(resource, None)
-                self._tombstones[resource] = version
-                continue
-            blob_hash = p.get("blob_hash")
-            prev_hash = p.get("prev_hash", "")
-            if not blob_hash:
-                continue                              # 旧格式事件：跳过
-            if version <= guard:
-                continue                              # 版本未推进（含已删资源）：忽略，防复活
-            if not self._blobs.exists(blob_hash):
-                continue                              # 当前 blob 不存在：跳过
-            # D-6：前像重建 —— 上一版本的 blob 就是 version-1 的内容
-            if prev_hash and self._blobs.exists(prev_hash):
-                self._versions.record(resource, version - 1, self._decode(prev_hash))
-            self.manifest[resource] = ManifestEntry(
-                version=version, blob_hash=blob_hash, prev_hash=prev_hash)
-            self._tombstones.pop(resource, None)     # 重建：清墓碑
+            self._project_event(ev)
 
     # ---- 合并算法（文档 §7.2.1） ----------------------------------
     def rebase_json(self, base, ours, theirs):

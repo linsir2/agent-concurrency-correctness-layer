@@ -10,10 +10,19 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 
 from .types import Result, Status
+
+
+class InvariantError(RuntimeError, AssertionError):
+    """不变量破坏（K-14 / §5.4）。
+
+    同时继承 `AssertionError`：旧用例 `pytest.raises(AssertionError)` 仍可命中；
+    同时满足 §5.4「不用 `assert`」（`python -O` 会剥离 assert）的要求。
+    """
 
 
 @dataclass
@@ -24,7 +33,8 @@ class Reservation:
     node_id: str
     amount: int
     consumed: int = 0
-    state: str = "ACTIVE"    # ACTIVE | SETTLED | RELEASED | EXPIRED
+    state: str = "ACTIVE"    # ACTIVE | SETTLED | RELEASED | EXPIRED | ARCHIVED
+    expires_at: int = 0      # tombstone 过期时间（epoch s）；0 = 不过期
 
     @property
     def balance(self) -> int:
@@ -47,6 +57,7 @@ class BudgetNode:
         self.self_reserved = 0        # 本节点持有的预留总额（含已消耗）
         self.subtree_reserved = 0     # 本节点 + 全部后代（显式维护）
         self.consumed = 0             # 已确认消耗（永久账）
+        self.folded_consumed = 0      # 归档子树折入的永久账（无对应预留条目）
         self.children: list["BudgetNode"] = []
         self.reservations: dict[str, Reservation] = {}
         self.owner = owner
@@ -69,12 +80,13 @@ class BudgetNode:
 
 
 class BudgetManager:
-    def __init__(self, run_limits: int = 1000) -> None:
+    def __init__(self, run_limits: int = 1000, tombstone_ttl_s: float = 86400.0) -> None:
         self.root = BudgetNode("run", run_limits)
         self._lock = threading.RLock()
         self._nodes: dict[str, BudgetNode] = {"run": self.root}
         # 全局索引：rid -> (node, resv)；生命周期长于节点（tombstone）
         self._reservations: dict[str, tuple[BudgetNode, Reservation]] = {}
+        self._tombstone_ttl_s = tombstone_ttl_s
 
     # ------------------------------------------------------------------ #
     # 内部工具
@@ -112,6 +124,7 @@ class BudgetManager:
             resv = Reservation(uuid.uuid4().hex, node_id, amount)
             node.reservations[resv.reservation_id] = resv
             self._reservations[resv.reservation_id] = (node, resv)
+            self._check_local(node)
             return resv
 
     def release(self, reservation_id: str) -> int:
@@ -128,6 +141,7 @@ class BudgetManager:
                     a.subtree_reserved -= freed
                 node.self_reserved -= freed
             resv.state = "RELEASED"
+            self._check_local(node)
             return freed
 
     def settle(self, reservation_id: str) -> int:
@@ -144,6 +158,7 @@ class BudgetManager:
                     a.subtree_reserved -= freed
                 node.self_reserved -= freed
             resv.state = "SETTLED"
+            self._check_local(node)
             return freed
 
     def consume(self, reservation_id: str, amount: int = 1) -> Result:
@@ -166,6 +181,7 @@ class BudgetManager:
                 )
             resv.consumed += amount
             node.consumed += amount
+            self._check_local(node)
             return Result(
                 Status.OK, {"consumed": resv.consumed, "balance": resv.balance}
             )
@@ -234,18 +250,107 @@ class BudgetManager:
             return True
 
     # ------------------------------------------------------------------ #
-    # 不变量
+    # 归档 / 回收（K-13）
     # ------------------------------------------------------------------ #
+    def _subtree_nodes(self, node: BudgetNode) -> list[BudgetNode]:
+        """返回 `node` 及其全部后代（归档需要整体折叠）。"""
+        out: list[BudgetNode] = []
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            out.append(cur)
+            stack.extend(cur.children)
+        return out
+
+    def archive_node(self, node_id: str) -> bool:
+        """终态摘除（§5.3）：子树内无 ACTIVE 预留才可归档。
+
+        ① 整个子树的 `consumed` 折入父级（永久账不丢），并同步父级
+           `self_reserved` / `subtree_reserved`，保证 I5a/I5b/I5c 同时成立；
+        ② 全局索引只留 tombstone（带 `expires_at`），不立即删；
+        ③ 从 `_nodes` 摘除整个子树。返回是否归档。
+        """
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None:
+                return False
+            subtree = self._subtree_nodes(node)
+            for n in subtree:
+                for r in n.reservations.values():
+                    if r.state == "ACTIVE":
+                        return False
+            parent = node.parent
+            if parent is not None:
+                total_subtree = node.subtree_reserved
+                total_consumed = sum(n.consumed for n in subtree)
+                # node 原先以 total_subtree 计入 parent.subtree；摘除后改以
+                # total_consumed 计入 parent 自身，故 subtree 的净变化为
+                # total_consumed - total_subtree（结算正确时通常为 0）。
+                parent.self_reserved += total_consumed
+                parent.subtree_reserved += total_consumed - total_subtree
+                parent.consumed += total_consumed
+                # 折入的永久账没有对应的预留条目，单独记账，供 I5c 校验
+                parent.folded_consumed += total_consumed
+                if node in parent.children:
+                    parent.children.remove(node)
+                self._check_local(parent)
+            now = int(time.time())
+            for n in subtree:
+                for rid in list(n.reservations):
+                    resv = n.reservations[rid]
+                    resv.state = "ARCHIVED"
+                    resv.expires_at = now + int(self._tombstone_ttl_s)
+                self._nodes.pop(n.node_id, None)
+            return True
+
+    def gc(self, now: float) -> int:
+        """清除已过期的 ARCHIVED tombstone（§5.3）。"""
+        removed = 0
+        with self._lock:
+            for rid in list(self._reservations):
+                node, resv = self._reservations[rid]
+                if resv.state == "ARCHIVED" and resv.expires_at and resv.expires_at <= now:
+                    del self._reservations[rid]
+                    if node is not None:
+                        node.reservations.pop(rid, None)
+                    removed += 1
+        return removed
+
+    # ------------------------------------------------------------------ #
+    # 不变量（K-14 / §5.4）
+    # ------------------------------------------------------------------ #
+    def _check_local(self, node: BudgetNode) -> None:
+        """O(1) 单节点断言（热路径默认开）。"""
+        if not (0 <= node.consumed <= node.self_reserved
+                <= node.subtree_reserved <= node.limits):
+            raise InvariantError(f"local invariant broken at {node.node_id}")
+
     def check_invariants(self) -> None:
+        """O(N) 全树校验（只在 recover 后 / debug 调用）。不用 `assert`。
+
+        I5c 必须与 `settle` / `release` / `archive` 的语义自洽：
+        - ACTIVE 条目按 `amount` 计入 `self_reserved`（含未消耗余额）；
+        - SETTLED / RELEASED / ARCHIVED 条目只保留 `consumed`（余额已归还）；
+        - `consumed` 是永久账，等于全部条目的 `consumed` 之和；
+        - 归档子树折入的永久账记在 `folded_consumed`（无对应预留条目）。
+        等价于 `self_reserved == consumed + Σ(ACTIVE balance)`。
+        """
         for n in self._nodes.values():
-            # I5a：消耗 ≤ 自身预留 ≤ 子树占用 ≤ 上限
-            assert 0 <= n.consumed <= n.self_reserved <= n.subtree_reserved <= n.limits
-            # I5b：子树 = 自身 + 各子子树
-            assert n.subtree_reserved == n.self_reserved + sum(
-                c.subtree_reserved for c in n.children
-            )
-            # I5c：自身预留 = 已消耗 + 全部 ACTIVE 预留余额
-            active_balance = sum(
-                r.balance for r in n.reservations.values() if r.state == "ACTIVE"
-            )
-            assert n.self_reserved == n.consumed + active_balance
+            self._check_local(n)
+            if n.subtree_reserved != n.self_reserved + sum(
+                    c.subtree_reserved for c in n.children):
+                raise InvariantError(f"subtree mismatch at {n.node_id}")
+            active_amount = 0
+            nonactive_consumed = 0
+            consumed_sum = 0
+            for r in n.reservations.values():
+                consumed_sum += r.consumed
+                if r.state == "ACTIVE":
+                    active_amount += r.amount
+                else:
+                    nonactive_consumed += r.consumed
+            if n.self_reserved != (active_amount + nonactive_consumed
+                                   + n.folded_consumed):
+                raise InvariantError(f"self_reserved mismatch at {n.node_id}")
+            if n.consumed != consumed_sum + n.folded_consumed:
+                raise InvariantError(f"consumed mismatch at {n.node_id}")

@@ -57,7 +57,7 @@ class AgentRuntime:
                     # 模拟「工具已调用但副作用未确认」→ effect 停在 UNKNOWN（文档 §5.8⑤）
                     if action.kind == "tool":
                         key = self.h.idem_key(acb, action, i)
-                        self.h.effects.begin(acb, action.tool, action.args, key)
+                        self.h.effects.begin(acb, action)
                         self.h.effects.mark_unknown(key, acb.id)
                     self.h.supervisor_note_crash(acb)
                     raise CrashInjected(acb.turn_seq, i)
@@ -73,6 +73,10 @@ class AgentRuntime:
                     return st
                 if st == Status.NEEDS_APPROVAL:
                     continue
+                if st == Status.NEEDS_RECONCILIATION:
+                    # §4.3：probe 三态中 `None` → 升级人工（显式分支，不走通用 FAILED）
+                    self._quarantine(acb, "NEEDS_RECONCILIATION")
+                    return st
                 if st not in (Status.OK, Status.VALID):
                     # 冲突类失败走语义 rebase 回路（§5.1）；其余失败交上层分类
                     if isinstance(st, Result) and st.status in (
@@ -106,6 +110,27 @@ class AgentRuntime:
         return Status.OK
 
     # ---- 单动作 ---------------------------------------------------
+    def _effect_id(self, idem_key: str) -> str:
+        entry = self.h.effects.get(idem_key)
+        return entry.effect_id if entry is not None else idem_key
+
+    def _gateway_check(self, acb: ACB, action: Action) -> bool:
+        """§5.6（K-11）：gateway 强制点，读 token 的 network / data_class。
+
+        - 无 token → 拒绝（deny-by-default）；
+        - `action` 无 `network` / `data_class` 属性 → 放行（不引入额外约束）。
+        """
+        token = self.h._effective_token(acb)
+        if token is None:
+            return False
+        network = getattr(action, "network", None)
+        if network and not self.h.policy.allows_network(token, network):
+            return False
+        data_class = getattr(action, "data_class", None)
+        if data_class and not self.h.policy.allows_data_class(token, data_class):
+            return False
+        return True
+
     def _do_action(self, acb: ACB, action: Action, i: int) -> Status:
         if action.kind == "stage":
             self.h.workspace.stage(acb, action.resource, action.content)
@@ -129,12 +154,27 @@ class AgentRuntime:
             return st
 
         if action.kind == "tool":
-            # B4：能力强制点在 gateway 强制执行，模型不可绕过
-            if not self.h.policy.check_capability(acb.id, action.tool, action.resource or ""):
-                return Status.DENIED_CAPABILITY
+            # B4：能力强制点在 gateway 强制执行，模型不可绕过（§4.1 / §5.9）
+            token = self.h._effective_token(acb)
+            if not self.h.policy.check_capability(
+                    acb.id, token, action.tool, action.resource or ""):
+                return Result(Status.DENIED_CAPABILITY, {"tool": action.tool})
+            if not self._gateway_check(acb, action):
+                return Result(Status.DENIED_CAPABILITY, {"reason": "gateway"})
             idem_key = self.h.idem_key(acb, action, i)
-            if self.h.effects.state(idem_key) == "CONFIRMED":
-                return Status.OK                       # I7：副作用恰好一次
+            st = self.h.effects.state(idem_key)
+            if st == "CONFIRMED":
+                # I7：副作用恰好一次；只有 CONFIRMED 可短路
+                return Result(Status.OK, {"effect_id": self._effect_id(idem_key)})
+            if st in ("INTENT", "UNKNOWN"):
+                # §4.1：INTENT 与 UNKNOWN 同路径 —— probe 三态
+                probe = self.h.effects.probe_one(idem_key)
+                if probe == "True":
+                    self.h.effects.confirm(idem_key, {"recovered": True})
+                    return Result(Status.OK, {"effect_id": self._effect_id(idem_key)})
+                if probe == "None":
+                    return Result(Status.NEEDS_RECONCILIATION, {"idem_key": idem_key})
+                # probe == "False" → 落到下面重执行（同一 idem）
             # 预算消费先于副作用：消费失败则不执行工具、不写事件
             st = self._consume_budget(acb, action.cost)
             if st != Status.OK:
@@ -142,14 +182,12 @@ class AgentRuntime:
                     acb.state = TaskState.FAILED
                     acb.failure = "BUDGET_EXHAUSTED"
                 return st
-            self.h.effects.begin(acb, action.tool, action.args, idem_key)
-            if self.h.effects.state(idem_key) == "UNKNOWN":
-                self.h.effects.mark_unknown(idem_key, acb.id)
+            self.h.effects.begin(acb, action)
             self.h.effects.confirm(idem_key, acb.id)
             self.h.event_log.append(EventKind.TOOL_COMPLETED, idem_key,
                                     {"tool": action.tool}, producer=acb.id,
                                     idempotency_key=idem_key)
-            return Status.OK
+            return Result(Status.OK, {"effect_id": idem_key})
 
         if action.kind == "request_hitl":
             acb.staged.clear()

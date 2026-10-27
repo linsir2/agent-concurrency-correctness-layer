@@ -17,6 +17,17 @@ import threading
 from .types import ACB, EventKind, Mode, Status, TaskState, Write
 
 
+def _normalize_required(t) -> dict:
+    """入口规范化（§5.5）：set → `{tool: ""}`；dict → 原样（`{tool: path}`）。"""
+    if t is None:
+        return {}
+    if isinstance(t, (set, frozenset, list, tuple)):
+        return {x: "" for x in t}
+    if isinstance(t, dict):
+        return dict(t)
+    return {}
+
+
 class Planner:
     def __init__(self, harness) -> None:
         self.h = harness
@@ -127,20 +138,24 @@ class Dispatcher:
         acb.failure = failure
         return acb
 
-    def _capability_ok(self, acb: ACB, required_tools: set[str]) -> bool:
-        """与运行时同一判定入口（token → default_token → deny），逐个含 path 判定。"""
-        if isinstance(required_tools, dict):
-            return all(self.h.policy.check_capability(acb.id, tool, path)
-                       for tool, path in required_tools.items())
-        return all(self.h.policy.check_capability(acb.id, tool, "")
-                   for tool in required_tools)
+    def _capability_ok(self, acb: ACB, required_tools,
+                       *, network=None, data_class=None) -> bool:
+        """与运行时同一判定入口（§5.9）：token 显式传入 + 四维。"""
+        token = self.h._effective_token(acb)
+        required = _normalize_required(required_tools)
+        return all(self.h.policy.check_capability(
+            acb.id, token, tool, path, network=network, data_class=data_class)
+            for tool, path in required.items())
 
     def try_admit(self, task: dict, run_id: str,
-                  required_tools: set[str] | None = None) -> ACB:
+                  required_tools: set[str] | None = None,
+                  token=None) -> ACB:
         """准入谓词（文档 §5）：slots → 能力 → 预算 → 逻辑，失败零残留。"""
         acb = ACB(id=f"A-{run_id}-{task['task_id']}-{self._next_attempt()}",
                   run_id=run_id, task_id=task["task_id"],
                   logical_subgoal_id=task["logical_subgoal_id"])
+        if token is not None:                 # 显式 token 绑定到 ACB（§5.9）
+            acb.capability = token
 
         node = None
         resv = None
