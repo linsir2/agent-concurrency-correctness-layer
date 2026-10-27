@@ -17,8 +17,10 @@ from .checkpoint import (CheckpointCorrupt, CheckpointStore, EffectJournal,
 from .clock import SystemClock
 from .compensation import CompensationJournal
 from .context import ContextAssembler
+from .egress import EgressGuard
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
+from .llm import LLMClient
 from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
                             RunCoordinator, Scheduler, SlotTracker)
 from .policy import PolicyEngine
@@ -61,7 +63,8 @@ class Harness:
                  per_action_delay: float = 0.0,
                  receipts_enabled: bool = True,
                  checkpoint_root=None,
-                 writer_id: str | None = None) -> None:
+                 writer_id: str | None = None,
+                 egress_required: bool | None = None) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -69,6 +72,15 @@ class Harness:
         self.max_concurrent = max_concurrent
         self.retention = retention
         self.per_action_delay = per_action_delay   # §2.5：基准配对用注入点
+
+        # ---- S11c/d/e：egress 强制点（见 `harness/egress/__init__.py`）---------
+        # `egress_required=True`  → 构造即校验，无强制点 → `EgressUnavailable`（拒绝启动）
+        # `egress_required=None`  → 构造不校验，**任何出站** fail-closed（默认）
+        # `egress_required=False` → 显式降级（仅测试/离线），原因记入 `degradations`
+        self.egress = EgressGuard(required=egress_required)
+        # S11-8 / 终审 8-1：真实出站路径（`llm._post`）必须过同一个 guard；
+        # 只构造 guard 不接线等于「有锁不装门」——`ensure()` 永远不会被调用。
+        self.llm = LLMClient(egress=self.egress)
 
         self.clock = clock or SystemClock()
         self.event_log = event_log if event_log is not None else EventLog(clock=self.clock)
@@ -92,12 +104,18 @@ class Harness:
         self.checkpoints.event_log = self.event_log      # §2.4：无条件注入全局水位源
         self.checkpoints.budget = self.budget            # S10a：聚合值 + 游标同临界区
         self.checkpoints.run_limits = self._run_limits   # S10a：run_limits 漂移基准
-        # S10a §3.4：预算写操作的 fencing 依据（慢写者被接管后不得再写预算）
-        self.budget._epoch_source = self.checkpoints.read_epoch
-        # ---- S10b §3.2：跨进程三锁全序（写死）--------------------------------
-        #   resource → receipts.lock → wal.lock → store.lock → eventlog._lock
-        # 三把 flock 按上表偏序获取；反向获取（如「持 store.lock 取
-        # receipts.lock」）会成环死锁 → 由 `_FileLock(order=...)` 运行期断言拦截。
+        # S11b K-46：fencing epoch 绑 WAL（`wal.log.epoch`）；无 WAL 时退回 store.json
+        _wal = getattr(self.event_log, "_wal", None)
+        self._wal_epoch_backend = (
+            _wal if callable(getattr(_wal, "read_epoch", None)) else None)
+        self.budget._epoch_source = (
+            _wal.read_epoch if self._wal_epoch_backend is not None
+            else self.checkpoints.read_epoch)
+        # ---- S10b §3.2 / S11b §3.2：跨进程锁全序（写死）--------------------
+        #   resource → budget → receipts.lock → wal.lock → epoch → store.lock
+        #   → eventlog._lock
+        # 各 flock 按上表偏序获取；反向获取（如「持 store.lock 取 epoch」）会成环
+        # 死锁 → 由 `_FileLock(order=...)` 运行期断言拦截。
         # `receipts.lock`：durable 模式跨进程互斥；内存模式退回进程内 RLock。
         cp_root = getattr(self.checkpoints, "root", None)
         self._receipts_flock = (
@@ -163,6 +181,9 @@ class Harness:
         # ---- S10a §2.5：单写者租约（durable 模式在构造期即 acquire）----
         # 生产路径必须真正持有租约：此前 `_try_acquire_writer_lease` 只被测试调用，
         # 单写者形同虚设。acquire 失败 → `_writer_lease_ok=False`，写入口拒绝服务。
+        # S11b / 终审 7-1：**取租约前先恢复 durable epoch**。否则干净重启
+        # （lease 已释放但 WAL epoch 仍为 N）时本地 epoch=0 → 首写被 fence。
+        self._restore_epoch()
         self._writer_id = writer_id or f"harness-{os.getpid()}"
         self._durable = self._lease_path() is not None
         self._writer_lease_ok = True
@@ -268,13 +289,12 @@ class Harness:
             heads[scope] = receipt_hash(receipt)
         return max_seq
 
-    def _receipt_records(self) -> list[tuple[int, dict]]:
-        """返回全部 `RECEIPT_ISSUED` 记录 `[(seq, payload)]`（按 seq 升序）。
+    def _receipt_records(self, watermark: int = 0) -> list[tuple[int, dict]]:
+        """返回 `seq > watermark` 的 `RECEIPT_ISSUED` 记录 `[(seq, payload)]`。
 
-        **跨进程安全**：`WalEventLog` 的内存索引 `_events` 只含「构造期加载
-        + 本进程 append」的记录；别的进程 append 的收据只落在 WAL **文件**里
-        → 先（`wal.lock` flock 内）O(1) fstat 比对回扫磁盘，再取原始记录。
-        内存 `EventLog` 直接读 `all()`。
+        **K-44**：WAL 实现走 `wal.receipts_from(watermark)` —— 在 `wal.lock` 内
+        O(1) fstat 比对 + **只解析新增帧**（增量索引），不再每次 `wal.records()`
+        全量枚举（那会是 O(N²)）。内存 `EventLog` 直接读 `all()`。
         """
         log = self.event_log
         wal = getattr(log, "_wal", None)
@@ -282,17 +302,21 @@ class Harness:
             recs = [(ev.seq, ev.payload) for ev in log.all()
                     if ev.kind == EventKind.RECEIPT_ISSUED]
         else:
-            lock = getattr(wal, "_lock", None)
-            if lock is not None:                     # 锁序 receipts → wal
-                with lock():
+            receipts_from = getattr(wal, "receipts_from", None)
+            if callable(receipts_from):
+                recs = list(receipts_from(watermark))
+            else:                                    # 兼容旧 WAL 实现
+                lock = getattr(wal, "_lock", None)
+                if lock is not None:                 # 锁序 receipts → wal
+                    with lock():
+                        self._rescan_wal_from_disk(wal)
+                        raw = wal.records()
+                else:
                     self._rescan_wal_from_disk(wal)
                     raw = wal.records()
-            else:
-                self._rescan_wal_from_disk(wal)
-                raw = wal.records()
-            recs = [(r.get("seq", 0), r.get("payload"))
-                    for r in raw
-                    if r.get("kind") == EventKind.RECEIPT_ISSUED.value]
+                recs = [(r.get("seq", 0), r.get("payload"))
+                        for r in raw
+                        if r.get("kind") == EventKind.RECEIPT_ISSUED.value]
         recs.sort(key=lambda rp: rp[0])
         return recs
 
@@ -327,11 +351,11 @@ class Harness:
         if not self.receipts_enabled:
             return
         with self._receipt_refresh_lock:
+            watermark = self._receipt_scan_watermark
             try:
-                records = self._receipt_records()
+                records = self._receipt_records(watermark)
             except Exception:  # noqa: BLE001  # EventLog 不可用 → 回退内存态
                 return
-            watermark = self._receipt_scan_watermark
             new_records = [rp for rp in records if rp[0] > watermark]
             if not new_records:
                 return
@@ -375,23 +399,26 @@ class Harness:
             return lock
 
     def _wire_wal_fencing(self) -> None:
-        """S10b §3.4：把 fencing 三件套注入 `WalEventLog`（若为 WAL 实现）。
+        """S11b K-46：把 fencing 三件套注入 `WalEventLog`（fencing **绑 WAL**）。
 
-        - `lock`：`checkpoints._flock`（store.lock，与 `bump_epoch` **同一把**）；
-        - `epoch_reader`：`checkpoints.read_epoch`（读 store.json 的 run 级 epoch）；
+        - `lock`：`wal.epoch_lock`（独立 epoch 锁，全序第 4 位）；
+        - `epoch_reader`：`wal.read_epoch`（读 `wal.log.epoch`，无锁原子读）；
         - `epoch_provider`：本写者当前 run 级 epoch（`intents.get_epoch()`）。
 
-        非 WAL 实现 / 无 `_flock`（内存 store）→ 不注入，fencing 不生效。
+        **不再绑 store.json**：旧实现用 `checkpoints._flock` + `read_epoch`，
+        导致「两个实例共享 WAL、不同 checkpoint root」时互不 fence（S11-3 负对照）。
+        非 WAL 实现 / 无 epoch 接口 → 不注入（fencing 不生效）。
         """
         log = self.event_log
         setter = getattr(log, "set_fencing", None)
         if not callable(setter):
             return
-        store_lock = getattr(self.checkpoints, "_flock", None)
-        read_epoch = getattr(self.checkpoints, "read_epoch", None)
-        if store_lock is None or not callable(read_epoch):
+        wal = getattr(log, "_wal", None)
+        epoch_lock = getattr(wal, "epoch_lock", None)
+        read_epoch = getattr(wal, "read_epoch", None)
+        if epoch_lock is None or not callable(read_epoch):
             return
-        setter(lock=store_lock, epoch_reader=read_epoch,
+        setter(lock=epoch_lock, epoch_reader=read_epoch,
                epoch_provider=lambda: int(self.intents.get_epoch() or 0))
 
     def _receipt_secret(self) -> str:
@@ -1081,11 +1108,15 @@ class Harness:
         接管 = 确认旧租约**过期** → `bump_epoch` → 落盘 → 才开始服务（§2.5）。
         旧租约仍有效且属于**其他写者** → 返回 False（拒绝服务，避免双写者）；
         同一写者（同 owner）重入 → 仅续期（同进程多 Harness 共享同一写者身份）。
+
+        K-46：`bump_epoch` 只取独立 `epoch` 锁，**必须在 `store.lock` 之外**
+        调用（否则 store(5) → epoch(4) 反向获取 → `LockOrderViolation`，接管崩）。
         """
         path = self._lease_path()
         if not path:
             self._writer_lease_ok = True
             return True
+        takeover = False
         with self._store_flock():
             now = self.clock.now_ms()
             cur = self._read_lease()
@@ -1102,16 +1133,28 @@ class Harness:
                     self._writer_lease_ok = True
                     return True
                 if not same_owner:
-                    self.bump_epoch()                # 旧租约已过期 → 接管
+                    takeover = True                  # 旧租约已过期 → 接管
+        # 终审 7-2：接管必须**先 bump_epoch（独立 epoch 锁）再写租约**。
+        # 旧实现「store.lock 内先落租约 → 锁外 bump」存在窗口：W1 在途写会在
+        # bump 之前读到未推进的 durable epoch → fence 通过 → W2 接管后仍写成功。
+        epoch = self.bump_epoch() if takeover else self.intents.get_epoch()
+        with self._store_flock():
+            cur = self._read_lease()
+            if cur is not None and cur.get("owner") != self._writer_id:
+                exp = int(cur.get("expires_at", 0) or 0)
+                if exp and self.clock.now_ms() < exp:
+                    # 别的写者在 bump 与落盘之间抢到了租约 → 放弃（epoch 已推进，无害）
+                    self._writer_lease_ok = False
+                    return False
             doc = {"owner": self._writer_id,
-                   "epoch": self.intents.get_epoch(),
-                   "expires_at": now + int(self.lease_ms)}
+                   "epoch": epoch,
+                   "expires_at": self.clock.now_ms() + int(self.lease_ms)}
             parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
             atomic_write(path, dumps(doc).encode("utf-8"))
             self._writer_lease_ok = True
-            return True
+        return True
 
     def _renew_writer_lease(self) -> bool:
         """续租（仅当本写者仍是持有者）；过期则走接管。"""
@@ -1128,7 +1171,8 @@ class Harness:
                 atomic_write(path, dumps(doc).encode("utf-8"))
                 self._writer_lease_ok = True
                 return True
-            return self._try_acquire_writer_lease()
+        # 非本写者：**释放 store.lock 后**再走接管（接管内可能 bump epoch）
+        return self._try_acquire_writer_lease()
 
     def _ensure_writer_lease(self) -> bool:
         """写入口守卫：durable 模式下必须持有/可续租；失败 → 拒绝服务。"""
@@ -1149,9 +1193,16 @@ class Harness:
                 except OSError:
                     pass
 
+    def _epoch_backend(self):
+        """run 级 epoch 的持久化后端：WAL 优先（K-46），无 WAL → checkpoint store。"""
+        backend = getattr(self, "_wal_epoch_backend", None)
+        if backend is not None:
+            return backend
+        return self.checkpoints
+
     def _restore_epoch(self) -> int:
         """从持久化存储读 run 级 epoch（RMW 语义，§3.4）。"""
-        reader = getattr(self.checkpoints, "read_epoch", None)
+        reader = getattr(self._epoch_backend(), "read_epoch", None)
         epoch = 0
         if callable(reader):
             try:
@@ -1163,8 +1214,12 @@ class Harness:
         return epoch
 
     def bump_epoch(self, reason: str = "") -> int:
-        """run 级 epoch 单调递增（同一 flock 内 read-modify-write，§2.5/§3.4）。"""
-        bumper = getattr(self.checkpoints, "bump_epoch", None)
+        """run 级 epoch 单调递增（同一 epoch 锁内 RMW，§2.5/§3.4）。
+
+        K-46：epoch 绑 WAL（`wal.log.epoch`）——`bump_epoch` **只取独立 epoch
+        锁**，不得在 `store.lock` 内调用（否则 store(5) → epoch(4) 反向获取）。
+        """
+        bumper = getattr(self._epoch_backend(), "bump_epoch", None)
         epoch = None
         if callable(bumper):
             try:

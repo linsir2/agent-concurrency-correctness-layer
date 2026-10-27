@@ -7,7 +7,7 @@
 ## 运行
 
 ```bash
-cd /workspace && python3 -m pytest tests/ -q     # 250 passed
+cd /workspace && python3 -m pytest tests/ -q     # 348 passed
 ```
 
 无第三方依赖（仅标准库 + pytest）。
@@ -55,6 +55,10 @@ cd /workspace && python3 -m pytest tests/ -q     # 250 passed
 | `tests/test_p2_review.py` | S9 终审 P2 回归（blob 隔离 / 陈旧内容去重 / ReceiptConflict 隔离与对账 / 指针单调 CAS / seq 不回退 / 畸形收据） |
 | `tests/test_s10_budget_reconcile.py` | S10a 预算对账：跨进程不超发（含前提断言 + 负对照）/ run_limits 漂移 / 重放锚定事件身份 / 树完整性（epoch 过期真实路径）/ 全局对账等式 / 预算事件不触发 gc |
 | `tests/test_s10_cross_process_locks.py` | S10b 跨进程锁：scope flock（文件信号 barrier 正负对照）/ WAL seq 不冲突 / fencing / 无循环导入 / 锁序 |
+| `tests/test_s11_gate.py` | S11a 统一 gate：穷举 5 kind 前置（正/负对照）/ `_commit_staged` 边界 / policy 通配·CIDR·端口 + 分级序 / 垃圾 token 拒绝 |
+| `tests/test_s11_receipt_index.py` | S11b：收据增量索引（枚举线性 + 索引==全量等价）/ 回扫重置 / fencing 绑 WAL / 干净重启 / WAL generation |
+| `tests/test_s11_egress.py` | S11c/d/e：DNS 钉住 + SSRF 完整 IP 列表（16 参数化）/ 重定向 302 真拒绝 / netns 正负对照 / 模式互斥 / 失败清理 / 降级 fail-closed |
+| `tests/_egress_child.py` | S11 子进程脚本（sandbox/netns 探针，pytest 不收集） |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |
 | `tests/test_adversarial.py` | A1–A13（含 A7b 背压） |
@@ -62,12 +66,11 @@ cd /workspace && python3 -m pytest tests/ -q     # 250 passed
 | `tests/test_ms8_conformance.py` | MS8 出口：I1/I2/I3/I5/I6/I7/I8 |
 | `tests/test_ms8_spec.py` | MS8 出口：I9/I10/I13 + 资源模型 + 协调协议 + 收据链 |
 
-> **总计 250 个测试**：19 个用例测试 + 231 个里程碑出口/规范/E2E/覆盖率/基准回归/持久化与收据/跨进程对账测试。
-> 按里程碑切子集：`pytest -m ms0`（14）、`-m ms1`（15）、`-m ms2`（9）、`-m ms3`（8）、`-m ms4`（16）、`-m e2e`（10）、`-m fault`（5）；markers 见 `pyproject.toml`。
-> 覆盖率：`python3 -m pytest --cov=harness --cov-report=json && python3 scripts/check_coverage.py`（整体 83.91%，分模块硬门禁通过）。
-> 基准：`python3 bench/run_bench.py --n 30 --out bench/result.json`（三条件×四负载，约 8s）；报告数值表用 `python3 -m bench.regen_report` 从 `result.json` 重新生成（时序指标本质非确定）。
-> 持久化：`FileCheckpointStore` 需与 `WalEventLog(fsync=True)` + `FileBlobStore` 同 root 注入（durable 模式）；`CheckpointStore` 仍为内存默认。
-> 跨进程：durable 模式为**单写者**（`writer_lease.json` + fencing epoch）；`_FileLock` 在 `harness/storage/_lock.py`，三锁全序 `resource → receipts → wal → store → eventlog`。
+> **总计 348 个测试**（另 2 个 xfail 为环境能力缺失显式登记）：19 个用例测试 + 329 个里程碑/规范/E2E/覆盖率/基准/持久化/收据/跨进程对账/egress 测试。
+> 按里程碑切子集：`pytest -m ms0`（14）、`-m ms1`（15）、`-m ms2`（9）、`-m ms3`（8）、`-m ms4`（16）、`-m e2e`（10）、`-m fault`（5）、`-m sandbox`/`-m netns`/`-m egress`；markers 见 `pyproject.toml`。
+> 覆盖率：`python3 -m pytest --cov=harness --cov-report=json && python3 scripts/check_coverage.py`（整体 84.09%，分模块硬门禁通过）。
+> 基准：`python3 bench/run_bench.py --n 30 --out bench/result.json`（三条件×四负载，约 8s）；报告数值表用 `python3 -m bench.regen_report` 从 `result.json` 重新生成。
+> egress：外部库（`sandlock`/`py-landlock`/`pyroute2`/`mitmproxy`）放 `optional-dependencies`；默认**出站 fail-closed**，生产用 `HARNESS_EGRESS_REQUIRED=1` 或 `egress_required=True` 强制启动即校验。netns/代理为**部署级**（需 root）。
 
 ## 设计要点
 

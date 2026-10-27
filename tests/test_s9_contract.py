@@ -29,6 +29,10 @@ def test_s9_1_crash_injected_is_baseexception_not_exception():
 def test_s9_1_handler_crash_passes_through_do_action(monkeypatch):
     """S9-1 断言②：handler 内崩溃**穿透** `_do_action`，不被映射成 `UPSTREAM_FAILED`。"""
     h = Harness()
+    # S11a §2.2：`_do_action` 统一前置 gateway（token 必须存在）。本用例测的是
+    # 「handler 崩溃穿透」，故给该路径**显式装 token**（不放宽断言、不改被测语义）。
+    h.policy.default_token = h.policy.issue(
+        "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
 
     def boom(rt, acb, action, i):
         raise CrashInjected(7, 3)

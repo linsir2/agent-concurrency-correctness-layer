@@ -116,3 +116,13 @@ def _acb(h: Harness, resource: str) -> ACB:
 
 def state_of(h: Harness, run_id: str, task_id: str) -> TaskState:
     return h.plans[run_id]["tasks"][task_id]["state"]
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    """S11 egress 环境 invalid **显式登记**（禁止静默 skip，见 `_egress_env.py`）。"""
+    try:
+        from _egress_env import report_lines
+    except ImportError:                      # pragma: no cover - 收集期异常兜底
+        return
+    for line in report_lines():
+        terminalreporter.write_line(line)

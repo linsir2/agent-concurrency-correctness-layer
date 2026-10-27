@@ -264,6 +264,9 @@ class Action:
     tool: Optional[str] = None
     args: Any = None
     cost: int = 1
+    # S11a §2.3：显式 egress 维度（向后兼容，默认 None = 该维度不约束）
+    network: Optional[str] = None
+    data_class: Optional[str] = None
 
 
 @dataclass

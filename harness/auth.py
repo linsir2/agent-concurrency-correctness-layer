@@ -58,14 +58,14 @@ class Signer:
 
     # ---- 签发 ------------------------------------------------------
     def mint(self, agent_id: str, *, tools=None, paths=None,
-             network=None, data_class: str = "*", exp=None) -> str:
+             network=None, data_class: str = "public", exp=None) -> str:
         now = int(time.time())
         payload = {
             "agent_id": agent_id,
             "tools": sorted(tools or []),
             "paths": sorted(paths or []),
             "network": sorted(network or []),
-            "data_class": data_class or "*",
+            "data_class": data_class or "public",
             "exp": int(exp) if exp else now + 3600,
             "jti": uuid.uuid4().hex,
         }

@@ -441,17 +441,25 @@ def test_s10_writer_lease_blocks_commit_and_recover(tmp_path):
 
 # ================================================================ 预算写 fencing
 def test_s10_stale_budget_epoch_writes_rejected(tmp_path):
-    """慢写者（旧 budget_epoch）被接管后，预算写操作必须被 fence。"""
-    root = tmp_path / "cp"
-    h1 = Harness(run_limits=1000, checkpoint_root=str(root), writer_id="writer-1")
+    """慢写者（旧 budget_epoch）被接管后，预算写操作必须被 fence。
+
+    S11b K-46：fencing epoch 绑 WAL（`wal.log.epoch`）——两实例共享同一 WAL、
+    不同 checkpoint root；接管者 bump 后，慢写者的预算写必须被拒。
+    """
+    wal_path = str(tmp_path / "wal.log")
+    log1 = WalEventLog(wal_path)
+    h1 = Harness(run_limits=1000, event_log=log1,
+                 checkpoint_root=str(tmp_path / "cp1"), writer_id="writer-1")
     h1.budget.create_node("B", 100)
     resv = h1.budget.reserve("B", 10)
     assert resv is not None
 
-    h2 = Harness(run_limits=1000, checkpoint_root=str(root), writer_id="writer-2")
-    h2.bump_epoch("takeover")                 # durable epoch 前进，h1 本地仍为旧值
+    log2 = WalEventLog(wal_path)
+    h2 = Harness(run_limits=1000, event_log=log2,
+                 checkpoint_root=str(tmp_path / "cp2"), writer_id="writer-2")
+    h2.bump_epoch("takeover")                 # WAL epoch 前进，h1 本地仍为旧值
 
-    assert h1.budget._epoch < h2.checkpoints.read_epoch()
+    assert h1.budget._epoch < log1._wal.read_epoch()
     assert h1.budget.reserve("B", 5) is None, "旧 epoch 不得再 reserve"
     r = h1.budget.consume(resv.reservation_id, 1)
     assert r == Status.REJECT_STALE

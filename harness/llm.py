@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 
+from .egress import EgressDenied, EgressGuard, build_opener
+
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen3.7-flash"
 ENV_KEY = "DASHSCOPE_API_KEY"
@@ -110,49 +112,98 @@ class LLMConfig:
                 f"api_key='***', timeout_s={self.timeout_s})")
 
 
-def _post(url: str, payload: dict, headers: dict, timeout_s: float) -> dict:
-    """真实网络分支：阶段一无真实 LLM（`token_multiplier` N/A），
-    成功返回那行 `# pragma: no cover`（§4.1），失败/重试路径仍被覆盖。"""
+def _post(url: str, payload: dict, headers: dict, timeout_s: float, *,
+          egress: Optional[EgressGuard] = None) -> dict:
+    """真实网络分支：**必须**先过 egress 强制点，再走钉住 + 禁重定向的 opener。
+
+    - `ensure()` 在入口调用：无强制点 → `EgressUnavailable`（拒绝出站，fail-closed）；
+    - `build_opener()` 用 `pinned_connection` 只解析一次（防 DNS rebinding / SSRF）；
+    - `3xx` 显式转成 `EgressDenied`（`NoRedirect` 已在 opener 内拒绝，这里是兜底）。
+    """
+    guard = egress if egress is not None else _default_egress()
+    guard.ensure()
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))  # pragma: no cover
+    try:
+        with build_opener().open(req, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8"))  # pragma: no cover
+    except urllib.error.HTTPError as exc:
+        if 300 <= int(exc.code) < 400:
+            raise EgressDenied(
+                f"重定向禁止二次解析：{exc.code} → {exc.headers.get('Location')!r}") from exc
+        raise
+
+
+_default_guard: Optional[EgressGuard] = None
+
+
+def _default_egress() -> EgressGuard:
+    """未显式注入 guard 时的默认值：`required=None` → 出站时 fail-closed。"""
+    global _default_guard
+    if _default_guard is None:
+        _default_guard = EgressGuard()
+    return _default_guard
+
+
+def configure_egress(guard: Optional[EgressGuard]) -> None:
+    """注入/覆盖模块级默认 guard（`Harness` 会注入自己的 guard）。"""
+    global _default_guard
+    _default_guard = guard
+
+
+class LLMClient:
+    """把 egress guard 与配置绑在一起的客户端（`Harness.llm` 使用）。"""
+
+    def __init__(self, config: Optional[LLMConfig] = None, *,
+                 egress: Optional[EgressGuard] = None) -> None:
+        self.config = config
+        self.egress = egress if egress is not None else _default_egress()
+
+    def chat(self, messages: Iterable[Mapping[str, str]], *,
+             temperature: float = 0.0,
+             max_tokens: Optional[int] = None) -> str:
+        cfg = self.config or LLMConfig.from_env()
+        validate_base_url(cfg.base_url)
+        url = f"{cfg.base_url}/chat/completions"
+        payload = {
+            "model": cfg.model,
+            "messages": list(messages),
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg.api_key}",
+        }
+
+        last_error: Optional[Exception] = None
+        for attempt in range(cfg.max_retries + 1):
+            try:
+                data = _post(url, payload, headers, cfg.timeout_s,
+                             egress=self.egress)
+                return data["choices"][0]["message"]["content"]
+            except EgressDenied:
+                raise                       # 出站被策略拒绝：不得重试、不得降级
+            except urllib.error.HTTPError as exc:          # 4xx 不重试（除 429）
+                last_error = exc
+                if exc.code != 429 and 400 <= exc.code < 500:
+                    break
+            except (urllib.error.URLError, TimeoutError, KeyError) as exc:
+                last_error = exc
+            if attempt < cfg.max_retries:
+                time.sleep(cfg.backoff_s * (2 ** attempt))
+        raise LLMError(f"调用失败（model={cfg.model}）：{last_error}")
 
 
 def chat(messages: Iterable[Mapping[str, str]], *,
          config: Optional[LLMConfig] = None,
          temperature: float = 0.0,
-         max_tokens: Optional[int] = None) -> str:
+         max_tokens: Optional[int] = None,
+         egress: Optional[EgressGuard] = None) -> str:
     """调用 chat/completions，返回首条回复文本。
 
     仅用于阶段二的真实模型接入；阶段一 demo 默认走 scripted fake。
     """
-    cfg = config or LLMConfig.from_env()
-    validate_base_url(cfg.base_url)
-    url = f"{cfg.base_url}/chat/completions"
-    payload = {
-        "model": cfg.model,
-        "messages": list(messages),
-        "temperature": temperature,
-    }
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg.api_key}",
-    }
-
-    last_error: Optional[Exception] = None
-    for attempt in range(cfg.max_retries + 1):
-        try:
-            data = _post(url, payload, headers, cfg.timeout_s)
-            return data["choices"][0]["message"]["content"]
-        except urllib.error.HTTPError as exc:          # 4xx 不重试（除 429）
-            last_error = exc
-            if exc.code != 429 and 400 <= exc.code < 500:
-                break
-        except (urllib.error.URLError, TimeoutError, KeyError) as exc:
-            last_error = exc
-        if attempt < cfg.max_retries:
-            time.sleep(cfg.backoff_s * (2 ** attempt))
-    raise LLMError(f"调用失败（model={cfg.model}）：{last_error}")
+    return LLMClient(config, egress=egress).chat(
+        messages, temperature=temperature, max_tokens=max_tokens)

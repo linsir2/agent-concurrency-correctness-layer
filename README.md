@@ -20,6 +20,7 @@
 | [S7 方案 v1.2](docs/s7-benchmark-and-coverage.md) | 三条件（串行/worktree/共享层）× 四负载基准 + 外部差分度量（资源级 expected + 键级归因）+ 独立 oracle + 二级指标 + 覆盖率分模块阈值 |
 | [S9 方案 v1.2](docs/s9-persistence-and-receipts.md) | 持久化 checkpoint（信封/codec/双层锁/唯一 ref）+ 收据链（同帧 + `commit_key` 去重 + scope 锁 + head 锚点）+ `CrashInjected` 契约 + `retention` 安全语义 + 跨进程恢复与 SIGKILL |
 | [S10 方案 v1.2](docs/s10-cross-process-reconciliation.md) | 跨进程预算对账（事件溯源 + 全量重放 + 树完整性 + 单写者 lease）+ 跨进程 flock（`_FileLock` 下沉 + 三锁全序 + WAL seq fstat + fencing）+ `FinalitySink` 接口草案 |
+| [S11 方案 v1.2](docs/s11-egress-enforcement.md) | egress 强制点（外部库 `sandlock`/`ip netns`，不自研）+ DNS 钉住与 SSRF 阻断 + 统一 gateway 前置 + K-44 收据增量索引 + K-46 fencing 绑 WAL |
 | [设计规范 v1.12](docs/multi-agent-harness-design-final.md) | 主设计规范：定位与承诺边界、Z0–Z3 分区、组件契约、RSC 提交与补偿、不变量 I1–I14、20 张数据流/架构/调用/扇入扇出图 |
 | [里程碑与模块划分](docs/milestones.md) | MS0–MS10 共 11 个里程碑，每个含目标 / 新增模块 / 依赖 / 出入口条件 / 扩展点 / 承上启下；含实现前决策 D1–D16 |
 | [用例与对抗测试](docs/use-cases-and-adversarial-tests.md) | 4 个真实用例 + 13 个对抗用例，逐步推演表 + 跑通判定标准 |

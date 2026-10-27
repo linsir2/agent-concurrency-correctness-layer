@@ -1,4 +1,4 @@
-"""跨进程 `flock` 原语 + 锁全序（S10b §3.1 / §3.2）。
+"""跨进程 `flock` 原语 + 锁全序（S10b §3.1 / §3.2 / S11b §3.2）。
 
 `_FileLock` 从 `checkpoint.py` **下沉**到此，解开循环导入：
 
@@ -7,14 +7,17 @@
 若 `wal.py` 反向 `from ..checkpoint import _FileLock`，则
 `checkpoint → event_log → wal → checkpoint` 成环 → `ImportError`。
 
-三把跨进程锁的**全序**（写死，禁止反向获取，否则成环死锁，S10b §3.2）：
+跨进程锁的**全序**（写死，禁止反向获取，否则成环死锁，S10b §3.2 / S11b §3.2）：
 
-    resource(0) → receipts.lock(1) → wal.lock(2) → store.lock(3) → eventlog._lock(4)
+    resource(0) → budget(1) → receipts(2) → wal(3) → epoch(4) → store(5) → eventlog(6)
 
-`resource` / `eventlog._lock` 为**进程内**锁（无跨进程语义）；三把跨进程
-`flock`（receipts / wal / store）按上表**偏序**获取。反向获取（如「持
-`store.lock` 取 `receipts.lock`」）会让两条路径互相等待成环 → 死锁；
-`_FileLock(order=...)` 在运行期把这种反向获取变成显式 `LockOrderViolation`。
+`resource` / `eventlog._lock` 为**进程内**锁（无跨进程语义）；其余为跨进程
+`flock`，按上表**偏序**获取。反向获取（如「持 `store.lock` 取 `epoch` 锁」）
+会让两条路径互相等待成环 → 死锁；`_FileLock(order=...)` 在运行期把这种反向
+获取变成显式 `LockOrderViolation`。
+
+S11b K-46：`epoch` 为**独立**锁（`wal.log.epoch`），`bump_epoch` 只取该锁、
+**不与其它锁嵌套**；WAL append 的复验路径按 wal(3) → epoch(4) 正序获取。
 """
 
 from __future__ import annotations
@@ -25,10 +28,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 # 全序常量（下标越小越先获取）。测试断言此顺序不可更改。
-LOCK_ORDER = ("resource", "receipts", "wal", "store", "eventlog")
-RECEIPTS_ORDER = 1
-WAL_ORDER = 2
-STORE_ORDER = 3
+LOCK_ORDER = ("resource", "budget", "receipts", "wal", "epoch", "store", "eventlog")
+BUDGET_ORDER = 1
+RECEIPTS_ORDER = 2
+WAL_ORDER = 3
+EPOCH_ORDER = 4
+STORE_ORDER = 5
+EVENTLOG_ORDER = 6
 
 
 class LockOrderViolation(RuntimeError):
@@ -115,6 +121,21 @@ class _FileLock:
 def wal_lock_path(path: str | Path) -> str:
     """WAL 锁文件路径（与 WAL 同目录，文件名加 `.lock` 后缀）。"""
     return os.fspath(path) + ".lock"
+
+
+def wal_epoch_path(path: str | Path) -> str:
+    """WAL epoch 文件路径（S11b K-46：与 WAL 同目录，`wal.log.epoch`）。"""
+    return os.fspath(path) + ".epoch"
+
+
+def wal_epoch_lock_path(path: str | Path) -> str:
+    """独立 epoch 锁文件路径（不与 wal.lock / store.lock 共用）。"""
+    return os.fspath(path) + ".epoch.lock"
+
+
+def wal_generation_path(path: str | Path) -> str:
+    """WAL generation 标记路径（终审 7-3：WAL 重建后旧写者必须被拒）。"""
+    return os.fspath(path) + ".generation"
 
 
 def receipts_lock_path(root: str | Path) -> str:

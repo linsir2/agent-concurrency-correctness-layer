@@ -7,10 +7,29 @@ name = "agent-concurrency-correctness-layer"
 version = "0.1.0"
 description = "多智能体并发正确性层：RSC = OCC + 租约 fencing + 短临界区 + Saga 补偿"
 requires-python = ">=3.11"
+# S11 §0.4 / Q1：egress 库本应放 `dependencies`（必需）—— 「放 optional 等于不装就绕过」。
+# 但本仓库运行环境实测（见 `docs/s11-egress-enforcement.md` §11 环境探测登记）：
+#   - `sandlock` / `py-landlock` 在当前索引**不存在**（`pip install` 无匹配发行版）；
+#   - 容器内 `landlock_create_ruleset` 返回 ENOSYS（ABI=0），`ip netns add` 需
+#     CAP_NET_ADMIN（EPERM）→ 即使装了库也**无法强制**。
+# 故采用 §0.4 的第二条路径（fail-closed 开关）：
+#   - 库放 `optional-dependencies.sandbox`（可解析时再装）；
+#   - `Harness(egress_required=True)` 或 `HARNESS_EGRESS_REQUIRED=1` → **启动即校验**，
+#     无强制点则 `EgressUnavailable`（拒绝启动）；
+#   - 默认（`None`）→ 构造可跑（本地动作不经 egress，K-51），但**任何出站** fail-closed。
+# 任何情况下都**不静默放行**（`harness/egress/__init__.py` 的 `EgressGuard`）。
 dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6"]
+# 内核 LSM（Landlock）强制点：真实 API = `Sandbox(...)` + **子进程** `sandbox.run(argv)`
+sandbox = ["sandlock>=0.1"]
+# 备选 LSM 绑定（sandlock 不可解析时的降级候选；不自研 seccomp/Landlock）
+landlock-alt = ["py-landlock>=0.1"]
+# L7 代理（只与 netns MODE_B 搭配；单独用不构成强制点，§0.1）
+proxy = ["mitmproxy>=10"]
+# 一次装齐（索引可用时）：`pip install -e '.[egress]'`
+egress = ["sandlock>=0.1", "py-landlock>=0.1", "mitmproxy>=10"]
 
 [tool.setuptools.packages.find]
 include = ["harness*"]
@@ -30,6 +49,9 @@ markers = [
     "slow: 长跑用例（-m 'not slow' 可跳过）",
     "serial: 需串行执行的并发用例",
     "fault: 故障注入（真实 fsync / 子进程 kill）",
+    "sandbox: 子进程沙箱用例（Landlock / sandlock，需内核支持）",
+    "netns: 网络命名空间用例（需 CAP_NET_ADMIN，缺失时 xfail 登记）",
+    "egress: egress 强制点用例（gate / DNS 钉住 / SSRF）",
 ]
 
 [tool.coverage.run]

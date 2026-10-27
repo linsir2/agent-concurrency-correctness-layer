@@ -15,19 +15,31 @@ S10b §3.3：**跨进程 seq 不冲突**
 
 S10b §3.4：**fencing epoch**
 - 每条 record 记录 run 级 `fencing_epoch`；
-- append 前在**同一 flock 内**读 store.json 的 epoch 复验，`writer < store` → 拒绝。
+- append 前在**同一 flock 内**复验 epoch，`writer < durable` → 拒绝。
+
+S11b §3.1/§3.2：
+- **K-44 增量收据索引**：`_receipt_index` / `_receipt_index_seq` / `_indexed_frame`，
+  `receipts_from(watermark)` 在 `wal.lock` 内**只解析新增帧**（O(新增)，非 O(N)）；
+  `_rescan_from_disk` 重建 `_frames` 时同步重置索引游标（否则错位）。
+- **K-46 fencing 绑 WAL**：`wal.log.epoch`（与 WAL 同目录）+ 独立 `epoch` 锁；
+  `read_epoch` 无锁原子读，`bump_epoch` 只取 epoch 锁（不与其它锁嵌套）。
 """
 
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import struct
+import uuid
 import zlib
 from pathlib import Path
 
-from ._lock import FencingRejected, WAL_ORDER, _FileLock, wal_lock_path
-from .atomic import fsync_dir, write_all
+from ..types import EventKind
+from ._lock import (EPOCH_ORDER, FencingRejected, WAL_ORDER, _FileLock,
+                    wal_epoch_lock_path, wal_epoch_path, wal_generation_path,
+                    wal_lock_path)
+from .atomic import atomic_write, fsync_dir, write_all
 
 MAGIC = b"MWAL"
 HEADER = struct.Struct(">4sII")
@@ -48,11 +60,56 @@ class Wal:
         self.truncated_at: int | None = None
         self._frames: list[list[dict]] = []
         self._seq = 0
+        # K-44：增量收据索引（只解析新增帧；`_indexed_frame` = 已索引帧数）
+        self._receipt_index: list[tuple[int, dict]] = []
+        # 终审 6-2：与 `_receipt_index` 平行的 seq 键，供 `bisect` 从水位切片
+        self._receipt_index_keys: list[int] = []
+        self._receipt_index_seq = 0
+        self._indexed_frame = 0
         # 缓存尾偏移：append 后立即记录；跨进程写入后 fstat 比对可 O(1) 发现
         self._cached_end: int = 0
-        self._load()
-        self._fd = os.open(self.path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
-        fsync_dir(self.path)
+        self.generation_path = Path(wal_generation_path(self.path))
+        # 终审 6-1：`_load` 必须在 `wal.lock` 内 —— 否则另一写者刚写 frame header
+        # （body 未写完）时本实例会看到 `body_end > len` 并 truncate 在途帧。
+        with self._lock():
+            existed = self.path.exists()
+            self._load()
+            self._generation = self._ensure_generation(existed)
+            self._fd = os.open(self.path,
+                               os.O_CREAT | os.O_RDWR | os.O_APPEND, 0o644)
+            fsync_dir(self.path)
+        # K-46：WAL 级 fencing epoch（`wal.log.epoch`），独立 epoch 锁
+        self.epoch_path = Path(wal_epoch_path(self.path))
+        self.epoch_lock = _FileLock(wal_epoch_lock_path(self.path),
+                                    order=EPOCH_ORDER)
+
+    # ---- generation（终审 7-3） -----------------------------------
+    def _ensure_generation(self, existed: bool) -> str:
+        """读取/创建 WAL generation（调用方须持 `wal.lock`）。
+
+        - WAL 文件不存在（被删除/重建）→ **轮换**新 UUID（旧写者一律拒绝）；
+        - generation 文件缺失（首次使用/升级）→ 新建 UUID；
+        - WAL 与 generation 都在 → 保持不变（正常重开/并发实例共享）。
+        """
+        try:
+            gen = self.generation_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            gen = ""
+        if not existed or not gen:
+            gen = uuid.uuid4().hex
+            atomic_write(self.generation_path, gen.encode("utf-8"))
+        return gen
+
+    @property
+    def generation(self) -> str:
+        return self._generation
+
+    def _current_generation(self) -> str:
+        """读盘上的当前 generation（调用方须持 `wal.lock`；缺失 → 空串）。"""
+        try:
+            return self.generation_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
 
     # ---- 读 -------------------------------------------------------
     def _load(self) -> None:
@@ -100,10 +157,70 @@ class Wal:
         """flock 内回扫：别的进程/实例写过 → 重建 `_frames` / `_seq` / `_cached_end`。
 
         只在 `fstat` 大小与缓存尾偏移不一致时调用（极少发生），不是每次 append。
+        K-44：`_frames` 重建 → **同步重置**索引游标（否则旧游标指向新列表错位）。
         """
         self.truncated_at = None
         self._frames = []
+        self._receipt_index = []
+        self._receipt_index_keys = []
+        self._receipt_index_seq = 0
+        self._indexed_frame = 0
         self._load()
+
+    # ---- K-44：增量收据索引 ---------------------------------------
+    def _index_new_frames_locked(self) -> None:
+        """只解析 `_indexed_frame` 之后的新增帧（调用方须持 `wal.lock`）。"""
+        while self._indexed_frame < len(self._frames):
+            frame = self._frames[self._indexed_frame]
+            for rec in frame:
+                if rec.get("kind") != EventKind.RECEIPT_ISSUED.value:
+                    continue
+                seq = rec.get("seq")
+                if isinstance(seq, int):
+                    self._receipt_index.append((seq, rec.get("payload")))
+                    self._receipt_index_keys.append(seq)
+                    if seq > self._receipt_index_seq:
+                        self._receipt_index_seq = seq
+            self._indexed_frame += 1
+
+    def receipts_from(self, watermark: int = 0) -> list[tuple[int, dict]]:
+        """返回 `seq > watermark` 的收据记录 `[(seq, payload)]`（增量，不重扫全量）。
+
+        **RAW API**：只返回索引里的原始记录，**不做链连续性校验**（`prev_receipt_hash`
+        / 重复 id / 畸形 payload 的判定由 `Harness._scan_receipts` 负责）。这样索引
+        层保持 O(log N + K)，校验逻辑只有一份（避免两处实现漂移）。
+
+        - 索引读写与 fstat 比对都在 `wal.lock` 内（跨进程安全）；
+        - 只解析**新增帧**；`_rescan_from_disk` 后索引游标已重置 → 从头重建；
+        - 终审 6-2：用 `bisect` 从水位位置切片（O(log N + K)），不再每次全量
+          过滤整个索引（O(N) → 累计 O(N²)）。
+        """
+        with self._lock():
+            size = os.fstat(self._fd).st_size
+            if size != self._cached_end:
+                self._rescan_from_disk()
+            self._index_new_frames_locked()
+            pos = bisect.bisect_right(self._receipt_index_keys, watermark)
+            return list(self._receipt_index[pos:])
+
+    # ---- K-46：WAL 级 fencing epoch -------------------------------
+    def read_epoch(self) -> int:
+        """无锁原子读 `wal.log.epoch`（`atomic_write` 保证不撕裂；缺失 → 0）。"""
+        try:
+            raw = self.epoch_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return 0
+        try:
+            return int(raw or 0)
+        except ValueError:
+            return 0
+
+    def bump_epoch(self) -> int:
+        """同一 `epoch` 锁临界区内 read-modify-write（只取该锁，不与其它锁嵌套）。"""
+        with self.epoch_lock():
+            epoch = self.read_epoch() + 1
+            atomic_write(self.epoch_path, str(epoch).encode("utf-8"))
+            return epoch
 
     # ---- 写 -------------------------------------------------------
     def append_frame(self, records: list[dict], *, fencing_epoch: int | None = None,
@@ -111,12 +228,20 @@ class Wal:
         """给每个记录分配 seq，整帧一次写入并 fdatasync（提交点）。
 
         `fencing_lock` / `fencing_reader` 提供时启用 fencing：在**同一 wal.lock
-        临界区**内先 `with fencing_lock():` 读 store.json 的 epoch 复验，
-        `fencing_epoch < store_epoch` → 抛 `FencingRejected`（不写入、不 ack）。
+        临界区**内按 wal(3) → epoch(4) 正序取独立 epoch 锁，读 `wal.log.epoch`
+        复验，`fencing_epoch < durable_epoch` → 抛 `FencingRejected`（不写入、不 ack）。
         """
         if not records:
             return []
         with self._lock():
+            # 终审 7-3：WAL 被删除/重建 → generation 轮换；旧写者一律拒绝。
+            # 若只比较 epoch，重建后 `.epoch` 归零会让旧写者（本地 epoch=N>0）
+            # 的 `N < 0` 为假 → 复活写入。
+            current_gen = self._current_generation()
+            if current_gen != self._generation:
+                raise FencingRejected(
+                    f"WAL generation 已轮换（本地 {self._generation!r} ≠ "
+                    f"磁盘 {current_gen!r}）→ 旧写者拒绝写入")
             if fencing_lock is not None and fencing_reader is not None:
                 with fencing_lock():
                     store_epoch = int(fencing_reader() or 0)
@@ -131,6 +256,7 @@ class Wal:
             for i, rec in enumerate(records, start=1):
                 item = dict(rec)
                 item["seq"] = base + i
+                item["wal_generation"] = self._generation
                 if fencing_epoch is not None:
                     item["fencing_epoch"] = fencing_epoch
                 assigned.append(item)

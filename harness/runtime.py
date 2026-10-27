@@ -161,19 +161,26 @@ class AgentRuntime:
         return entry.effect_id if entry is not None else idem_key
 
     def _gateway_check(self, acb: ACB, action: Action) -> bool:
-        """§5.6（K-11）：gateway 强制点，读 token 的 network / data_class。
+        """S11a §2.1：统一 gateway 强制点（两句语义，不可合并）。
 
-        - 无 token → 拒绝（deny-by-default）；
-        - `action` 无 `network` / `data_class` 属性 → 放行（不引入额外约束）。
+        ① token 必须存在**且可解析**（deny-by-default）——只判非 None 会让
+          `acb.capability = "garbage-token"` 放行所有 kind（终审 1-1）；
+        ② `agent_id` 必须与 ACB 绑定（`"*"` 仅测试夹具通配）；
+        ③ `network` / `data_class` 字段缺失 → 该维度不约束（本地动作不经 egress）。
         """
         token = self.h._effective_token(acb)
         if token is None:
+            return False                                  # ①
+        resolved = self.h.policy.resolve_token(token)
+        if resolved is None:
+            return False                                  # ① 不可解析 = 拒绝
+        if resolved.agent_id not in (acb.id, "*"):
+            return False                                  # ② 身份绑定
+        network = action.network                          # 显式字段（不再 getattr）
+        if network and not resolved.allows_network(network):
             return False
-        network = getattr(action, "network", None)
-        if network and not self.h.policy.allows_network(token, network):
-            return False
-        data_class = getattr(action, "data_class", None)
-        if data_class and not self.h.policy.allows_data_class(token, data_class):
+        data_class = action.data_class
+        if data_class and not resolved.allows_data_class(data_class):
             return False
         return True
 
@@ -189,6 +196,10 @@ class AgentRuntime:
         delay = getattr(self.h, "per_action_delay", 0.0)
         if delay and delay > 0:
             time.sleep(delay)
+        # S11a §2.2：**统一前置** —— 5 个 kind（stage/commit/tool/request_hitl/
+        # finish）在查表派发之前全部先过 gateway（不再只挂 tool）。
+        if not self._gateway_check(acb, action):
+            return Result(Status.DENIED_CAPABILITY, {"reason": "gateway"})
         fn = _HANDLERS.get(action.kind)
         if fn is None:
             return Result(Status.INVALID_INPUT, {"reason": "unknown_action"})
@@ -240,8 +251,6 @@ class AgentRuntime:
         if not self.h.policy.check_capability(
                 acb.id, token, action.tool, action.resource or ""):
             return Result(Status.DENIED_CAPABILITY, {"tool": action.tool})
-        if not self._gateway_check(acb, action):
-            return Result(Status.DENIED_CAPABILITY, {"reason": "gateway"})
         idem_key = self.h.idem_key(acb, action, i)
         st = self.h.effects.state(idem_key)
         if st == "CONFIRMED":
@@ -348,6 +357,12 @@ class AgentRuntime:
 
     # ---- 提交 + 补偿（文档 §5.4） --------------------------------
     def _commit_staged(self, acb: ACB) -> Result:
+        """K-51：**本地动作，不经 egress gate**（统一前置只覆盖 `_do_action`）。
+
+        turn 末自动提交 / rebase 重试直接调 `commit_batch`，不经过 `_do_action`；
+        若在此处加 gateway 检查，无 token 的本地提交会被误拦成 DENIED_CAPABILITY
+        → 恢复路径死锁。边界由 `tests/test_s11_gate.py::test_s11_1b_*` 固定。
+        """
         if not acb.staged:
             return ok()
         writes = [Write(resource=r, content=c) for r, c in acb.staged.items()]
@@ -360,6 +375,9 @@ class AgentRuntime:
     # ---- 冲突处理回路（文档 §5） ----------------------------------
     def handle_commit_result(self, acb: ACB, result: Result) -> Result:
         """提交失败 → **有界**语义 rebase（§5.1）。
+
+        K-51：本方法内的 `_commit_staged` 重试为**本地动作，不经 egress gate**
+        （与 `_do_action` 的 5 个 kind 边界分离；见 `_commit_staged` 注释）。
 
         - `REJECT_STALE`：租约失效 → 重新 reserve 重试一次（§5.4）；
         - `REJECT_STALE_READ`：读依赖被推进 → **对陈旧的 staged 重跑 merge3**

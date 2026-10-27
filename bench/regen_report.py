@@ -37,6 +37,19 @@ def _fmt(value: float, digits: int = 3) -> str:
     return f"{value:.{digits}f}"
 
 
+def _speed_table(speed: dict) -> str:
+    lines = ["| 负载 | B1 wall 均值 | B3 wall 均值 | speedup | 差值 CI（95%，n=30） |",
+             "|---|---|---|---|---|"]
+    for wl in ("C0", "C1", "C2", "C3"):
+        s = speed[wl]
+        ci = s.get("paired_bootstrap_ci") or {}
+        lines.append("| {} | {} s | {} s | {} | [{}, {}] |".format(
+            wl, _fmt(s["b1_wall_mean"]), _fmt(s["b3_wall_mean"]),
+            _fmt(s["speedup_b1_over_b3"]),
+            _fmt(ci.get("ci_low", 0.0)), _fmt(ci.get("ci_high", 0.0))))
+    return "\n".join(lines)
+
+
 def _throughput_table(summary: dict) -> str:
     lines = ["| 负载 | B1 | B2 | B3 |", "|---|---|---|---|"]
     for wl in ("C0", "C1", "C2", "C3"):
@@ -118,6 +131,7 @@ def regen(result_path: Path, report_path: Path) -> None:
     text = report_path.read_text(encoding="utf-8")
 
     blocks = {
+        "speed": _speed_table(data["speed"]),
         "throughput": _throughput_table(summary),
         "latency": _latency_table(summary),
         "scalability": _scalability_table(secondary),

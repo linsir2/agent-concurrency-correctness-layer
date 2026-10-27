@@ -301,7 +301,8 @@ def test_ms3_network_data_class_and_signature():
 
     # ④ runtime 强制点：evil network 的 tool action 必须 DENIED_CAPABILITY
     h4 = make_harness()
-    tok = h4.policy.issue("A1", tools={"http"}, paths={"*"},
+    # token 必须绑定到 dispatcher 生成的 ACB id（A-{run}-{task}-{attempt}）
+    tok = h4.policy.issue("A-R-T1-1", tools={"http"}, paths={"*"},
                           network={"api.example.com"}, data_class="*")
     plan4 = h4.planner.plan("R", [{"task_id": "T1", "min_budget": 10}])
     act4 = tool("http")

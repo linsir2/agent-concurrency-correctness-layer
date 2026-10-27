@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from harness import ACB, EventKind, Harness, Status, Write
+from harness import ACB, EventKind, Harness, ManualClock, Status, Write
 from harness.event_log import WalEventLog
 from harness.spec.receipt import GENESIS_HASH, receipt_hash, verify_chain
 from harness.storage._lock import (
@@ -262,10 +262,12 @@ def test_s10_8_fencing_rejects_stale_writer_and_preserves_acked_frame(tmp_path):
     assert len(wal._wal.records()) == 1
     assert wal._wal.records()[0]["fencing_epoch"] == 4
 
-    # 监督者 bump 到 5（同一 store.lock 内 RMW）
+    # 监督者 bump 到 5（S11b K-46：epoch 绑 WAL，`wal.log.epoch` 内 RMW；
+    # 只 bump 持久 epoch、**不**推进本写者 intents epoch → 模拟被接管的旧写者）
     for _ in range(5):
-        h.checkpoints.bump_epoch()
-    assert h.checkpoints.read_epoch() == 5
+        wal._wal.bump_epoch()
+    assert wal._wal.read_epoch() == 5
+    assert h.intents.get_epoch() == 4, "监督者 bump 不应改写旧写者的本地 epoch"
 
     # ① 旧 epoch 写者再 append → 被拒，且不落盘
     before = len(wal._wal.records())
@@ -301,8 +303,8 @@ def test_s10_8_negative_control_without_recheck_stale_append_succeeds(tmp_path):
 
     h.intents.set_epoch(4)
     for _ in range(5):
-        h.checkpoints.bump_epoch()
-    assert h.checkpoints.read_epoch() == 5
+        wal._wal.bump_epoch()                 # S11b K-46：WAL 侧 epoch
+    assert wal._wal.read_epoch() == 5
 
     # 模拟缺少 append 前复验的旧实现
     wal._fencing_lock = None
@@ -331,15 +333,18 @@ def test_s10_10_no_circular_import(module):
 
 # ================================================================ S10-11
 def test_s10_11_lock_order_constant_is_immutable():
-    """S10-11：`LOCK_ORDER` 结构断言（全序写死、不可更改）。"""
-    assert LOCK_ORDER == ("resource", "receipts", "wal", "store", "eventlog")
+    """S10-11 / S11b §3.2：`LOCK_ORDER` 结构断言（全序写死、不可更改）。"""
+    assert LOCK_ORDER == (
+        "resource", "budget", "receipts", "wal", "epoch", "store", "eventlog")
     assert isinstance(LOCK_ORDER, tuple), "必须是不可变元组（防被原地改写）"
     with pytest.raises(TypeError):
         LOCK_ORDER[0] = "x"                       # type: ignore[index]
-    assert (RECEIPTS_ORDER, WAL_ORDER, STORE_ORDER) == (1, 2, 3)
-    assert LOCK_ORDER.index("resource") < LOCK_ORDER.index("receipts")
+    assert (RECEIPTS_ORDER, WAL_ORDER, STORE_ORDER) == (2, 3, 5)
+    assert LOCK_ORDER.index("resource") < LOCK_ORDER.index("budget")
+    assert LOCK_ORDER.index("budget") < LOCK_ORDER.index("receipts")
     assert LOCK_ORDER.index("receipts") < LOCK_ORDER.index("wal")
-    assert LOCK_ORDER.index("wal") < LOCK_ORDER.index("store")
+    assert LOCK_ORDER.index("wal") < LOCK_ORDER.index("epoch")
+    assert LOCK_ORDER.index("epoch") < LOCK_ORDER.index("store")
     assert LOCK_ORDER.index("store") < LOCK_ORDER.index("eventlog")
 
 
@@ -359,3 +364,35 @@ def test_s10_11_reverse_acquisition_raises_lock_order_violation(tmp_path):
         with wal_lock():
             with store_lock():
                 pass
+
+
+# ================================================================ 终审 7-2
+def test_final_7_2_takeover_bumps_epoch_before_writing_lease(tmp_path, monkeypatch):
+    """接管必须**先 bump_epoch 再落租约**（否则旧写者可在窗口内以旧 epoch 写入）。
+
+    判据：bump 执行时，磁盘上的租约仍属于旧写者（w1）。旧实现先写租约再 bump，
+    此处会观察到 "w2"。
+    """
+    clock = ManualClock()
+    cp = str(tmp_path / "cp")
+    h1 = Harness(checkpoint_root=cp, writer_id="w1", clock=clock, lease_ms=1000)
+    assert h1._read_lease()["owner"] == "w1"
+
+    observed: list[str | None] = []
+    orig_bump = Harness.bump_epoch
+
+    def spy(self, reason: str = ""):
+        if getattr(self, "_writer_id", None) == "w2":
+            lease = self._read_lease()
+            observed.append(None if lease is None else lease.get("owner"))
+        return orig_bump(self, reason)
+
+    monkeypatch.setattr(Harness, "bump_epoch", spy)
+    clock.advance(2000)                       # w1 租约过期 → w2 接管
+    h2 = Harness(checkpoint_root=cp, writer_id="w2", clock=clock, lease_ms=1000)
+
+    assert observed == ["w1"], \
+        f"接管窗口未消除：bump 时租约 owner={observed!r}（期望旧写者 w1）"
+    assert h2._writer_lease_ok is True
+    lease = h2._read_lease()
+    assert lease["owner"] == "w2" and lease["epoch"] == 1

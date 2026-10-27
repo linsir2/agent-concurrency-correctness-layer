@@ -291,9 +291,20 @@ class Dispatcher:
 
     def _capability_ok(self, acb: ACB, required_tools,
                        *, network=None, data_class=None) -> bool:
-        """与运行时同一判定入口（§5.9）：token 显式传入 + 四维。"""
+        """与运行时同一判定入口（§5.9）：token 显式传入 + 四维。
+
+        终审 1-1：**无条件**校验 token 可解析且 `agent_id` 绑定到本 ACB
+        （不再只在 `required_tools` 非空时才看能力）——否则
+        `try_admit(..., token="garbage-token")` 会直接 ADMITTED。
+        """
         token = self.h._effective_token(acb)
+        if token is not None:
+            resolved = self.h.policy.resolve_token(token)
+            if resolved is None or resolved.agent_id not in (acb.id, "*"):
+                return False
         required = _normalize_required(required_tools)
+        if not required:
+            return True
         return all(self.h.policy.check_capability(
             acb.id, token, tool, path, network=network, data_class=data_class)
             for tool, path in required.items())
@@ -376,8 +387,8 @@ class Dispatcher:
                 self._deny(acb, "NO_SLOT")
                 return False
 
-            # ② 能力
-            if required_tools and not self._capability_ok(acb, required_tools):
+            # ② 能力（无条件：token 存在即校验可解析 + 身份绑定）
+            if not self._capability_ok(acb, required_tools):
                 self._deny(acb, "DENIED_CAPABILITY")
                 return False
 

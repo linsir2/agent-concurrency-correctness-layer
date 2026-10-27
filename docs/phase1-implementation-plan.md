@@ -770,7 +770,8 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S8** | ✅ 完成（2026-10-27） | 覆盖率分模块阈值落地（`fail_under=80` + `scripts/check_coverage.py`）、补 `recover(COMPENSATE)`/resolver/`_restore_path` 三缺口、S8-1..S8-4 补强、`budget.gc` 接上 + `check_invariants` 加锁 | **152 passed**；整体 **83.89%**、budget 95.88%；**评审发现并修复真缺陷 K-28**（C1 静默丢写，残值归零） |
 | **S9** | ✅ 完成（2026-10-27） | K-25（`CrashInjected(BaseException)` + probe 不吞）+ K-26（`retention` 安全语义）+ K-24（`commit_batch` 同帧收据链 + `commit_key` 去重 + scope 锁）+ K-30（`FileCheckpointStore`：信封/codec/双层锁/唯一 ref/损坏隔离）+ 跨进程恢复 + 四阶段 SIGKILL | **214 passed**；覆盖率 **84.69%**；三轮对抗评审修 **2 P0（静默丢写）+ 6 P1 + 11 P2/P3**；详见 [S9 方案 v1.2](s9-persistence-and-receipts.md) §8 |
 | **S10** | ✅ 完成（2026-10-27） | MS9 跨进程预算对账（预算变更事件溯源 + 全量重放建完整树 + 树完整性锚定事件声明 + 全局对账等式 + 单写者 lease）+ K-34 跨进程 flock（`_FileLock` 下沉 + 三锁全序 + WAL seq 的 fstat 缓存 + fencing epoch）+ `FinalitySink` 接口草案 | **250 passed**；覆盖率 **83.91%**；两轮对抗评审修 **1 P0（budget↔store 死锁）+ 4 P1 + 10 P2/P3**；详见 [S10 方案 v1.2](s10-cross-process-reconciliation.md) §9 |
-| S11 | ⏳ 待开工 | egress 真强制点（档 c/d：eBPF/Landlock 或 gVisor/Kata）+ 跨进程 scope 锁收口（K-46）+ 收据增量索引（K-44） | — |
+| **S11** | ✅ 完成（2026-10-27） | `_gateway_check` 统一前置 + `Action.network/data_class` 字段 + policy 通配/CIDR/分级序；K-44 收据增量索引 + K-46 fencing 绑 WAL（generation）；DNS 钉住 + SSRF 阻断（完整云 metadata 列表）；egress 外部库（`sandlock`/`ip netns`，**不自研**）+ 出站 fail-closed | **348 passed**（+2 xfail 环境登记）；覆盖率 **84.09%**；终审修 **5 高（egress 未接线 / token 一次性 / 干净重启 fence / WAL 重建复活 / 并发 Wal 截断）+ 11 中低**；详见 [S11 方案 v1.2](s11-egress-enforcement.md) §11 |
+| S12 | ⏳ 待开工 | 真内核强制点（gVisor/Firecracker 容器运行时）+ Landlock 可用环境验证（K-53/K-54） | — |
 
 **S0–S4 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。

@@ -9,16 +9,21 @@
 
 from __future__ import annotations
 
+import json
 import os
 import struct
 import subprocess
 import sys
+import threading
+import time
+import zlib
 from pathlib import Path
 
 import pytest
 
 from harness import EventKind, WalEventLog
 from harness.storage import Wal, WalCorrupt, atomic_write, canonical_bytes
+from harness.storage._lock import _FileLock, wal_lock_path
 from harness.storage.wal import HEADER, MAGIC
 
 pytestmark = pytest.mark.ms0
@@ -115,3 +120,46 @@ def test_atomic_write_is_all_or_nothing(tmp_path):
     # 目录里不应残留临时文件
     leftovers = [p.name for p in target.parent.iterdir() if p.name.startswith(".tmp-")]
     assert leftovers == []
+
+
+def test_final_6_1_concurrent_construction_does_not_truncate_inflight(tmp_path):
+    """终审 6-1：另一写者只写了 frame header（body 在途）时构造 Wal 不得截断。
+
+    旧实现 `_load` 不在 `wal.lock` 内 → 看到 `body_end > len` 立即 truncate；
+    写者补完 body 后文件变成「无 header 的 body」→ 重开 `WalCorrupt`。
+    """
+    path = _wal_path(tmp_path)
+    body1 = json.dumps([{"kind": "x", "subject": "s", "payload": {}, "seq": 1}],
+                       sort_keys=True, separators=(",", ":")).encode()
+    body2 = json.dumps([{"kind": "x", "subject": "s2", "payload": {}, "seq": 2}],
+                       sort_keys=True, separators=(",", ":")).encode()
+    half = len(body2) // 2
+    with open(path, "wb") as fh:
+        fh.write(HEADER.pack(MAGIC, len(body1), zlib.crc32(body1) & 0xFFFFFFFF))
+        fh.write(body1)
+        fh.write(HEADER.pack(MAGIC, len(body2), zlib.crc32(body2) & 0xFFFFFFFF))
+        fh.write(body2[:half])                    # 在途帧：body 未写完
+        fh.flush()
+        os.fsync(fh.fileno())
+
+    lock = _FileLock(wal_lock_path(path))
+    started = threading.Event()
+
+    def writer():
+        with lock():                              # 模拟持锁写者
+            started.set()
+            time.sleep(0.35)
+            with open(path, "ab") as fh:
+                fh.write(body2[half:])            # 补完 body
+                fh.flush()
+                os.fsync(fh.fileno())
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    assert started.wait(5)
+    wal = Wal(path)                               # 必须等锁 → 看到完整帧
+    thread.join(5)
+
+    assert wal.truncated_at is None, "构造期截断了在途帧"
+    assert wal.tail == 2
+    assert Wal(path).tail == 2, "重开必须不抛 WalCorrupt"
