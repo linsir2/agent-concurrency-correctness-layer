@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import threading
 from dataclasses import dataclass
 
@@ -19,7 +18,9 @@ from .event_log import EventLog
 from .intent_registry import IntentRegistry
 from .rebase import DELETE, MISSING, merge3
 from .storage.atomic import atomic_delete
-from .storage.blob import InMemoryBlobStore, _BYTES_PREFIX, canonical_bytes
+from .storage.blob import (BlobCorrupt, InMemoryBlobStore, _BYTES_PREFIX,
+                           canonical_bytes)
+from .storage.codec import decode, loads
 
 
 class WorkspaceVersionStore:
@@ -63,6 +64,8 @@ class WorkspaceManager:
                  blobs=None, path_of=None, lock_timeout_s: float = 5.0) -> None:
         self.manifest: dict[str, ManifestEntry] = {}
         self._tombstones: dict[str, int] = {}
+        # P2：blob 缺失被隔离的资源（不再静默 `return False`）
+        self.isolated_resources: set[str] = set()
         self._event_log = event_log
         self._intents = intents
         self._versions = versions or WorkspaceVersionStore()
@@ -120,8 +123,10 @@ class WorkspaceManager:
         if raw.startswith(_BYTES_PREFIX):          # 剥魔数前缀还原 bytes
             return raw[len(_BYTES_PREFIX):]
         try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            # 嵌套 bytes / DELETE 哨兵必须走严格 codec（P1-4）：
+            # 裸 json.loads 会把 {"__type__":"bytes",...} 读回成 dict。
+            return decode(loads(raw.decode("utf-8")))
+        except (ValueError, TypeError, UnicodeDecodeError):
             return raw
 
     def content(self, resource: str):
@@ -153,12 +158,65 @@ class WorkspaceManager:
         return max(cur, self._tombstones.get(resource, 0), 0) + 1
 
     def _guard_version(self, resource: str) -> int:
-        """当前最高已见版本（manifest 或 tombstone），供重放做版本守卫。"""
+        """当前最高已见版本（manifest 或 tombstone），供重放做版本守卫。
+
+        **只看内存 manifest**：`_project_event` 用它做幂等守卫，若把事件日志水位
+        也算进来，会导致「事件尚未投影时 guard 已含其版本 → 投影被跳过」的坏循环。
+        """
         return self._next_version(resource) - 1
+
+    def _watermark_version(self, resource: str) -> int:
+        """该资源在**事件日志**中的最高已提交版本（含未投影事件）。
+
+        P0-1③：`manifest` 可能落后于日志（提交点已 append、投影前崩溃）。
+        写路径必须以日志水位为准，否则新写会算出与既有事件相同的 version。
+        """
+        best = 0
+        for ev in self._event_log.replay(subject=resource):
+            if ev.kind not in (EventKind.RESOURCE_COMMITTED,
+                              EventKind.WORKSPACE_COMMITTED):
+                continue
+            payload = ev.payload or {}
+            try:
+                version = int(payload.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if version > best:
+                best = version
+        return best
+
+    def _effective_version(self, resource: str) -> int:
+        """写路径的当前最高已用版本：`max(manifest, tombstone, 事件日志水位)`。"""
+        return max(self._guard_version(resource), self._watermark_version(resource))
 
     def content_hash(self, resource: str) -> str:
         entry = self.manifest.get(resource)
         return entry.blob_hash if entry else ""
+
+    def _current_blob_hash(self, resource: str) -> str:
+        """写路径的「前一版内容 hash」：manifest 与事件日志水位取**最高版本**者。
+
+        `manifest` 可能因「append 后、投影前崩溃」落后于日志；此时 `version_before`
+        以水位为准，前一版内容也必须是水位对应事件的 blob，否则前像重建会错。
+        """
+        entry = self.manifest.get(resource)
+        best_hash = entry.blob_hash if entry is not None else ""
+        best_version = entry.version if entry is not None else 0
+        for ev in self._event_log.replay(subject=resource):
+            if ev.kind not in (EventKind.RESOURCE_COMMITTED,
+                              EventKind.WORKSPACE_COMMITTED):
+                continue
+            payload = ev.payload or {}
+            if bool(payload.get("deleted", False)):
+                continue
+            try:
+                version = int(payload.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if version > best_version:
+                best_version = version
+                best_hash = payload.get("blob_hash", "") or ""
+        return best_hash
 
     # ---- 写（文档 §5.2） ------------------------------------------
     def put(self, resource: str, content) -> ManifestEntry:
@@ -171,7 +229,7 @@ class WorkspaceManager:
         with self.lock_for(resource):
             blob_hash = self._blobs.put(canonical_bytes(content))
             cur = self.manifest.get(resource)
-            version = self._next_version(resource)
+            version = self._effective_version(resource) + 1
             entry = ManifestEntry(version=version, blob_hash=blob_hash,
                                   prev_hash=cur.blob_hash if cur else "")
             self.manifest[resource] = entry
@@ -185,14 +243,27 @@ class WorkspaceManager:
         return entry
 
     # ---- 暂存（Z3 worktree，文档 §5.3） ----------------------------
-    def stage(self, acb, resource: str, content) -> None:
-        """覆盖式暂存；同时把「读版本」写入 read_set/base_version（每次 stage = 重新读）。"""
+    def stage(self, acb, resource: str, content) -> Result:
+        """覆盖式暂存；同时把「读版本」写入 read_set/base_version（每次 stage = 重新读）。
+
+        P1-5 fail-fast：内容必须在**进入** staged 前通过严格 codec 校验，
+        否则非法内容会一路带到 commit（UPSTREAM_FAILED）与 `_finalize` 落盘
+        （codec 再抛 → 穿透 run → 槽位/预算结算被跳过）。
+        """
+        if content is not DELETE:
+            try:
+                canonical_bytes(content)
+            except (TypeError, ValueError) as exc:
+                return Result(Status.INVALID_INPUT,
+                              {"reason": "bad_content", "resource": resource,
+                               "error": type(exc).__name__})
         with self.lock_for(resource):
             ver = self.version(resource)
             acb.read_set[resource] = ver
             acb.base_version[resource] = ver
             acb.pre_image[resource] = self.content_hash(resource)
             acb.staged[resource] = copy.deepcopy(content)
+        return Result(Status.OK, {"resource": resource})
 
     # ---- 校验（文档 §5.4） ----------------------------------------
     def prepare(self, acb, w: Write, lease, mode: Mode) -> Result:
@@ -247,12 +318,21 @@ class WorkspaceManager:
 
     # ---- 投影（文档 §5.6） ----------------------------------------
     def _apply_locked(self, acb, w: Write, blob_hash: str, prev_hash: str,
-                      deleted: bool = False) -> None:
-        """只做投影（manifest + 可选 link）+ 前像记录；不取锁（调用方已持）。"""
+                      deleted: bool = False, *, version_after: int | None = None) -> None:
+        """只做投影（manifest + 可选 link）+ 前像记录；不取锁（调用方已持）。
+
+        `version_after` 由调用方传入（与 `RESOURCE_COMMITTED` 同一次
+        `_effective_version` 结果，S9 §2.3.9）；传入时 assert 与实际计算一致。
+        版本以**事件日志水位**为准（P0-1③）：`manifest` 可能因「append 后、
+        投影前崩溃」而落后，若只看内存 manifest 会与既有事件撞版本。
+        """
         cur = self.manifest.get(w.resource)
-        base_version = max(cur.version if cur is not None else 0,
-                           self._tombstones.get(w.resource, 0))
-        new_version = self._next_version(w.resource)
+        new_version = self._effective_version(w.resource)
+        if version_after is not None:
+            assert new_version == version_after, (new_version, version_after)
+        else:
+            version_after = new_version
+        base_version = version_after - 1
         if deleted:                                   # Delete 哨兵：删除并写 tombstone
             self.manifest.pop(w.resource, None)
             self._tombstones[w.resource] = new_version
@@ -295,11 +375,28 @@ class WorkspaceManager:
             return False                              # 旧格式事件：跳过
         if version <= guard:
             return False                              # 版本未推进（含已删资源）：忽略，防复活
-        if not self._blobs.exists(blob_hash):
-            return False                              # 当前 blob 不存在：跳过
+        # P2：必须校验内容哈希（坏盘/位翻转不得静默改变内容）。
+        #   - 缺失（KeyError/FileNotFoundError）或损坏（BlobCorrupt，位翻转/坏盘）
+        #     → 隔离该资源（记入 `isolated_resources`，不再静默跳过 / 不再冒泡打挂启动）；
+        #   - `BlobCorrupt` 继承 `Exception`（非 KeyError/FileNotFoundError），必须显式捕获，
+        #     否则单个 bit-flip 会让 `WorkspaceManager.__init__` → `Harness.__init__` 直接抛，
+        #     整个 recover/启动失败（P1-A）。
+        try:
+            self._blobs.get(blob_hash)
+        except (KeyError, FileNotFoundError, BlobCorrupt):
+            self.isolated_resources.add(resource)
+            return False
         # D-6：前像重建 —— 上一版本的 blob 就是 version-1 的内容
-        if prev_hash and self._blobs.exists(prev_hash):
-            self._versions.record(resource, version - 1, self._decode(prev_hash))
+        if prev_hash:
+            try:
+                self._blobs.get(prev_hash)
+            except (KeyError, FileNotFoundError, BlobCorrupt):
+                # 前像损坏/缺失 → 3-way merge 的 base 不可信，同样隔离该资源
+                self.isolated_resources.add(resource)
+                return False
+            else:
+                self._versions.record(resource, version - 1,
+                                      self._decode(prev_hash))
         self.manifest[resource] = ManifestEntry(
             version=version, blob_hash=blob_hash, prev_hash=prev_hash)
         self._tombstones.pop(resource, None)         # 重建：清墓碑

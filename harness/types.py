@@ -71,6 +71,14 @@ def ok(detail: Optional[dict] = None) -> Result:
     return Result(Status.OK, detail or {})
 
 
+class ReceiptConflict(RuntimeError):
+    """收据 `receipt_id` 冲突：同一 scope 已签发过相同收据（P0-3）。
+
+    继续 append 会产出重复 `receipt_id`，使 `verify_receipts` **永久**为 False；
+    因此 `commit_batch` 在 append 前断言并抛出本异常，由 runtime 隔离该 scope。
+    """
+
+
 class Mode(str, Enum):
     """提交模式（文档 §5.4）。"""
     COMMIT = "COMMIT"
@@ -89,6 +97,7 @@ class EventKind(str, Enum):
     COMPENSATION_ENTRY = "COMPENSATION_ENTRY"
     COMPENSATION_STATE = "COMPENSATION_STATE"
     RESOURCE_COMMITTED = "RESOURCE_COMMITTED"
+    RECEIPT_ISSUED = "RECEIPT_ISSUED"
     COMPENSATION_STARTED = "COMPENSATION_STARTED"
     COMPENSATION_DONE = "COMPENSATION_DONE"
     COMPENSATION_FAILED = "COMPENSATION_FAILED"
@@ -277,6 +286,7 @@ class ACB:
     staged: dict = field(default_factory=dict)
     pre_image: dict = field(default_factory=dict)   # resource -> 前像 blob hash（供补偿）
     materialized: dict = field(default_factory=dict)
+    materialized_watermark: int = 0   # 物化快照覆盖到的事件水位（P1-7：跳 floor 的前提）
     cursor: int = 0
     subscriptions: set = field(default_factory=set)
     event_log: list = field(default_factory=list)

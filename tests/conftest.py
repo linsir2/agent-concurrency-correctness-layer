@@ -20,7 +20,8 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
                  toolgw=None, compensate_crash_at=None,
                  auth_secret: str | None = None,
                  auth_gc_every: int = 256, gc_every: int = 1000,
-                 tombstone_ttl_s: float = 86400.0) -> Harness:
+                 tombstone_ttl_s: float = 86400.0,
+                 checkpoints=None, checkpoint_root=None) -> Harness:
     """默认 Harness + 通配能力 token（D13：deny-by-default 下的测试夹具）。
 
     安全用例必须用**不装 default_token** 的 `Harness()` 自行断言拒绝。
@@ -38,7 +39,8 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
     """
     h = Harness(run_limits=run_limits, clock=clock, blobs=blobs,
                 auth_secret=auth_secret, auth_gc_every=auth_gc_every,
-                gc_every=gc_every, tombstone_ttl_s=tombstone_ttl_s)
+                gc_every=gc_every, tombstone_ttl_s=tombstone_ttl_s,
+                checkpoints=checkpoints, checkpoint_root=checkpoint_root)
     if probe is not None:
         h.effects._probe = probe
     if toolgw is not None:

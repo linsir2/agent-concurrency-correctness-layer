@@ -89,6 +89,20 @@ class DeleteResource:
     def __repr__(self) -> str:  # pragma: no cover - 仅用于调试展示
         return "DELETE"
 
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo=None):
+        return self
+
+    def __reduce__(self):
+        # pickle 往返必须回到模块级单例（不能新建实例）
+        return (_delete_singleton, ())
+
+
+def _delete_singleton() -> "DeleteResource":
+    return DELETE
+
 
 DELETE = DeleteResource()
 

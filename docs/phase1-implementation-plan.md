@@ -768,6 +768,8 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S6** | ✅ 完成（2026-10-27） | `_do_action` 注册表（归一化+异常映射）、`guard` 谓词列表 + `_renew_or_fail` 三态、事件游标真水位、snapshot 补字段、`edges` 前驱闸门 + 环检测、`_drain_scheduler` 真消费（防递归）、U1×2/U2/U4 去假绿、10 条不变量 E2E | **123 passed**（+32，连跑 10 轮稳定）；`-m ms4`→16、`-m e2e`→10；实现后评审修 1 高 + 4 中 + 6 低；详见 [S6 方案 v1.2](s6-runtime-and-e2e.md) §12 |
 | **S7** | ✅ 完成（2026-10-27） | `bench/`（workloads/conditions/metrics/run_bench/report）三条件×四负载 + 外部差分度量 + 二级指标 + 环境信息与测量局限 | 基准可运行（n≥30）；C2 主终点成立；离散指标确定性（48 项方差 0）；详见 [S7 方案 v1.2](s7-benchmark-and-coverage.md) §10 |
 | **S8** | ✅ 完成（2026-10-27） | 覆盖率分模块阈值落地（`fail_under=80` + `scripts/check_coverage.py`）、补 `recover(COMPENSATE)`/resolver/`_restore_path` 三缺口、S8-1..S8-4 补强、`budget.gc` 接上 + `check_invariants` 加锁 | **152 passed**；整体 **83.89%**、budget 95.88%；**评审发现并修复真缺陷 K-28**（C1 静默丢写，残值归零） |
+| **S9** | ✅ 完成（2026-10-27） | K-25（`CrashInjected(BaseException)` + probe 不吞）+ K-26（`retention` 安全语义）+ K-24（`commit_batch` 同帧收据链 + `commit_key` 去重 + scope 锁）+ K-30（`FileCheckpointStore`：信封/codec/双层锁/唯一 ref/损坏隔离）+ 跨进程恢复 + 四阶段 SIGKILL | **214 passed**；覆盖率 **84.69%**；三轮对抗评审修 **2 P0（静默丢写）+ 6 P1 + 11 P2/P3**；详见 [S9 方案 v1.2](s9-persistence-and-receipts.md) §8 |
+| S10 | ⏳ 待开工 | MS9 跨进程预算对账、egress gateway 下沉、跨进程 scope 锁（K-34） | — |
 
 **S0–S4 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。

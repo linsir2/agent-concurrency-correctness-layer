@@ -11,6 +11,7 @@ from conftest import admit, decision, finish, make_harness, seed
 from harness import (
     ACB,
     Action,
+    CheckpointStore,
     EventKind,
     ManualClock,
     Result,
@@ -148,8 +149,13 @@ def test_guard_renew_or_fail_three_states():
 
 # ---------------------------------------------------------------- event_cursor
 def test_event_cursor_materialized_on_save_and_recover():
-    """§2.3：save 写 materialized_cursor；recover 优先用它，旧格式回退 cursor。"""
-    h = make_harness()
+    """§2.3：save 写 materialized_cursor；recover 优先用它，旧格式回退 cursor。
+
+    S9c：本用例直接改 `_store` —— 显式使用**内存版** `CheckpointStore`
+    （文件版不允许缓存篡改，`load_strict` 会绕过缓存）。
+    """
+    h = make_harness(checkpoints=CheckpointStore())
+    assert type(h.checkpoints) is CheckpointStore
     acb = ACB(id="A-C", run_id="C", task_id="T")
     for i in range(3):
         h.event_log.append(EventKind.TASK_COMPLETED, f"x{i}", {})
@@ -166,7 +172,8 @@ def test_event_cursor_materialized_on_save_and_recover():
     recovered = h.recover(ref)
     assert recovered.cursor == 2
 
-    h2 = make_harness()
+    h2 = make_harness(checkpoints=CheckpointStore())
+    assert type(h2.checkpoints) is CheckpointStore
     ref2 = h2.checkpoints.save(ACB(id="A-C2", run_id="C2", task_id="T2"))
     stored2 = h2.checkpoints._store[ref2]
     stored2.pop("materialized_cursor")

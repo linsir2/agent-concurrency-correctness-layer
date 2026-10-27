@@ -15,12 +15,14 @@ from typing import Any
 
 from .rebase import (MISSING, MergeResult, _kind, _merge_object, _strict_eq,
                      merge3)
+from .spec.receipt import GENESIS_HASH
 from .types import (
     ACB,
     Action,
     Decision,
     EventKind,
     Mode,
+    ReceiptConflict,
     Result,
     Status,
     TaskState,
@@ -91,6 +93,9 @@ class AgentRuntime:
                         return Status.GUARD_VIOLATION
 
                 st = self._do_action(acb, action, i)
+                if acb.state is TaskState.QUARANTINED:
+                    # P0-3：收据冲突等已隔离 → 直接返回，不改状态、不覆盖 failure
+                    return st
                 if st in (Status.OK, Status.VALID):      # D13b：本 turn 有进展
                     progressed = True
                 if st in (Status.CANCELLED, Status.APPROVAL_TIMEOUT):
@@ -135,7 +140,18 @@ class AgentRuntime:
                     acb.aging_deadline = self.h.clock.now_ms()   # D13b：到达 aging_max 设定期限
 
         acb.state = TaskState.DONE
-        self.h.event_log.append(EventKind.TASK_COMPLETED, acb.task_id, {}, producer=acb.id)
+        # S9 §2.3.7：TASK_COMPLETED 作 head 锚点（run_id/receipt_head/receipt_count）
+        scope = (acb.run_id, acb.logical_subgoal_id)
+        receipt_head = self.h._receipt_heads.get(scope, GENESIS_HASH)
+        receipt_count = len(self.h.receipts_of(acb.run_id, acb.logical_subgoal_id))
+        plan = self.h.plans.get(acb.run_id)
+        if plan is not None:                # 非权威镜像（plan 不持久化）
+            plan.setdefault("receipt_heads", {})[acb.logical_subgoal_id] = receipt_head
+        self.h.event_log.append(
+            EventKind.TASK_COMPLETED, acb.task_id,
+            {"run_id": acb.run_id, "receipt_head": receipt_head,
+             "receipt_count": receipt_count},
+            producer=acb.id, run_id=acb.run_id)
         self.h.checkpoints.save(acb)
         return Status.OK
 
@@ -178,6 +194,10 @@ class AgentRuntime:
             return Result(Status.INVALID_INPUT, {"reason": "unknown_action"})
         try:
             out = fn(self, acb, action, i)
+        except ReceiptConflict:
+            # P0-3：收据冲突 → 隔离该 scope（不得继续 append，否则链永久坏）
+            self._quarantine(acb, "RECEIPT_CONFLICT")
+            return Result(Status.SEMANTIC_REJECTED, {"reason": "receipt_conflict"})
         except Exception as e:  # noqa: BLE001  # §2.1：异常映射到 Result，不穿透
             return Result(Status.UPSTREAM_FAILED, {"reason": type(e).__name__})
         if isinstance(out, Result):
@@ -189,7 +209,9 @@ class AgentRuntime:
     # ---- 动作处理器（§2.1，逐个对应原 if/elif 分支）-----------------
     @register_action("stage")
     def _action_stage(self, acb: ACB, action: Action, i: int) -> Result:
-        self.h.workspace.stage(acb, action.resource, action.content)
+        res = self.h.workspace.stage(acb, action.resource, action.content)
+        if res != Status.OK:                  # P1-5：非法内容在暂存边界就 fail-fast
+            return res
         acb.subscriptions.add(action.resource)
         self.h.subscriptions.add(acb.id, action.resource)   # 读即订阅（文档 §5.6）
         return ok()
@@ -645,8 +667,16 @@ def _validate_resolution(resolved: Any, mr: MergeResult, base: Any,
     return True
 
 
-class CrashInjected(Exception):
-    def __init__(self, turn_seq: int, action_index: int) -> None:
+class CrashInjected(BaseException):
+    """故障注入用的「进程崩溃」替身（S9 §2.1 / K-25）。
+
+    继承 `BaseException` 而**不是** `Exception`：让 `except Exception` 的
+    降级路径（异常映射 / notify 吞异常）挡不住它，从而真实穿透到测试夹具。
+    注意它**不是**真正的进程崩溃 —— `finally` 仍会执行，故 SIGKILL 语义
+    必须走子进程（见 §2.1 注）。
+    """
+
+    def __init__(self, turn_seq: int = 0, action_index: int = 0) -> None:
         super().__init__(f"crash at turn={turn_seq} action={action_index}")
         self.turn_seq = turn_seq
         self.action_index = action_index

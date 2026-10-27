@@ -17,6 +17,7 @@
 
 from .types import (
     Resource, Lease, Event, ACB, Write, Decision, Action, Result,
+    ReceiptConflict,
     Status, Mode, EventKind, TaskState, RunState, TASK_TERMINAL, RUN_TERMINAL,
     TRANSITIONS, advance,
 )
@@ -25,7 +26,8 @@ from .event_log import EventLog, WalEventLog
 from .intent_registry import IntentRegistry
 from .workspace import WorkspaceManager, WorkspaceVersionStore
 from .budget import BudgetManager, InvariantError, Reservation
-from .checkpoint import CheckpointStore, EffectJournal, EffectEntry
+from .checkpoint import (CheckpointCorrupt, CheckpointStore, EffectEntry,
+                         EffectJournal, FileCheckpointStore)
 from .compensation import CompensationJournal, CompEntry
 from .subscription import SubscriptionRegistry
 from .policy import CapabilityToken, PolicyEngine
@@ -40,12 +42,13 @@ from .rebase import (MISSING, DELETE, Conflict, MergePolicy, MergeResult, merge3
 
 __all__ = [
     "Resource", "Lease", "Event", "ACB", "Write", "Decision", "Action",
-    "Result", "Reservation",
+    "Result", "Reservation", "ReceiptConflict",
     "Status", "Mode", "EventKind", "TaskState", "RunState",
     "TASK_TERMINAL", "RUN_TERMINAL", "TRANSITIONS", "advance",
     "Clock", "SystemClock", "ManualClock",
     "EventLog", "WalEventLog", "IntentRegistry", "WorkspaceManager", "WorkspaceVersionStore",
-    "BudgetManager", "CheckpointStore", "EffectJournal", "EffectEntry",
+    "BudgetManager", "CheckpointStore", "CheckpointCorrupt",
+    "FileCheckpointStore", "EffectJournal", "EffectEntry",
     "CompensationJournal", "CompEntry",
     "SubscriptionRegistry",
     "PolicyEngine", "CapabilityToken", "Signer", "MissingSecret",

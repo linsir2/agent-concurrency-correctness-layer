@@ -1,7 +1,7 @@
 """不变量 E2E（S6 §4）：全部串行确定性构造，断言落在事件日志 / 持久化字段 / 账本。
 
-覆盖 I1/I2/I3/I5/I6/I8/I9/I10/I12 与 I4/I7/I11 补强。
-I13（收据链）在 `run_task` 路径不产生 `Receipt` → 本套件不纳入（K-24）。
+覆盖 I1/I2/I3/I5/I6/I8/I9/I10/I12/I13 与 I4/I7/I11 补强。
+I13（收据链）在 S9b 起由 `commit_batch` 生产路径生成（K-24），纳入本套件。
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import pytest
 from conftest import admit, commit, decision, finish, make_harness, seed, stage, tool
 
 from harness import TASK_TERMINAL, EventKind, Harness, Mode, Status, TaskState, Write
+from harness.spec.receipt import receipt_hash
 
 pytestmark = pytest.mark.e2e
 
@@ -201,6 +202,35 @@ def test_i12_nonterminal_task_not_finalized():
     assert t2.budget_node is not None
     assert t2.budget_node.node_id in h.budget._nodes
     assert t2.id in h.slots.active_keys()
+
+
+# ---------------------------------------------------------------- I13
+def test_i13_receipts_from_production_path():
+    """I13：`commit_batch` 生产路径签发收据链，可离线验证，且 head 锚点匹配。"""
+    h = make_harness(auth_secret="s3cr3t")
+    seed(h, "r", {"v": 0})
+    plan = h.planner.plan("I13", [{"task_id": "T1", "contingent": ["r"]}])
+    h.plans["I13"] = plan
+    acb = h.dispatch_and_run(
+        plan, "T1", [decision(1, stage("r", {"v": 1}), commit("r"))])
+    assert acb.state is TaskState.DONE
+
+    subgoal = acb.logical_subgoal_id
+    receipts = h.receipts_of("I13", subgoal)
+    assert receipts, "生产路径必须产生收据"
+    assert all(r.signed for r in receipts)
+    assert h.verify_receipts("I13", subgoal) is True
+    assert h.verify_receipts("I13") is True
+
+    completed = next(e for e in h.event_log.all()
+                     if e.kind == EventKind.TASK_COMPLETED and e.subject == "T1")
+    head = completed.payload["receipt_head"]
+    assert completed.payload["run_id"] == "I13"
+    assert completed.payload["receipt_count"] == len(receipts)
+    assert head == receipt_hash(receipts[-1])
+    # plan 镜像（非权威）与 EventLog 链尾一致
+    assert plan["receipt_heads"][subgoal] == head
+    assert h._receipt_heads[("I13", subgoal)] == head
 
 
 # ---------------------------------------------------------------- I4/I7/I11

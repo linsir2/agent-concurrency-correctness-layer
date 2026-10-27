@@ -29,6 +29,7 @@ from harness import (
     EventKind,
     Harness,
     ManualClock,
+    Mode,
     Status,
     TaskState,
     Write,
@@ -37,6 +38,7 @@ from harness import (
 from harness import runtime as runtime_module
 from harness.event_log import WalEventLog
 from harness.runtime import CrashInjected, _validate_resolution
+from harness.storage.blob import canonical_bytes, sha256_hex
 
 
 # ================================================================ A. §4.2 高价值缺口
@@ -430,7 +432,22 @@ from hypothesis.stateful import (
 
 
 class _S8_2InterleaveMachine(RuleBasedStateMachine):
-    """S8-2：RuleBasedStateMachine 跑 commit_batch 交错 → I1 / I5 / I7 不变量。"""
+    """S8-2：RuleBasedStateMachine 跑 commit_batch 交错 → I1 / I5 / I7 不变量。
+
+    **P2-9 判定（断言变更是否削弱）**：改动**合理**，不是削弱。
+    - 原断言 `version == v0 + ok_count` 在「同内容重提交按内容去重」语义下
+      **不可能成立**：`commit_batch` 对同内容重提交返回 `OK` 且 `dedup=True`，
+      `ok_count` 自增 1 而版本不变 → 等式必然被破坏（只要机器产生一次 dedup）。
+      故原断言不是「更强」，而是**与语义矛盾**（会在合法 dedup 上误报失败）。
+    - 新断言 `version == v0 + ok_count − dedup_count` 是**精确等式**：每个 OK
+      提交要么推进版本（非 dedup），要么命中 dedup（幂等不推进）。
+    - 为杜绝「随便返回 OK」（把新内容误判为 dedup 也能满足等式），额外用
+      `_assert_genuine_dedup` 校验命中事件的 `(run_id, logical_subgoal_id,
+      resource, mode, deleted)` 与当前 acb 一致 —— 而不是「hash ∈ 全局集合」。
+      仅断言后者会**漏报跨 subgoal 去重**（a/b 共用资源 r、subgoal 不同：
+      若实现漏掉 subgoal 分量，b 会误判 dedup，而 hash 确实在全局集合里 → 两条
+      断言同时通过，测试漏报）。
+    """
 
     def __init__(self):
         super().__init__()
@@ -439,6 +456,7 @@ class _S8_2InterleaveMachine(RuleBasedStateMachine):
         self.a = None
         self.b = None
         self.ok_count = 0
+        self.dedup_count = 0
 
     @initialize()
     def _init_state(self):
@@ -461,13 +479,60 @@ class _S8_2InterleaveMachine(RuleBasedStateMachine):
 
     @rule()
     def commit_a(self):
-        if self.h.commit_batch(self.a, [Write("r")]) == Status.OK:
+        staged = copy.deepcopy(self.a.staged.get("r"))
+        st = self.h.commit_batch(self.a, [Write("r")])
+        if st == Status.OK:
             self.ok_count += 1
+            if st.detail.get("dedup") is True:
+                self.dedup_count += 1
+                self._assert_genuine_dedup(self.a, staged)
 
     @rule()
     def commit_b(self):
-        if self.h.commit_batch(self.b, [Write("r")]) == Status.OK:
+        staged = copy.deepcopy(self.b.staged.get("r"))
+        st = self.h.commit_batch(self.b, [Write("r")])
+        if st == Status.OK:
             self.ok_count += 1
+            if st.detail.get("dedup") is True:
+                self.dedup_count += 1
+                self._assert_genuine_dedup(self.b, staged)
+
+    def _assert_genuine_dedup(self, acb, staged) -> None:
+        """P2-9 强化：dedup 必须命中「与当前 acb 同 scope 的提交事件」。
+
+        仅断言 `version == v0 + ok_count − dedup_count` 会让 dedup 成为
+        「随便返回 OK」的合法出口（把新内容误判为 dedup 也能满足等式）。
+        旧判据「`content_hash ∈ 全局已提交 hash`」**不足以**堵住：若实现漏掉
+        subgoal 分量，跨 subgoal 的误判 dedup 也会通过（hash 确实在全局集合里）
+        → 测试漏报（P2-D）。
+
+        新判据要求命中事件的 `(run_id, logical_subgoal_id, resource, mode,
+        deleted)` 与当前 acb 一致，且其 `version` 就是该资源的最新版本
+        （`_effective_version`，即 dedup 只能命中最新提交，P1-B 的镜像断言）。
+        """
+        assert staged is not None, "dedup 命中时 staged 不得为空"
+        resource = "r"
+        blob_hash = sha256_hex(canonical_bytes(staged))
+        matched = [
+            ev for ev in self.h.event_log.all()
+            if ev.kind == EventKind.RESOURCE_COMMITTED
+            and ev.run_id == acb.run_id
+            and (ev.payload or {}).get("logical_subgoal_id", "") == acb.logical_subgoal_id
+            and (ev.payload or {}).get("resource") == resource
+            and (ev.payload or {}).get("mode", Mode.COMMIT.value) == Mode.COMMIT.value
+            and bool((ev.payload or {}).get("deleted", False)) is False
+            and (ev.payload or {}).get("blob_hash", "") == blob_hash
+        ]
+        assert matched, (
+            "dedup 必须命中与当前 acb 同 scope 的提交事件："
+            f"run={acb.run_id!r} subgoal={acb.logical_subgoal_id!r} "
+            f"resource={resource!r} mode={Mode.COMMIT.value}"
+        )
+        latest_version = self.h.workspace._effective_version(resource)
+        assert all(
+            int((ev.payload or {}).get("version", 0) or 0) == latest_version
+            for ev in matched
+        ), "dedup 命中事件必须是该资源的最新版本（不得命中陈旧提交）"
 
     @rule()
     def tool_idempotent(self):
@@ -483,7 +548,9 @@ class _S8_2InterleaveMachine(RuleBasedStateMachine):
 
     @invariant()
     def i1_single_writer_version(self):
-        assert self.h.workspace.version("r") == self.v0 + self.ok_count
+        # 每个 OK 提交要么推进版本、要么命中 dedup（幂等不推进）→ 严格等式
+        # （`ok_count >= dedup_count` 由等式蕴含，冗余，已删；见 P3-G）
+        assert self.h.workspace.version("r") == self.v0 + self.ok_count - self.dedup_count
 
     @invariant()
     def i5_budget_conserved(self):

@@ -14,7 +14,8 @@ import copy
 import itertools
 import threading
 
-from .types import ACB, EventKind, Mode, Status, TaskState, Write
+from .types import ACB, EventKind, Status, TaskState
+from .storage.blob import canonical_bytes
 
 
 def _normalize_required(t) -> dict:
@@ -57,6 +58,35 @@ def _has_cycle(edges) -> bool:
         return False
 
     return any(color.get(n, 0) == 0 and visit(n) for n in list(adj))
+
+
+def _admission_input_error(task) -> str | None:
+    """准入输入 fail-fast 校验（P1-5）：返回 `None` 表示通过，否则为原因。
+
+    用户内容（`merge_policy` / `logical_deps`）必须在**准入边界**通过严格 codec
+    校验；否则非法内容会一路带到 commit（UPSTREAM_FAILED）与 `_finalize` 落盘
+    （codec 再抛 → 穿透 run → 槽位/预算结算被跳过）。
+    """
+    if not isinstance(task, dict):
+        return "task_not_dict"
+    footprint = task.get("footprint")
+    if not isinstance(footprint, dict):
+        return "footprint_not_dict"
+    for key in ("task_id", "logical_subgoal_id"):
+        if not isinstance(task.get(key), str):
+            return f"bad_{key}"
+    min_budget = footprint.get("min_budget")
+    if isinstance(min_budget, bool) or not isinstance(min_budget, int) or min_budget < 0:
+        return "bad_min_budget"
+    try:
+        canonical_bytes(task.get("merge_policy") or {})
+        deps = footprint.get("logical_deps") or []
+        if not isinstance(deps, list):
+            return "bad_logical_deps"
+        canonical_bytes(deps)
+    except (TypeError, ValueError):
+        return "bad_task_content"
+    return None
 
 
 class Planner:
@@ -231,6 +261,12 @@ class Dispatcher:
         if token is not None:                 # 显式 token 绑定到 ACB（§5.9）
             acb.capability = token
 
+        # P1-5：准入输入 fail-fast（不占槽位、不留残留）
+        input_error = _admission_input_error(task)
+        if input_error is not None:
+            acb.spec["admission_error"] = input_error
+            return self._deny(acb, "INVALID_INPUT")
+
         eff_plan = plan if plan is not None else self.h.plans.get(run_id)
         if eff_plan is not None and not self._predecessors_done(eff_plan, task["task_id"]):
             return self._deny(acb, "PREDECESSOR_NOT_DONE")
@@ -280,7 +316,13 @@ class Dispatcher:
                 self._rollback(acb, node, resv, declared)
 
     def _rollback(self, acb: ACB, node, resv, declared: list[str]) -> None:
-        """逆序撤销（逻辑 → 预留 → 节点 → 槽位）；不吞原异常。"""
+        """逆序撤销（逻辑 → 预留 → 节点 → 槽位）；不吞原异常。
+
+        S9 §2.1 边界（K-25）：这里**保持** `except Exception` 而非
+        `CrashInjected`/`BaseException` —— 回滚链必须跑完，注入的崩溃
+        不得中断「逻辑撤销 → 预留释放 → 节点移除 → 槽位释放」。真正的
+        进程崩溃（SIGKILL）由子进程用例覆盖，不靠本函数的异常语义。
+        """
         for dep_id in declared:
             try:
                 self.h.intents.undeclare_logical(dep_id, acb.id)

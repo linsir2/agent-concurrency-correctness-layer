@@ -11,12 +11,13 @@
 from .resources import RESOURCE_KINDS, ResourceKind, ResourceSpec, resource_kind
 from .protocol import Grant, Wait, Die, decide
 from .receipt import (GENESIS_HASH, Receipt, build_receipt, receipt_hash,
-                      verify_chain)
+                      verify_chain, verify_chain_detailed)
 from .invariants import INVARIANTS, INVARIANT_IDS
 
 __all__ = [
     "RESOURCE_KINDS", "ResourceKind", "ResourceSpec", "resource_kind",
     "Grant", "Wait", "Die", "decide",
     "GENESIS_HASH", "Receipt", "build_receipt", "receipt_hash", "verify_chain",
+    "verify_chain_detailed",
     "INVARIANTS", "INVARIANT_IDS",
 ]

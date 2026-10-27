@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 
 from .auth import Signer
 from .budget import BudgetManager, InvariantError, Reservation
-from .checkpoint import CheckpointStore, EffectJournal
+from .checkpoint import (CheckpointCorrupt, CheckpointStore, EffectJournal,
+                         FileCheckpointStore)
 from .clock import SystemClock
 from .compensation import CompensationJournal
 from .context import ContextAssembler
@@ -20,11 +22,14 @@ from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
                             RunCoordinator, Scheduler, SlotTracker)
 from .policy import PolicyEngine
 from .resolver import ScriptedResolver
-from .runtime import AgentRuntime
+from .runtime import AgentRuntime, CrashInjected
+from .spec.receipt import (GENESIS_HASH, Receipt, ReceiptMalformed,
+                           build_receipt, receipt_hash, verify_chain_detailed)
 from .subscription import SubscriptionRegistry
-from .types import (ACB, TASK_TERMINAL, EventKind, Mode, Result, Status,
-                    TaskState, Write, advance)
 from .storage.blob import InMemoryBlobStore, canonical_bytes
+from .storage.codec import CodecError
+from .types import (ACB, TASK_TERMINAL, EventKind, Mode, ReceiptConflict, Result,
+                    Status, TaskState, Write, advance)
 from .workspace import WorkspaceManager, WorkspaceVersionStore
 from .rebase import DELETE
 
@@ -49,7 +54,9 @@ class Harness:
                  tombstone_ttl_s: float = 86400.0,
                  auth_gc_every: int = 256,
                  gc_every: int = 1000,
-                 per_action_delay: float = 0.0) -> None:
+                 per_action_delay: float = 0.0,
+                 receipts_enabled: bool = True,
+                 checkpoint_root=None) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -70,9 +77,11 @@ class Harness:
                                                 lock_timeout_s=lock_timeout_s))
         self.budget = (budget if budget is not None
                        else BudgetManager(run_limits, tombstone_ttl_s=tombstone_ttl_s))
-        self.checkpoints = checkpoints if checkpoints is not None else CheckpointStore()
-        if hasattr(self.checkpoints, "event_log"):      # §2.4：注入全局水位源
-            self.checkpoints.event_log = self.event_log
+        self.checkpoints = (checkpoints if checkpoints is not None
+                            else (FileCheckpointStore(checkpoint_root)
+                                  if checkpoint_root is not None
+                                  else CheckpointStore()))
+        self.checkpoints.event_log = self.event_log      # §2.4：无条件注入全局水位源
         self.effects = (effects if effects is not None
                         else EffectJournal(self.event_log))
         self.comp_journal = CompensationJournal(self.event_log)
@@ -110,8 +119,328 @@ class Harness:
         self.plans: dict[str, dict] = {}
         self.acbs: dict[str, ACB] = {}
         self._lock = threading.RLock()
+        # S9 §2.3：收据链（每 scope 一把 RLock；head/id 由 EventLog 重建）
+        self.receipts_enabled = receipts_enabled
+        # 锁序写死：resource → scope → eventlog（docs s9 §2.3.5）。
+        # **durable 模式为单写者**：`_scope_lock` 是**进程内** `threading.RLock`，
+        # 跨进程**不互斥**；`WalEventLog.append_batch` 的 `_lock` 同理。跨进程
+        # 多写者必须自行串行化（跨进程 scope 锁留 S10，本阶段不实现）。
+        self._scope_locks: dict[tuple[str, str], threading.RLock] = {}
+        self._receipt_heads: dict[tuple[str, str], str] = {}
+        self._receipt_ids: set[str] = set()
+        self._tainted_scopes: set[tuple[str, str]] = set()
+        self._malformed_receipts: list[dict] = []
+        self._rebuild_receipts()
 
         self.event_log.subscribe(self._on_event)
+
+    # ---- 收据链（S9 §2.3 / K-24） --------------------------------
+    def _rebuild_receipts(self) -> None:
+        """无条件从 EventLog 重建收据 head / id（不读 checkpoint 内存值）。
+
+        P2：按 scope 维护 running head，**校验链连续性** —— `prev_receipt_hash`
+        必须等于 running head 且 `receipt_id` 不重复；失败 → 该 scope 标
+        **tainted** 并拒绝继续扩展。否则已存在的重复/乱序收据会被静默折叠，
+        新收据继续接在坏 head 上 → `verify_receipts` 永远 False。
+        P2：畸形 payload（缺 `receipt_id`/`run_id`/`task_id`）→ 记入
+        `_malformed_receipts`，其 scope 标 tainted（**不得抛** → 单条坏事件
+        不得打挂 Harness 启动）。
+        """
+        heads: dict[tuple[str, str], str] = {}
+        ids: set[str] = set()
+        tainted: set[tuple[str, str]] = set()
+        running: dict[tuple[str, str], str] = {}
+        malformed: list[dict] = []
+        for ev in self.event_log.all():
+            if ev.kind != EventKind.RECEIPT_ISSUED:
+                continue
+            payload = ev.payload or {}
+            try:
+                receipt = Receipt.from_dict(payload)
+            except ReceiptMalformed as exc:
+                malformed.append({"seq": ev.seq, "error": str(exc),
+                                  "payload": payload})
+                scope = self._payload_scope(payload)
+                if scope is not None:
+                    tainted.add(scope)
+                continue
+            scope = (receipt.run_id, receipt.logical_subgoal_id)
+            if scope in tainted:
+                continue
+            if receipt.receipt_id in ids:            # 重复 receipt_id → 断链
+                tainted.add(scope)
+                continue
+            head = running.get(scope, GENESIS_HASH)
+            if receipt.prev_receipt_hash != head:    # 乱序/断链
+                tainted.add(scope)
+                continue
+            ids.add(receipt.receipt_id)
+            running[scope] = receipt_hash(receipt)
+            heads[scope] = running[scope]
+        self._receipt_heads = heads
+        self._receipt_ids = ids
+        self._tainted_scopes = tainted
+        self._malformed_receipts = malformed
+
+    @staticmethod
+    def _payload_scope(payload: dict) -> tuple[str, str] | None:
+        """从（可能畸形的）payload 尽力推断 scope（用于 tainted 标记）。"""
+        if not isinstance(payload, dict):
+            return None
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            return None
+        return (run_id, payload.get("logical_subgoal_id") or "")
+
+    def _scope_lock(self, scope: tuple[str, str]) -> threading.RLock:
+        """取（必要时创建）scope 锁；只护锁表，极短，不覆盖临界区。
+
+        **进程内锁**：跨进程不互斥 —— durable 模式按单写者使用（见 `__init__`）。
+        """
+        with self._lock:
+            lock = self._scope_locks.get(scope)
+            if lock is None:
+                lock = threading.RLock()
+                self._scope_locks[scope] = lock
+            return lock
+
+    def _receipt_secret(self) -> str:
+        """收据签名密钥来源：构造参数优先，否则读 env（开关独立于 secret 是否存在）。"""
+        if self._auth_secret:
+            return self._auth_secret
+        return os.environ.get("HARNESS_AUTH_SECRET", "")
+
+    @staticmethod
+    def _commit_key(acb: ACB, resource: str, content_hash: str, mode: Mode) -> str:
+        """同一逻辑提交恒等键（P0-2）：**不含 base_version**。
+
+        `base_version` 是「读到哪一版」的**状态**而非写的内容；刷新 ACB
+        （提交后重读）后它会变，若入键则同一逻辑写的重试去重失效，
+        导致重复提交 + 重复收据。
+        """
+        raw = (f"{acb.run_id}|{acb.logical_subgoal_id}|{resource}|"
+               f"{content_hash}|{mode.value}")
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _dedup_event(self, acb: ACB, resource: str, blob_hash: str,
+                     deleted: bool, mode: Mode):
+        """查找既有 `RESOURCE_COMMITTED`：同 (run, subgoal, resource, content, mode)。
+
+        P0-1②：必须校验已提交 `blob_hash` == 新内容 hash（含 DELETE 哨兵），
+        内容不同 → 返回 `None`（视为不同写，绝不允许短路）。
+
+        P1-B：dedup 只能命中该资源的**最新**提交 —— 命中事件的 `version` 必须等于
+        `workspace._effective_version(resource)`。否则说明该内容已被后续写覆盖，
+        命中它会把新写**静默丢弃**（返回 OK + dedup=True，但 version 与值都不变）。
+        反例：`r=A(v1) → r=A(v2) → r=B(v3) → 再写 A` 必须产生 v4=A，而不是命中 v2。
+        """
+        effective = self.workspace._effective_version(resource)
+        for ev in reversed(self.event_log.all()):
+            if ev.kind != EventKind.RESOURCE_COMMITTED:
+                continue
+            payload = ev.payload or {}
+            if payload.get("resource") != resource:
+                continue
+            if payload.get("mode", Mode.COMMIT.value) != mode.value:
+                continue
+            if ev.run_id != acb.run_id:
+                continue
+            if payload.get("logical_subgoal_id", "") != acb.logical_subgoal_id:
+                continue
+            if bool(payload.get("deleted", False)) != deleted:
+                continue
+            if payload.get("blob_hash", "") != blob_hash:
+                continue                      # 内容不同 → 不得短路（P0-1②）
+            try:
+                matched_version = int(payload.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                return None                   # 版本不可解析 → 视为新写（不猜）
+            if matched_version != effective:
+                return None                   # 命中的是陈旧版本 → 视为新写（P1-B）
+            return ev
+        return None
+
+    def _replay_dedup_events(self, dedup_events) -> None:
+        """P0-1①：把已提交但未投影的 `RESOURCE_COMMITTED` 补投影到 manifest。
+
+        用版本守卫投影（`_project_event`），既补上缺失投影，又不会把 manifest
+        回退到更旧的版本。
+        """
+        for ev in dedup_events:
+            if ev is not None:
+                self.workspace.apply_event(ev)
+
+    def _refresh_after_commit(self, acb: ACB, records) -> None:
+        """⑦′：自写后重读，刷新 ACB 的 read_set / base_version。"""
+        for w, _draft, _vb, _va, _ck in records:
+            new_version = self.workspace.version(w.resource)
+            acb.read_set[w.resource] = new_version
+            acb.base_version[w.resource] = new_version
+
+    def _receipt_event(self, receipt_id: str):
+        for ev in reversed(self.event_log.all()):
+            if ev.kind == EventKind.RECEIPT_ISSUED and ev.subject == receipt_id:
+                return ev
+        return None
+
+    def _receipt_is_stale(self, receipt_id: str) -> bool:
+        """该 `receipt_id` 对应的收据是否为「陈旧内容」收据（P1-B 后续）。
+
+        若资源当前版本已推进到比该收据 `version_after` 更新的位置，说明该内容
+        已被后续写覆盖 → 本次是**合法新写**（dedup 正确地未命中陈旧版本），
+        应换 receipt_id 而不是永久冲突。
+        """
+        ev = self._receipt_event(receipt_id)
+        if ev is None:
+            return False
+        try:
+            receipt = Receipt.from_dict(ev.payload or {})
+        except ReceiptMalformed:
+            return False
+        return self.workspace.version(receipt.resource) != receipt.version_after
+
+    def _derive_receipt_id(self, commit_key: str) -> str:
+        """为合法重写派生一个不冲突的 `receipt_id`（换 receipt_id，P2-C）。"""
+        n = 1
+        candidate = f"{commit_key}#{n}"
+        while candidate in self._receipt_ids:
+            n += 1
+            candidate = f"{commit_key}#{n}"
+        return candidate
+
+    def receipts_of(self, run_id: str, logical_subgoal_id: str | None = None
+                    ) -> list[Receipt]:
+        """按 seq 顺序返回某 run（可选 scope）的全部收据。
+
+        P2：畸形事件（缺必填字段）**跳过并记录**（记入 `_malformed_receipts`），
+        不再抛 `KeyError` —— 单条坏事件不得让验签/启动打挂。
+        """
+        out: list[Receipt] = []
+        for ev in self.event_log.all():
+            if ev.kind != EventKind.RECEIPT_ISSUED:
+                continue
+            payload = ev.payload or {}
+            if payload.get("run_id") != run_id:
+                continue
+            if (logical_subgoal_id is not None
+                    and payload.get("logical_subgoal_id") != logical_subgoal_id):
+                continue
+            try:
+                out.append(Receipt.from_dict(payload))
+            except ReceiptMalformed:
+                continue
+        return out
+
+    def verify_receipts(self, run_id: str,
+                        logical_subgoal_id: str | None = None) -> bool | None:
+        """离线验证该 run 的收据链（三态：`True` / `False` / `None`）。
+
+        链按 `(run_id, logical_subgoal_id)` 独立成链；未指定 scope 时逐链验证后
+        合并：任一 `False` → `False`；全部 `True` → `True`；否则 `None`。
+
+        P2：tainted scope（畸形/重复/断链）→ `False`（拒绝继续扩展坏链）。
+        """
+        receipts = self.receipts_of(run_id, logical_subgoal_id)
+        secret = self._receipt_secret()
+        if logical_subgoal_id is not None:
+            if (run_id, logical_subgoal_id) in self._tainted_scopes:
+                return False
+            return verify_chain_detailed(receipts, secret)
+        groups: dict[str, list[Receipt]] = {}
+        for receipt in receipts:
+            groups.setdefault(receipt.logical_subgoal_id, []).append(receipt)
+        results = []
+        for subgoal, chain in groups.items():
+            if (run_id, subgoal) in self._tainted_scopes:
+                results.append(False)
+            else:
+                results.append(verify_chain_detailed(chain, secret))
+        if not results or any(r is False for r in results):
+            return False
+        if all(r is True for r in results):
+            return True
+        return None
+
+    # ---- 收据冲突对账（P2-C） --------------------------------------
+    def _commit_event_for_receipt(self, receipt, run_id: str,
+                                  logical_subgoal_id: str):
+        """判断某收据是否有对应的 `RESOURCE_COMMITTED` 事件（对账用）。
+
+        匹配键：`run_id` + `logical_subgoal_id` + `resource` + `version_after`
+        （版本在资源内唯一，故可定位到唯一提交事件）。
+        """
+        for ev in self.event_log.all():
+            if ev.kind != EventKind.RESOURCE_COMMITTED:
+                continue
+            payload = ev.payload or {}
+            if ev.run_id != run_id:
+                continue
+            if payload.get("logical_subgoal_id", "") != logical_subgoal_id:
+                continue
+            if payload.get("resource") != receipt.resource:
+                continue
+            try:
+                version = int(payload.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if version == receipt.version_after:
+                return ev
+        return None
+
+    def reconcile_scope(self, run_id: str, logical_subgoal_id: str) -> Result:
+        """P2-C 显式对账入口：解除 `ReceiptConflict` 造成的 scope 隔离。
+
+        `ReceiptConflict` 的根因是「收据已签发（`receipt_id` 在 `_receipt_ids`），
+        但对应的 `RESOURCE_COMMITTED` 事件缺失」→ `_dedup_event` 失效 → 同逻辑写
+        **永久**冲突。本入口执行**补写丢失的 RESOURCE_COMMITTED**：
+
+        ① 对该 scope 的每条收据，若缺少对应的提交事件，且 workspace 的当前版本
+           恰好等于 `version_after`（内容未被后续写覆盖）→ 用 workspace 当前内容
+           补写一条提交事件（`prev_hash` 不可重建时留空，不影响去重/投影）；
+        ② 补写后重跑 `_rebuild_receipts`；若 scope 不再 tainted → 解除隔离；
+        ③ 无法补写（资源已被覆盖 / 内容不可重建）→ 保持隔离并返回
+           `NEEDS_RECONCILIATION`（需人工：换 receipt_id 或修复事件日志）。
+        """
+        scope = (run_id, logical_subgoal_id)
+        receipts = self.receipts_of(run_id, logical_subgoal_id)
+        missing = [r for r in receipts
+                   if self._commit_event_for_receipt(r, run_id,
+                                                     logical_subgoal_id) is None]
+        backfilled = 0
+        for r in missing:
+            current = self.workspace.version(r.resource)
+            blob_hash = self.workspace.content_hash(r.resource)
+            if current != r.version_after or not blob_hash:
+                # 无法补写 → **保持隔离**（不得因重建而丢失 taint）
+                self._tainted_scopes.add(scope)
+                return Result(Status.NEEDS_RECONCILIATION, {
+                    "scope": list(scope), "reason": "resource_overwritten",
+                    "resource": r.resource, "expected_version": r.version_after,
+                    "actual_version": current, "blob_hash": blob_hash,
+                    "hint": "需人工：换 receipt_id 或修复事件日志",
+                })
+            payload = {
+                "resource": r.resource, "version": r.version_after,
+                "mode": Mode.COMMIT.value,
+                "logical_subgoal_id": logical_subgoal_id,
+                "acb_id": "", "blob_hash": blob_hash, "prev_hash": "",
+                "diff": {"prev_hash": "", "current_hash": blob_hash},
+            }
+            ev = self.event_log.append(
+                EventKind.RESOURCE_COMMITTED, r.resource, payload,
+                producer="", run_id=run_id,
+                idempotency_key=f"reconcile:{run_id}:{logical_subgoal_id}:"
+                                f"{r.receipt_id}")
+            self.workspace.apply_event(ev)
+            backfilled += 1
+        self._rebuild_receipts()
+        if scope in self._tainted_scopes:
+            return Result(Status.NEEDS_RECONCILIATION, {
+                "scope": list(scope), "reason": "still_tainted",
+                "hint": "需人工：换 receipt_id 或修复事件日志",
+            })
+        return Result(Status.OK, {"scope": list(scope), "reconciled": True,
+                                  "backfilled": backfilled})
 
     # ---- 事件 → 订阅失效（文档 §5.6） ----------------------------
     def _on_event(self, ev) -> None:
@@ -178,6 +507,15 @@ class Harness:
             if contents[w.resource] is None:
                 return Result(Status.INVALID_INPUT,
                               {"reason": "none_content", "resource": w.resource})
+        for w in writes:                                           # ①′ 内容 fail-fast
+            if contents[w.resource] is DELETE:
+                continue
+            try:                                                   # P1-5：非法内容不得进临界区
+                canonical_bytes(contents[w.resource])
+            except (TypeError, ValueError) as exc:
+                return Result(Status.INVALID_INPUT,
+                              {"reason": "bad_content", "resource": w.resource,
+                               "error": type(exc).__name__})
 
         resources |= set(acb.read_set)                             # ③ 读集合一并持锁 → 原子复验
         leases: dict = {}
@@ -201,12 +539,17 @@ class Harness:
                     return r
 
             blob_hashes = {}                              # ④′ 内容先落盘（DELETE 跳过）
-            for w in writes:
-                if contents[w.resource] is DELETE:
-                    blob_hashes[w.resource] = ""
-                else:
-                    blob_hashes[w.resource] = self.blobs.put(
-                        canonical_bytes(contents[w.resource]))
+            try:
+                for w in writes:
+                    if contents[w.resource] is DELETE:
+                        blob_hashes[w.resource] = ""
+                    else:
+                        blob_hashes[w.resource] = self.blobs.put(
+                            canonical_bytes(contents[w.resource]))
+            except (CodecError, TypeError, ValueError) as exc:   # P1-5：编码失败 → INVALID_INPUT
+                return Result(Status.INVALID_INPUT,
+                              {"reason": "bad_content",
+                               "error": type(exc).__name__})
 
             for w in writes:                                       # ⑤ 提交点前复验租约
                 if not self.intents.is_valid(leases[w.resource]):
@@ -214,21 +557,115 @@ class Harness:
                                   {"resource": w.resource,
                                    "reason": "lease_expired_before_commit"})
 
-            drafts = [self._commit_record(acb, w, blob_hashes[w.resource],
-                                          contents[w.resource] is DELETE)
-                      for w in writes]
-            events = self.event_log.append_batch(drafts, notify=False)   # ⑥ 提交点
+            records = []
+            for w in writes:
+                draft, version_before, version_after = self._commit_record(
+                    acb, w, blob_hashes[w.resource],
+                    deleted=contents[w.resource] is DELETE, mode=mode)
+                commit_key = self._commit_key(acb, w.resource, blob_hashes[w.resource], mode)
+                records.append((w, draft, version_before, version_after, commit_key))
 
-            for w in writes:                                       # ⑦ 投影（可重放）
-                prev = (self.workspace.manifest[w.resource].blob_hash
-                        if w.resource in self.workspace.manifest else "")
-                self.workspace._apply_locked(acb, w, blob_hashes[w.resource], prev,
-                                             deleted=contents[w.resource] is DELETE)
-            for w in writes:                                       # ⑦′ 自写后重读：刷新 ACB 读版本
-                new_version = self.workspace.version(w.resource)
-                acb.read_set[w.resource] = new_version
-                acb.base_version[w.resource] = new_version
-            return Result(Status.OK, {"resources": sorted(blob_hashes), "seq": events[-1].seq})
+            scope = (acb.run_id, acb.logical_subgoal_id)
+            # scope 临界区**覆盖**「去重检查 → 读 head → 构造 drafts → append_batch」
+            # P2：去重检查**必须**在临界区内 —— 否则同 scope 跨资源场景下，去重判断
+            # 与 head/append 非原子（并发写各自判定「非去重」→ 重复提交 + 重复收据）。
+            with self._scope_lock(scope):                          # 锁序 resource → scope → eventlog
+                # 幂等短路（S9 §2.3.3 / P0-1②③）：逐写匹配既有提交事件
+                #   键 = (run_id, logical_subgoal_id, resource, content_hash, mode)，
+                #   且已提交 blob_hash 必须 == 新内容 hash（内容不同 → 不得短路）。
+                dedup_events = [self._dedup_event(acb, w.resource, blob_hashes[w.resource],
+                                                  contents[w.resource] is DELETE, mode)
+                                for w, _d, _vb, _va, _ck in records]
+                # P0-3：is_dedup **只**依据事件匹配；receipt_id 冲突由 append 前断言兜底
+                #（若这里也按 receipt_id 判 dedup，守卫将永不可达）。
+                is_dedup = [ev is not None for ev in dedup_events]
+
+                if all(is_dedup):
+                    # 全命中：必须**补投影**（P0-1①），再刷新读版本，最后返回 OK
+                    self._replay_dedup_events(dedup_events)
+                    self._refresh_after_commit(acb, records)
+                    return Result(Status.OK, {
+                        "resources": sorted(blob_hashes),
+                        "seq": self._last_committed_seq(dedup_events),
+                        "receipt_seq": self._last_receipt_seq(records),
+                        "dedup": True,
+                    })
+
+                # P0-3：逐写过滤——已去重的写只补投影，不生成 commit/receipt draft
+                to_append = [rec for rec, dedup in zip(records, is_dedup) if not dedup]
+
+                # P2：tainted scope（畸形/重复/断链）拒绝继续扩展（不得接在坏 head 上）
+                if scope in self._tainted_scopes:
+                    raise ReceiptConflict(
+                        f"scope 已隔离（tainted），拒绝扩展：{scope}")
+
+                head = self._receipt_heads.get(scope, GENESIS_HASH)
+                secret = self._receipt_secret()
+                drafts: list[dict] = []
+                issued: list[str] = []
+                for w, draft, version_before, version_after, commit_key in to_append:
+                    drafts.append(draft)
+                    if not self.receipts_enabled:
+                        continue
+                    # P0-3：append 前断言 receipt_id 不冲突
+                    if (commit_key in self._receipt_ids
+                            and self._receipt_is_stale(commit_key)):
+                        # P1-B 后续：同一内容被后续写覆盖后又写回 = **合法新写**
+                        # （dedup 正确地未命中陈旧版本）。此时资源版本已推进到比该
+                        # 收据 `version_after` 更新的位置 → 换 receipt_id（派生后缀），
+                        # 否则会永久 ReceiptConflict（P2-C）。
+                        commit_key = self._derive_receipt_id(commit_key)
+                    if commit_key in self._receipt_ids:
+                        # P2-C：冲突必须把 scope 加入 `_tainted_scopes`（否则重试同逻辑写
+                        # 会**永久** ReceiptConflict，跨进程/重启一样）。隔离后
+                        # `verify_receipts` 对该 scope 返回 False，且可由
+                        # `reconcile_scope` 显式对账解除。
+                        self._tainted_scopes.add(scope)
+                        raise ReceiptConflict(
+                            f"receipt_id 已签发：{commit_key}（scope={scope}）")
+                    receipt = build_receipt(
+                        receipt_id=commit_key, run_id=acb.run_id,
+                        task_id=acb.task_id,
+                        logical_subgoal_id=acb.logical_subgoal_id,
+                        resource=w.resource,
+                        version_before=version_before, version_after=version_after,
+                        prev_receipt_hash=head, secret=secret)
+                    drafts.append({
+                        "kind": EventKind.RECEIPT_ISSUED,
+                        "subject": receipt.receipt_id,     # subject 不能用 resource（§2.3.6）
+                        "payload": receipt.to_dict(),      # resource 放 payload
+                        "producer": acb.id,
+                        "run_id": acb.run_id,
+                        "idempotency_key": f"receipt:{receipt.receipt_id}",
+                    })
+                    head = receipt_hash(receipt)
+                    issued.append(receipt.receipt_id)
+                events = self.event_log.append_batch(drafts, notify=False)   # ⑥ 提交点
+                # ③ head 后置提交：append 成功后才改内存态
+                if self.receipts_enabled:
+                    self._receipt_heads[scope] = head
+                    self._receipt_ids.update(issued)
+
+            # ⑦ 投影（锁外，可重放）：去重写走版本守卫，新写走 _apply_locked
+            for (w, _d, _vb, version_after, _ck), ev in zip(records, dedup_events):
+                if ev is not None:
+                    self.workspace.apply_event(ev)                 # P0-1①：补投影
+                    continue
+                prev = self.workspace._current_blob_hash(w.resource)
+                self.workspace._apply_locked(
+                    acb, w, blob_hashes[w.resource], prev,
+                    deleted=contents[w.resource] is DELETE,
+                    version_after=version_after)
+            self._refresh_after_commit(acb, records)                  # ⑦′ 自写后重读
+            commit_seqs = [e.seq for e in events
+                           if e.kind == EventKind.RESOURCE_COMMITTED]
+            receipt_seqs = [e.seq for e in events
+                            if e.kind == EventKind.RECEIPT_ISSUED]
+            return Result(Status.OK, {
+                "resources": sorted(blob_hashes),
+                "seq": commit_seqs[-1],                  # 保持最后一条 RESOURCE_COMMITTED 的 seq
+                "receipt_seq": receipt_seqs[-1] if receipt_seqs else None,
+            })
         finally:
             self.workspace._release_all(held)                      # 先释放资源锁
             for lease in leases.values():
@@ -236,23 +673,36 @@ class Harness:
             if events is not None:                                 # ⑧ 锁外通知（不掩盖返回值）
                 try:
                     self.event_log.notify_events(events)
+                except CrashInjected:                 # S9 §2.1：注入崩溃必须穿透，不得被吞
+                    raise
                 except Exception:
                     pass
 
     def _commit_record(self, acb: ACB, w: Write, blob_hash: str,
-                       deleted: bool = False) -> dict:
-        cur = self.workspace.manifest.get(w.resource)
-        version = self.workspace._next_version(w.resource)
+                       deleted: bool = False, mode: Mode = Mode.COMMIT
+                       ) -> tuple[dict, int, int]:
+        """构造 `RESOURCE_COMMITTED` 草稿，并返回 `(draft, version_before, version_after)`。
+
+        版本只算一次：`_apply_locked` 复用 `version_after` 并 assert 相等（S9 §2.3.9）。
+        P0-1③：`version_before/version_after` 以**事件日志水位**为准
+        （`manifest` 可能因「append 后、投影前崩溃」落后于日志）。
+        """
+        version_before = self.workspace._effective_version(w.resource)
+        version = version_before + 1
+        prev_hash = self.workspace._current_blob_hash(w.resource)
         payload = {
             "resource": w.resource,
             "version": version,
+            "mode": mode.value,                 # 幂等短路键的一部分（§2.3.3）
+            "logical_subgoal_id": acb.logical_subgoal_id,   # P0-2：去重键的 scope 分量
+            "acb_id": acb.id,
             "blob_hash": blob_hash,
-            "prev_hash": cur.blob_hash if cur else "",
-            "diff": {"prev_hash": cur.blob_hash if cur else "", "current_hash": blob_hash},
+            "prev_hash": prev_hash,
+            "diff": {"prev_hash": prev_hash, "current_hash": blob_hash},
         }
         if deleted:                                  # Delete 哨兵事件（可重放）
             payload["deleted"] = True
-        return {
+        draft = {
             "kind": EventKind.RESOURCE_COMMITTED,          # ← 必须与重建过滤一致
             "subject": w.resource,
             "payload": payload,
@@ -260,6 +710,24 @@ class Harness:
             "run_id": acb.run_id,
             "idempotency_key": f"{acb.run_id}:{acb.id}:{w.resource}",
         }
+        return draft, version_before, version
+
+    def _last_committed_seq(self, dedup_events) -> int | None:
+        """幂等短路时：已存在 `RESOURCE_COMMITTED` 的最大 seq。"""
+        seq = None
+        for ev in dedup_events:
+            if ev is not None and (seq is None or ev.seq > seq):
+                seq = ev.seq
+        return seq
+
+    def _last_receipt_seq(self, records) -> int | None:
+        """幂等短路时：最后一条已存在 `RECEIPT_ISSUED` 的 seq。"""
+        seq = None
+        for _w, _draft, _vb, _va, commit_key in records:
+            ev = self._receipt_event(commit_key)
+            if ev is not None and (seq is None or ev.seq > seq):
+                seq = ev.seq
+        return seq
 
     def compensate(self, acb: ACB, applied: list[Write]) -> None:
         """Saga 补偿（§4.2）：批量原子计划 → 释放租约 → 逐条续做。
@@ -444,12 +912,23 @@ class Harness:
                 continue
             self._run_one(acb)
 
+    def _safe_save(self, acb: ACB) -> None:
+        """落盘（**保证不抛**）：P1-5 —— 非法 staged 内容不得阻断结算/槽位释放。
+
+        `CrashInjected`（BaseException）仍穿透；普通编码异常只记录，不冒泡。
+        """
+        try:
+            self.checkpoints.save(acb)
+        except Exception:  # noqa: BLE001  # 契约：落盘失败不得跳过后续结算
+            pass
+
     def _finalize(self, acb: ACB) -> None:
         plan = self.plans.get(acb.run_id)
         if plan and acb.task_id in plan["tasks"]:
             plan["tasks"][acb.task_id]["state"] = acb.state
-        # §2.4：_finalize 落盘（K-3：在结算/归档**之前**，保留活跃预留供 recover 恢复）
-        self.checkpoints.save(acb)
+        # §2.4：_finalize 落盘（K-3：在结算/归档**之前**，保留活跃预留供 recover 恢复）；
+        # P1-5：保存失败**不得**阻断下面的结算/归档/槽位释放（否则槽位泄漏）。
+        self._safe_save(acb)
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
                          TaskState.DONE, TaskState.DONE_PARTIAL, TaskState.QUARANTINED):
             # 终态 + QUARANTINED 结算全部预留（文档 §5.5：未消耗部分归还，已消耗留账）
@@ -459,7 +938,7 @@ class Harness:
             # §5.3（K-13）：终态且无 ACTIVE 预留 → 归档（consumed 折入父级）
             if self.budget.archive_node(acb.budget_node.node_id):
                 acb.budget_node = None
-        self.slots.release(acb.id)
+        self.slots.release(acb.id)                     # P1-5：先释放槽位（不因落盘失败跳过）
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
             # D14：patch 后旧 ACB 的 task_id 可能已不在 plan["tasks"] 中 → 用 .get() 安全取值
             task = plan.get("tasks", {}).get(acb.task_id) if plan else None
@@ -497,6 +976,16 @@ class Harness:
         self.checkpoints.save(acb)              # §2.4：escalate 落盘
         return Result(Status.OK, {"state": acb.state.value})
 
+    def _pointer_header_fallback(self, ref: str) -> dict:
+        """P1-6：ref 头部为空时，从 checkpoint 的 latest 指针兜底取元数据。"""
+        fallback = getattr(self.checkpoints, "_header_from_pointers", None)
+        if callable(fallback):
+            try:
+                return dict(fallback(ref) or {})
+            except Exception:  # noqa: BLE001
+                return {}
+        return {}
+
     # ---- 恢复（文档 §5.8 / §4.3） -------------------------------
     def recover(self, ref: str, *, resume_policy: str = "RESUME") -> ACB:
         """崩溃恢复（§4.3）：journal 重建 → ACB 重建 → 事件重放 → probe → 终态策略。
@@ -504,8 +993,26 @@ class Harness:
         - `resume_policy="RESUME"`：probe 三态对账（`True` → CONFIRMED；`None` → 隔离）；
         - `resume_policy="COMPENSATE"`：**终态策略**（清 staged，补偿后不恢复执行）。
         """
-        data = self.checkpoints.load(ref)
+        try:
+            data = self.checkpoints.load_strict(ref)  # 绕过缓存，校验双 checksum
+        except CheckpointCorrupt as exc:
+            # §2.4.8：payload 坏 → 用头部构造 QUARANTINED + needs_readmit
+            header = dict(exc.header or {})
+            if not header:
+                # P1-6：头部为空时用指针文件里的 acb_id/run_id/task_id/generation 兜底
+                header = self._pointer_header_fallback(ref)
+            acb = ACB(id=header.get("acb_id", ""),
+                      run_id=header.get("run_id", ""),
+                      task_id=header.get("task_id", ""))
+            acb.generation = int(header.get("generation", 1) or 1) + 1
+            acb.state = TaskState.QUARANTINED
+            acb.failure = "CHECKPOINT_CORRUPT"
+            acb.needs_readmit = True
+            self.acbs[acb.id] = acb
+            self.run_coordinator.register(acb)
+            return acb
         events = self.event_log.all()                  # 锁内快照（单一数据源）
+        self._rebuild_receipts()                       # §2.3.4：head/id 从 EventLog 重建
         mine = [e for e in events if e.producer == data.get("acb_id")]
         self.effects.rebuild_from(mine)
         self.comp_journal.rebuild_from(mine)
@@ -617,6 +1124,10 @@ class Harness:
             # §2.4：优先用 per-ACB 物化游标；旧 checkpoint 回退到 `cursor`
             acb.cursor = data.get("materialized_cursor", data.get("cursor", 0))
             acb.pre_image = dict(data.get("pre_image") or {})
+            # P1-8：恢复 subscriptions / materialized（及其水位），否则 context_view 为空
+            acb.subscriptions = set(data.get("subscriptions") or [])
+            acb.materialized = dict(data.get("materialized") or {})
+            acb.materialized_watermark = int(data.get("materialized_watermark", 0) or 0)
             acb.last_committed_seq = int(data.get("last_committed_seq", 0) or 0)
             acb.aging_deadline = data.get("aging_deadline")
             acb.step = data.get("effect_journal_offset", 0)
