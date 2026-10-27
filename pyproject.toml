@@ -39,6 +39,7 @@ omit = ["tests/*", "*/conftest.py"]
 
 [tool.coverage.report]
 show_missing = true
+fail_under = 80        # §4.1 兜底门禁
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",

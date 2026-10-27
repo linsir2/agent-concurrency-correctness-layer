@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import copy
+import time
 from collections.abc import Callable
 from typing import Any
 
-from .rebase import (MISSING, MergeResult, _kind, _strict_eq, merge3)
+from .rebase import (MISSING, MergeResult, _kind, _merge_object, _strict_eq,
+                     merge3)
 from .types import (
     ACB,
     Action,
@@ -165,7 +167,12 @@ class AgentRuntime:
         D1：handler 返回值三分支归一化 —— `Result` 原样、`Status` 包装、
         其他（含 `None`）→ `UPSTREAM_FAILED(bad_return)`，避免 `Result(None)`
         在 `run()` 里 `st.value` 崩溃。
+
+        §2.5：`per_action_delay` 注入点 —— 每个 action 前 sleep，供基准配对使用。
         """
+        delay = getattr(self.h, "per_action_delay", 0.0)
+        if delay and delay > 0:
+            time.sleep(delay)
         fn = _HANDLERS.get(action.kind)
         if fn is None:
             return Result(Status.INVALID_INPUT, {"reason": "unknown_action"})
@@ -333,7 +340,8 @@ class AgentRuntime:
         """提交失败 → **有界**语义 rebase（§5.1）。
 
         - `REJECT_STALE`：租约失效 → 重新 reserve 重试一次（§5.4）；
-        - `REJECT_STALE_READ`：读依赖被推进 → 重读刷新 read_set（不做 merge3）；
+        - `REJECT_STALE_READ`：读依赖被推进 → **对陈旧的 staged 重跑 merge3**
+          再提交（K-28 修复：绝不拿陈旧 staged 直接覆盖他人写）；
         - `CONFLICT`：取 pre_image → merge3 → 成功则 _accept 重试，否则 resolver；
         - 内部有界循环（≤ `retry_budget + 1` 次）直到 OK 或隔离，
           避免「第二次冲突直接 FAILED」丢写；
@@ -356,7 +364,9 @@ class AgentRuntime:
 
         for _ in range(acb.retry_budget + 1):
             if st == Status.REJECT_STALE_READ:
-                self._refresh_read_dep(acb, result.detail.get("resource"))
+                failed = self._rebase_stale_staged(acb, result)
+                if failed is not None:
+                    return failed
             else:
                 outcome = self._rebase_write(acb, result)
                 if outcome is not None:
@@ -438,7 +448,9 @@ class AgentRuntime:
         resolved = None
         if self.h.resolver is not None:
             resolved = self.h.resolver(acb, resource, mr.conflicts, ctx)
-        if resolved is None or not _validate_resolution(resolved, mr, base, committed):
+        if resolved is None or not _validate_resolution(
+                resolved, mr, base, committed, local,
+                policy=self.h.planner.merge_policy_of(resource)):
             # resolver 放弃 / 输出不合 schema → 计入一次尝试，由 retry_budget 隔离
             acb.failure = "resolver_failed"
             return None
@@ -461,10 +473,7 @@ class AgentRuntime:
         acb.read_set[resource] = v
 
     def _refresh_read_dep(self, acb: ACB, resource: str | None = None) -> None:
-        """§5.4：REJECT_STALE_READ → 一次刷新**所有**陈旧读依赖（不做 merge3）。
-
-        同时刷新 `read_set` 与 `base_version`（否则 base 仍是旧值 → 再冲突）。
-        """
+        """§5.4：刷新**所有**陈旧读依赖的版本（纯读依赖，无内容可合并）。"""
         targets = list(acb.read_set)
         if resource is not None and resource not in targets:
             targets.append(resource)
@@ -473,6 +482,59 @@ class AgentRuntime:
             if acb.read_set.get(r) != actual:
                 acb.read_set[r] = actual
                 acb.base_version[r] = actual
+
+    def _rebase_stale_staged(self, acb: ACB, result: Result) -> Result | None:
+        """K-28 修复：`REJECT_STALE_READ` 时对**陈旧的 staged** 重跑 merge3。
+
+        旧实现只刷新 `base_version`（`_refresh_read_dep`）后直接重试提交，
+        于是基于旧版本 staged 的整份内容会覆盖他人已提交的写（静默丢写）。
+
+        现在：凡 `staged` 中存在且 `base_version` 落后于当前版本的资源，
+        一律以 `pre_image(base_version)` 为 base 重跑 3-way merge：
+        干净 → 采用 merge3 结果；冲突 → resolver；仍不可解 → **不重试**
+        （返回失败，绝不提交陈旧 staged）。纯读依赖仅刷新版本。
+
+        返回 `None` 表示已安全刷新、可继续重试；返回 `Result` 表示不可安全重试。
+        """
+        resource = result.detail.get("resource")
+        targets = set(acb.read_set)
+        if resource is not None:
+            targets.add(resource)
+
+        policy_of = self.h.planner.merge_policy_of
+        for r in sorted(targets):
+            local = acb.staged.get(r, MISSING)
+            if local is MISSING:
+                continue                       # 纯读依赖：只刷版本
+            base_ver = acb.base_version.get(r, 0)
+            if base_ver == self.h.workspace.version(r):
+                continue                       # 已是最新 base，无需合并
+            base = self.h.workspace.pre_image(r, base_ver)
+            if base is MISSING:                # 前像缺失 → 不能自动合并
+                self._quarantine(acb, "no_pre_image")
+                return Result(Status.SEMANTIC_REJECTED, {"reason": "no_pre_image"})
+            committed = self.h.workspace.get(r)
+            if _strict_eq(local, committed):   # 内容本就一致 → 仅刷新版本
+                continue
+            mr = merge3(base, local, committed, policy_of(r))
+            if mr.ok:
+                self._accept(acb, r, mr.merged, merge=False)
+                continue
+            ctx = {"attempt": acb.rebase_attempts + 1,
+                   "task": acb.task_id, "subgoal": acb.logical_subgoal_id,
+                   "script": acb.spec.get("script")}
+            resolved = None
+            if self.h.resolver is not None:
+                resolved = self.h.resolver(acb, r, mr.conflicts, ctx)
+            if resolved is None or not _validate_resolution(
+                    resolved, mr, base, committed, local, policy=policy_of(r)):
+                acb.failure = "stale_staged_unmergeable"
+                return Result(Status.SEMANTIC_REJECTED,
+                              {"reason": "stale_staged_unmergeable", "resource": r})
+            self._accept(acb, r, resolved, merge=True)
+
+        self._refresh_read_dep(acb, resource)
+        return None
 
     def _retry_with_fresh_lease(self, acb: ACB, result: Result) -> Result:
         """§5.4：REJECT_STALE → 重新 reserve（不是 renew）后重试一次。
@@ -522,22 +584,51 @@ def _deep_merge(base: Any, override: Any) -> Any:
     return copy.deepcopy(override)
 
 
-def _validate_resolution(resolved: Any, mr: MergeResult, base: Any, committed: Any) -> bool:
+def _clean_merge_present_tops(mr: MergeResult, base: Any, committed: Any,
+                              local: Any, policy: Any = None) -> set:
+    """merge3 **干净合并后仍存在**的顶层键集合（§4.3）。
+
+    - `mr` 整体干净（`mr.ok`）：`mr.merged` 的键即权威结果；
+    - 否则 merge3「全有或全无」，`mr.merged` 为 MISSING → **按 merge3 的对象
+      规则逐键精确判定**（复用 `_merge_object`，不手写推断）：
+      缺/有/缺 → 保留 local；有/缺/缺 → 删除；有/有/缺 且 local==base → 删除；
+      冲突键不出现在结果里（由 `conflict_tops` 单独覆盖）。
+
+    反例（旧实现的 bug）：base={x:0,a:0} local={x:0,a:1} committed={a:2}。
+    merge3 对 x 走「有/base 缺 → 删除」，旧推断却把 x 当新增，导致
+    `_validate_resolution({a:1,x:0})` 放行已删键、`{a:1}` 被误拒。
+    """
+    if mr.ok and isinstance(mr.merged, dict):
+        return set(mr.merged)
+    if not isinstance(local, dict) or not isinstance(committed, dict):
+        return set(committed)
+    probe: list = []
+    clean = _merge_object(base if isinstance(base, dict) else {},
+                          local, committed, "", policy, probe)
+    return set(clean)
+
+
+def _validate_resolution(resolved: Any, mr: MergeResult, base: Any,
+                         committed: Any, local: Any = None,
+                         policy: Any = None) -> bool:
     """§7.1 输出注入防护 + 语义完整性：resolver 必须给出**完整内容**。
 
     - 是 dict；
-    - 键集合 == `committed` 顶层键 ∪ 冲突路径顶层键（不多不少）；
-    - 非冲突键：值必须**严格等于** `committed`；
+    - 键集合 == **merge3 干净合并后仍存在的顶层键** ∪ 冲突路径顶层键
+      （§4.3：由 merge3 对象规则精确判定——干净删除的键不得复活、
+      多余非法键不得放行）；
+    - 非冲突键：值必须**严格等于** `committed`（新增键的值由 resolver 定）；
     - 冲突键：值类型必须与 `committed`（缺失时退到 `base`）同类。
-    任一不满足 → `False`（→ 隔离）。
+    任一不满足 → `False`（→ 隔离）。`committed` 非 dict 直接 `False`（→ PIVOT）。
     """
     if not isinstance(resolved, dict):
         return False
-    conflict_tops = {c.path.strip("/").split("/")[0] if c.path else ""
-                     for c in mr.conflicts}
     if not isinstance(committed, dict):
         return False
-    if set(resolved) != (set(committed) | conflict_tops):
+    conflict_tops = {c.path.strip("/").split("/")[0] if c.path else ""
+                     for c in mr.conflicts}
+    clean_tops = _clean_merge_present_tops(mr, base, committed, local, policy)
+    if set(resolved) != (clean_tops | conflict_tops):
         return False
     for key, value in resolved.items():
         if key in conflict_tops:
@@ -546,9 +637,11 @@ def _validate_resolution(resolved: Any, mr: MergeResult, base: Any, committed: A
                 ref = base.get(key, MISSING)
             if ref is not MISSING and _kind(value) != _kind(ref):
                 return False
-        else:
+        elif key in committed:
+            # 非冲突且 merge3 干净保留的既有键：值不得被 resolver 改写
             if not _strict_eq(value, committed[key]):
                 return False
+        # 干净合并新增的顶层键：不在 committed 中，值由 resolver 定
     return True
 
 

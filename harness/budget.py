@@ -334,23 +334,27 @@ class BudgetManager:
         - `consumed` 是永久账，等于全部条目的 `consumed` 之和；
         - 归档子树折入的永久账记在 `folded_consumed`（无对应预留条目）。
         等价于 `self_reserved == consumed + Σ(ACTIVE balance)`。
+
+        §4.4：加 `_lock`，避免周期 `gc` 与 recover 后的 `check_invariants` 并发
+        读到中间态 → 偶发 `InvariantError`（新 flaky）。
         """
-        for n in self._nodes.values():
-            self._check_local(n)
-            if n.subtree_reserved != n.self_reserved + sum(
-                    c.subtree_reserved for c in n.children):
-                raise InvariantError(f"subtree mismatch at {n.node_id}")
-            active_amount = 0
-            nonactive_consumed = 0
-            consumed_sum = 0
-            for r in n.reservations.values():
-                consumed_sum += r.consumed
-                if r.state == "ACTIVE":
-                    active_amount += r.amount
-                else:
-                    nonactive_consumed += r.consumed
-            if n.self_reserved != (active_amount + nonactive_consumed
-                                   + n.folded_consumed):
-                raise InvariantError(f"self_reserved mismatch at {n.node_id}")
-            if n.consumed != consumed_sum + n.folded_consumed:
-                raise InvariantError(f"consumed mismatch at {n.node_id}")
+        with self._lock:
+            for n in self._nodes.values():
+                self._check_local(n)
+                if n.subtree_reserved != n.self_reserved + sum(
+                        c.subtree_reserved for c in n.children):
+                    raise InvariantError(f"subtree mismatch at {n.node_id}")
+                active_amount = 0
+                nonactive_consumed = 0
+                consumed_sum = 0
+                for r in n.reservations.values():
+                    consumed_sum += r.consumed
+                    if r.state == "ACTIVE":
+                        active_amount += r.amount
+                    else:
+                        nonactive_consumed += r.consumed
+                if n.self_reserved != (active_amount + nonactive_consumed
+                                       + n.folded_consumed):
+                    raise InvariantError(f"self_reserved mismatch at {n.node_id}")
+                if n.consumed != consumed_sum + n.folded_consumed:
+                    raise InvariantError(f"consumed mismatch at {n.node_id}")

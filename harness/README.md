@@ -7,7 +7,7 @@
 ## 运行
 
 ```bash
-cd /workspace && python3 -m pytest tests/ -q     # 123 passed
+cd /workspace && python3 -m pytest tests/ -q     # 152 passed
 ```
 
 无第三方依赖（仅标准库 + pytest）。
@@ -44,14 +44,18 @@ cd /workspace && python3 -m pytest tests/ -q     # 123 passed
 | `tests/test_ms3_recovery.py` | MS3 出口：effect UNKNOWN 反查三分支 / 补偿中途崩溃续做（批次原子）/ idem_key 稳定性 / 逐笔账本恢复 / 补偿幂等键 / 生产不变量 / network+data_class+签名 / requeue_readmit（8 个测试） |
 | `tests/test_ms4_runtime.py` | MS4 出口：动作注册表（5 kind + 未知 kind + 异常映射 + 重复注册）/ guard 谓词与续租三态 / 事件游标 / `_drain_scheduler` 防递归 / 前驱闸门 / 环检测（16 个测试） |
 | `tests/test_e2e_invariants.py` | 端到端不变量：I1/I2/I3/I5/I6/I8/I10/I9/I12 + I4/I7/I11 补强（10 个测试，全部串行确定性构造） |
+| `tests/test_s8_coverage.py` | S8 覆盖率补强：`recover(COMPENSATE)` 两段式 / resolver 成功路径与反证 / `_restore_path` 逐级与回滚 / `auth.gc_seen` / `budget.gc` / S8-1..S8-4（15 个测试） |
+| `tests/test_k28_bench_regressions.py` | K-28 基准回归：陈旧 staged 必须重合并（含反证）/ `_validate_resolution` 精确语义 / B2 降级合并与 git 差分 / 报告一致性 |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |
 | `tests/test_adversarial.py` | A1–A13（含 A7b 背压） |
 | `tests/test_ms7_capability.py` | MS7 出口：能力强制（2 个测试） |
 | `tests/test_ms8_conformance.py` | MS8 出口：I1/I2/I3/I5/I6/I7/I8 |
 | `tests/test_ms8_spec.py` | MS8 出口：I9/I10/I13 + 资源模型 + 协调协议 + 收据链 |
 
-> **总计 123 个测试**：19 个用例测试 + 104 个里程碑出口/规范/E2E 测试。
-> 按里程碑切子集：`pytest -m ms0`（14）、`-m ms1`（15）、`-m ms2`（9）、`-m ms3`（8）、`-m ms4`（16）、`-m e2e`（10）；markers 见 `pyproject.toml`。
+> **总计 152 个测试**：19 个用例测试 + 133 个里程碑出口/规范/E2E/覆盖率/基准回归测试。
+> 按里程碑切子集：`pytest -m ms0`（14）、`-m ms1`（15）、`-m ms2`（9）、`-m ms3`（8）、`-m ms4`（16）、`-m e2e`（10）、`-m fault`（S8-1）；markers 见 `pyproject.toml`。
+> 覆盖率：`python3 -m pytest --cov=harness --cov-report=json && python3 scripts/check_coverage.py`（整体 83.89%，分模块硬门禁通过）。
+> 基准：`python3 bench/run_bench.py --n 30 --out bench/result.json`（三条件×四负载，约 8s）。
 
 ## 设计要点
 

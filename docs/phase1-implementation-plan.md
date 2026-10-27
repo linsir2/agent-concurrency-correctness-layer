@@ -766,8 +766,8 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S4** | ✅ 完成（2026-10-26） | `budget.py` 重写（`Reservation` + `subtree_reserved` + 幂等 release/settle + 三条不变量 + 兼容属性）、`SlotTracker`、`try_admit` 重写（committed 哨兵 + 四级回滚）、`policy.issue` 收口、`Harness.dispatch_and_run` 唯一入口 | **83 passed**（+14）；T9/T10/T14/T23/T24 + 7 回归；实现后评审修 5 P0 + 5 高；详见 [S4 方案 v1.2](s4-budget-and-admission.md) §13 |
 | **S5** | ✅ 完成（2026-10-26） | `EffectJournal` 落盘+probe 三态（INTENT 也 probe）、`CompensationJournal` 落盘+`comp_id`+批量原子+续做、`recover` 带 `resume_policy`、`auth.py`（HMAC+`jti`）、K-6/K-7/K-8/K-9/K-11/K-13/K-14 收口 | **91 passed**（+8，连跑 10 轮稳定）；T11/T12/T13/T25–T29；实现后评审修 4 P0 + 5 高 + 1 flaky；详见 [S5 方案 v1.2](s5-recovery-and-journals.md) §12 |
 | **S6** | ✅ 完成（2026-10-27） | `_do_action` 注册表（归一化+异常映射）、`guard` 谓词列表 + `_renew_or_fail` 三态、事件游标真水位、snapshot 补字段、`edges` 前驱闸门 + 环检测、`_drain_scheduler` 真消费（防递归）、U1×2/U2/U4 去假绿、10 条不变量 E2E | **123 passed**（+32，连跑 10 轮稳定）；`-m ms4`→16、`-m e2e`→10；实现后评审修 1 高 + 4 中 + 6 低；详见 [S6 方案 v1.2](s6-runtime-and-e2e.md) §12 |
-| S7 | ⏳ 待开工 | 基准（B1/B2/B3+C0–C3）+报告 | `bench/report.md` 含 §9.3 全部 5 项指标 |
-| S8 | ⏳ 待开工 | 补强 T15–T18 + 覆盖率达标 | 全部测试绿 + 分模块覆盖率达标 |
+| **S7** | ✅ 完成（2026-10-27） | `bench/`（workloads/conditions/metrics/run_bench/report）三条件×四负载 + 外部差分度量 + 二级指标 + 环境信息与测量局限 | 基准可运行（n≥30）；C2 主终点成立；离散指标确定性（48 项方差 0）；详见 [S7 方案 v1.2](s7-benchmark-and-coverage.md) §10 |
+| **S8** | ✅ 完成（2026-10-27） | 覆盖率分模块阈值落地（`fail_under=80` + `scripts/check_coverage.py`）、补 `recover(COMPENSATE)`/resolver/`_restore_path` 三缺口、S8-1..S8-4 补强、`budget.gc` 接上 + `check_invariants` 加锁 | **152 passed**；整体 **83.89%**、budget 95.88%；**评审发现并修复真缺陷 K-28**（C1 静默丢写，残值归零） |
 
 **S0–S4 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。

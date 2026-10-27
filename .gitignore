@@ -8,6 +8,7 @@ venv/
 .DS_Store
 .hypothesis/
 .coverage
+coverage.json
 coverage.xml
 .env
 .env.*

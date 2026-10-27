@@ -111,10 +111,12 @@ class LLMConfig:
 
 
 def _post(url: str, payload: dict, headers: dict, timeout_s: float) -> dict:
+    """真实网络分支：阶段一无真实 LLM（`token_multiplier` N/A），
+    成功返回那行 `# pragma: no cover`（§4.1），失败/重试路径仍被覆盖。"""
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return json.loads(resp.read().decode("utf-8"))  # pragma: no cover
 
 
 def chat(messages: Iterable[Mapping[str, str]], *,

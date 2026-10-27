@@ -47,13 +47,16 @@ class Harness:
                  blobs=None, path_of=None, lock_timeout_s: float = 5.0,
                  auth_secret: str | None = None,
                  tombstone_ttl_s: float = 86400.0,
-                 auth_gc_every: int = 256) -> None:
+                 auth_gc_every: int = 256,
+                 gc_every: int = 1000,
+                 per_action_delay: float = 0.0) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
         self.max_steps = max_steps
         self.max_concurrent = max_concurrent
         self.retention = retention
+        self.per_action_delay = per_action_delay   # §2.5：基准配对用注入点
 
         self.clock = clock or SystemClock()
         self.event_log = event_log if event_log is not None else EventLog(clock=self.clock)
@@ -77,6 +80,7 @@ class Harness:
         self.checkpoints.applied_event_ids = self._applied_event_ids
         self._drain_skipped: list[tuple[str, str]] = []   # D11：调度跳过原因（不再静默）
         self.auth_gc_every = max(1, int(auth_gc_every))
+        self.gc_every = max(1, int(gc_every))
         self._event_count = 0
         self._auth_secret = auth_secret
         self._auth: Signer | None = Signer(auth_secret) if auth_secret else None
@@ -113,6 +117,9 @@ class Harness:
     def _on_event(self, ev) -> None:
         # 周期性清理已过期的 jti（按注入时钟，避免 `_seen` 无界增长）
         self._event_count += 1
+        if self._event_count % self.gc_every == 0:
+            # §4.4：接上 budget.gc（原死代码），now 用注入时钟的 epoch 秒
+            self.budget.gc(self.clock.now_ms() / 1000.0)
         if (self._auth is not None
                 and self._event_count % self.auth_gc_every == 0):
             self._auth.gc_seen(self.clock.now_ms() / 1000.0)
@@ -667,7 +674,7 @@ class Harness:
                     limits = {node_id: data.get("budget_limits")}
                 try:
                     self._restore_path(path, limits=limits)
-                except Exception:  # noqa: BLE001
+                except (ValueError, KeyError, RuntimeError):
                     acb.reservation_ids = []
                     acb.budget_node = None
                     acb.needs_readmit = True
