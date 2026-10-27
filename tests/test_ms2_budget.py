@@ -462,9 +462,9 @@ def test_ms2_capability_path_and_guard_uses_active_reservation():
     acb = ACB(id="A-G", run_id="G", task_id="T")
     acb.budget_node = node
     acb.reservation_ids = [resv.reservation_id]
-    assert h.runtime.guard(acb) is True
+    assert h.runtime.guard(acb) == (True, None)
     h.budget.settle(resv.reservation_id)
-    assert h.runtime.guard(acb) is False
+    assert h.runtime.guard(acb) == (False, "BUDGET_EXHAUSTED")
     assert acb.failure == "BUDGET_EXHAUSTED"
 
 

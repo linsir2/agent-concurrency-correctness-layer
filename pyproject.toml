@@ -23,6 +23,8 @@ markers = [
     "ms1: 单资源 RSC",
     "ms2: 预算与准入",
     "ms3: 崩溃恢复与幂等",
+    "ms4: 运行时表驱动 + guard/续租 + 游标 + 调度 + 前驱闸门",
+    "e2e: 端到端不变量",
     "conformance: 不变量 I1-I14 的可执行校验",
     "adversarial: 对抗用例 A1-A13",
     "slow: 长跑用例（-m 'not slow' 可跳过）",

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from typing import Any
 
 from .rebase import (MISSING, MergeResult, _kind, _strict_eq, merge3)
@@ -25,6 +26,19 @@ from .types import (
     advance,
     ok,
 )
+
+
+_HANDLERS: dict[str, Callable] = {}
+
+
+def register_action(kind: str):
+    """动作注册表（§2.1）：精确 key 命中，重复注册抛 `ValueError`。"""
+    def deco(fn):
+        if kind in _HANDLERS:
+            raise ValueError(f"duplicate action handler: {kind}")
+        _HANDLERS[kind] = fn
+        return fn
+    return deco
 
 
 class AgentRuntime:
@@ -44,14 +58,18 @@ class AgentRuntime:
         acb.state = TaskState.RUNNING
         for decision in decisions:
             acb.turn_seq = decision.turn_seq
+            acb.cursor = self.h.event_log.tail()          # §2.3：save 前对齐全局水位
+            acb.heartbeat_at = self.h.clock.now_ms()      # D13b：心跳推进（不再只恢复）
             self.h.checkpoints.save(acb)
 
-            if not self.guard(acb):
+            guard_ok, reason = self.guard(acb)
+            if not guard_ok:
                 acb.state = TaskState.FAILED
-                acb.failure = "GUARD_VIOLATION"
+                acb.failure = reason or "GUARD_VIOLATION"
                 self.h.checkpoints.save(acb)
                 return Status.GUARD_VIOLATION
 
+            progressed = False
             for i, action in enumerate(decision.actions):
                 if crash_at and crash_at == (acb.turn_seq, i):
                     # 模拟「工具已调用但副作用未确认」→ effect 停在 UNKNOWN（文档 §5.8⑤）
@@ -62,13 +80,17 @@ class AgentRuntime:
                     self.h.supervisor_note_crash(acb)
                     raise CrashInjected(acb.turn_seq, i)
 
-                if i % self.h.guard_every == 0 and not self.guard(acb):
-                    acb.state = TaskState.FAILED
-                    acb.failure = "GUARD_VIOLATION"
-                    self.h.checkpoints.save(acb)
-                    return Status.GUARD_VIOLATION
+                if i % self.h.guard_every == 0:
+                    guard_ok, reason = self.guard(acb)
+                    if not guard_ok:
+                        acb.state = TaskState.FAILED
+                        acb.failure = reason or "GUARD_VIOLATION"
+                        self.h.checkpoints.save(acb)
+                        return Status.GUARD_VIOLATION
 
                 st = self._do_action(acb, action, i)
+                if st in (Status.OK, Status.VALID):      # D13b：本 turn 有进展
+                    progressed = True
                 if st in (Status.CANCELLED, Status.APPROVAL_TIMEOUT):
                     return st
                 if st == Status.NEEDS_APPROVAL:
@@ -103,6 +125,12 @@ class AgentRuntime:
                 return st
             self.h.checkpoints.save(acb)
             acb.step += 1
+            if progressed:
+                acb.no_progress_steps = 0
+            else:
+                acb.no_progress_steps += 1            # D13b：本 turn 无进展 → 自增
+                if acb.no_progress_steps >= self.h.aging_max:
+                    acb.aging_deadline = self.h.clock.now_ms()   # D13b：到达 aging_max 设定期限
 
         acb.state = TaskState.DONE
         self.h.event_log.append(EventKind.TASK_COMPLETED, acb.task_id, {}, producer=acb.id)
@@ -131,107 +159,148 @@ class AgentRuntime:
             return False
         return True
 
-    def _do_action(self, acb: ACB, action: Action, i: int) -> Status:
-        if action.kind == "stage":
-            self.h.workspace.stage(acb, action.resource, action.content)
-            acb.subscriptions.add(action.resource)
-            self.h.subscriptions.add(acb.id, action.resource)   # 读即订阅（文档 §5.6）
-            return Status.OK
+    def _do_action(self, acb: ACB, action: Action, i: int) -> Result:
+        """§2.1：查表派发 + 归一化（裸 `Status` → `Result`）+ 异常映射。
 
-        if action.kind == "commit":
-            for w in action.writes:               # 未暂存的资源不得提交
-                if w.resource not in acb.staged:
-                    return Status.INVALID_INPUT
-            writes = [Write(resource=w.resource, content=acb.staged.get(w.resource))
-                      for w in action.writes]
-            st = self.h.commit_batch(acb, writes, Mode.COMMIT)
-            if st == Status.OK:
-                for w in action.writes:           # 已提交的从 staged 移除（避免重复提交）
-                    acb.staged.pop(w.resource, None)
-                    new_ver = self.h.workspace.version(w.resource)   # 刷新为写入后的新版本
-                    acb.read_set[w.resource] = new_ver
-                    acb.base_version[w.resource] = new_ver
-            return st
+        D1：handler 返回值三分支归一化 —— `Result` 原样、`Status` 包装、
+        其他（含 `None`）→ `UPSTREAM_FAILED(bad_return)`，避免 `Result(None)`
+        在 `run()` 里 `st.value` 崩溃。
+        """
+        fn = _HANDLERS.get(action.kind)
+        if fn is None:
+            return Result(Status.INVALID_INPUT, {"reason": "unknown_action"})
+        try:
+            out = fn(self, acb, action, i)
+        except Exception as e:  # noqa: BLE001  # §2.1：异常映射到 Result，不穿透
+            return Result(Status.UPSTREAM_FAILED, {"reason": type(e).__name__})
+        if isinstance(out, Result):
+            return out
+        if isinstance(out, Status):
+            return Result(out)
+        return Result(Status.UPSTREAM_FAILED, {"reason": "bad_return"})
 
-        if action.kind == "tool":
-            # B4：能力强制点在 gateway 强制执行，模型不可绕过（§4.1 / §5.9）
-            token = self.h._effective_token(acb)
-            if not self.h.policy.check_capability(
-                    acb.id, token, action.tool, action.resource or ""):
-                return Result(Status.DENIED_CAPABILITY, {"tool": action.tool})
-            if not self._gateway_check(acb, action):
-                return Result(Status.DENIED_CAPABILITY, {"reason": "gateway"})
-            idem_key = self.h.idem_key(acb, action, i)
-            st = self.h.effects.state(idem_key)
-            if st == "CONFIRMED":
-                # I7：副作用恰好一次；只有 CONFIRMED 可短路
+    # ---- 动作处理器（§2.1，逐个对应原 if/elif 分支）-----------------
+    @register_action("stage")
+    def _action_stage(self, acb: ACB, action: Action, i: int) -> Result:
+        self.h.workspace.stage(acb, action.resource, action.content)
+        acb.subscriptions.add(action.resource)
+        self.h.subscriptions.add(acb.id, action.resource)   # 读即订阅（文档 §5.6）
+        return ok()
+
+    @register_action("commit")
+    def _action_commit(self, acb: ACB, action: Action, i: int) -> Result:
+        for w in action.writes:               # 未暂存的资源不得提交
+            if w.resource not in acb.staged:
+                return Result(Status.INVALID_INPUT, {})
+        writes = [Write(resource=w.resource, content=acb.staged.get(w.resource))
+                  for w in action.writes]
+        st = self.h.commit_batch(acb, writes, Mode.COMMIT)
+        if st == Status.OK:
+            for w in action.writes:           # 已提交的从 staged 移除（避免重复提交）
+                acb.staged.pop(w.resource, None)
+                new_ver = self.h.workspace.version(w.resource)   # 刷新为写入后的新版本
+                acb.read_set[w.resource] = new_ver
+                acb.base_version[w.resource] = new_ver
+            acb.last_committed_seq = self.h.event_log.tail()   # D13：显式提交也推进水位
+        return st
+
+    @register_action("tool")
+    def _action_tool(self, acb: ACB, action: Action, i: int) -> Result:
+        # B4：能力强制点在 gateway 强制执行，模型不可绕过（§4.1 / §5.9）
+        token = self.h._effective_token(acb)
+        if not self.h.policy.check_capability(
+                acb.id, token, action.tool, action.resource or ""):
+            return Result(Status.DENIED_CAPABILITY, {"tool": action.tool})
+        if not self._gateway_check(acb, action):
+            return Result(Status.DENIED_CAPABILITY, {"reason": "gateway"})
+        idem_key = self.h.idem_key(acb, action, i)
+        st = self.h.effects.state(idem_key)
+        if st == "CONFIRMED":
+            # I7：副作用恰好一次；只有 CONFIRMED 可短路
+            return Result(Status.OK, {"effect_id": self._effect_id(idem_key)})
+        if st in ("INTENT", "UNKNOWN"):
+            # §4.1：INTENT 与 UNKNOWN 同路径 —— probe 三态
+            probe = self.h.effects.probe_one(idem_key)
+            if probe == "True":
+                self.h.effects.confirm(idem_key, {"recovered": True})
                 return Result(Status.OK, {"effect_id": self._effect_id(idem_key)})
-            if st in ("INTENT", "UNKNOWN"):
-                # §4.1：INTENT 与 UNKNOWN 同路径 —— probe 三态
-                probe = self.h.effects.probe_one(idem_key)
-                if probe == "True":
-                    self.h.effects.confirm(idem_key, {"recovered": True})
-                    return Result(Status.OK, {"effect_id": self._effect_id(idem_key)})
-                if probe == "None":
-                    return Result(Status.NEEDS_RECONCILIATION, {"idem_key": idem_key})
-                # probe == "False" → 落到下面重执行（同一 idem）
-            # 预算消费先于副作用：消费失败则不执行工具、不写事件
-            st = self._consume_budget(acb, action.cost)
-            if st != Status.OK:
-                if st == Status.BUDGET_EXHAUSTED:
-                    acb.state = TaskState.FAILED
-                    acb.failure = "BUDGET_EXHAUSTED"
-                return st
-            self.h.effects.begin(acb, action)
-            self.h.effects.confirm(idem_key, acb.id)
-            self.h.event_log.append(EventKind.TOOL_COMPLETED, idem_key,
-                                    {"tool": action.tool}, producer=acb.id,
-                                    idempotency_key=idem_key)
-            return Result(Status.OK, {"effect_id": idem_key})
-
-        if action.kind == "request_hitl":
-            acb.staged.clear()
-            self.h.intents.revoke_all(acb.id)
-            acb.state = TaskState.WAITING_APPROVAL
-            self.h.checkpoints.save(acb)
-            self.h.event_log.append(EventKind.APPROVAL_RAISED, acb.task_id, {},
-                                    producer=acb.id)
-            resolved = self.h.hitl.resolve(acb)
-            if resolved is None:
+            if probe == "None":
+                return Result(Status.NEEDS_RECONCILIATION, {"idem_key": idem_key})
+            # probe == "False" → 落到下面重执行（同一 idem）
+        # 预算消费先于副作用：消费失败则不执行工具、不写事件
+        st = self._consume_budget(acb, action.cost)
+        if st != Status.OK:
+            if st == Status.BUDGET_EXHAUSTED:
                 acb.state = TaskState.FAILED
-                acb.failure = "APPROVAL_TIMEOUT"
-                return Status.APPROVAL_TIMEOUT
-            acb.hitl_result = resolved
-            acb.state = TaskState.RUNNING
-            self.h.event_log.append(EventKind.APPROVAL_RESOLVED, acb.task_id, {},
-                                    producer=acb.id)
-            return Status.NEEDS_APPROVAL
+                acb.failure = "BUDGET_EXHAUSTED"
+            return Result(st)
+        self.h.effects.begin(acb, action)
+        self.h.effects.confirm(idem_key, acb.id)
+        self.h.event_log.append(EventKind.TOOL_COMPLETED, idem_key,
+                                {"tool": action.tool}, producer=acb.id,
+                                idempotency_key=idem_key)
+        return Result(Status.OK, {"effect_id": idem_key})
 
-        if action.kind == "finish":
-            return Status.OK
+    @register_action("request_hitl")
+    def _action_request_hitl(self, acb: ACB, action: Action, i: int) -> Result:
+        acb.staged.clear()
+        self.h.intents.revoke_all(acb.id)
+        acb.state = TaskState.WAITING_APPROVAL
+        self.h.checkpoints.save(acb)
+        self.h.event_log.append(EventKind.APPROVAL_RAISED, acb.task_id, {},
+                                producer=acb.id)
+        resolved = self.h.hitl.resolve(acb)
+        if resolved is None:
+            acb.state = TaskState.FAILED
+            acb.failure = "APPROVAL_TIMEOUT"
+            return Result(Status.APPROVAL_TIMEOUT, {})
+        acb.hitl_result = resolved
+        acb.state = TaskState.RUNNING
+        self.h.event_log.append(EventKind.APPROVAL_RESOLVED, acb.task_id, {},
+                                producer=acb.id)
+        return Result(Status.NEEDS_APPROVAL, {})
 
-        return Status.INVALID_INPUT
+    @register_action("finish")
+    def _action_finish(self, acb: ACB, action: Action, i: int) -> Result:
+        return ok()
 
     # ---- guard（文档 §5.3 / §4.4） -------------------------------
-    def guard(self, acb: ACB) -> bool:
-        """五查：取消 / 期限 / 预算 / 步数 / 无进展；并续租。"""
-        if self.h.run_coordinator.is_cancelled(acb):
-            acb.state = TaskState.CANCELLED
-            return False
-        self.h.intents.renew_for(acb)
-        # 预算 guard：要求 ACB 名下有「一笔 ACTIVE 且余额 ≥ 1」的预留
-        if not self.h.budget.check_reservations(acb.reservation_ids, 1):
-            acb.failure = "BUDGET_EXHAUSTED"
-            return False
-        if acb.deadline is not None and acb.step >= acb.deadline:
-            acb.failure = "DEADLINE_EXCEEDED"
-            return False
-        if acb.step > self.h.max_steps:
-            return False
-        if acb.no_progress_steps > self.h.aging_max:
-            acb.failure = "NO_PROGRESS"
-            return False
-        return True
+    def _guard_checks(self, acb: ACB) -> list[Callable[[], str | None]]:
+        """§2.2：谓词列表（顺序即优先级）。每个谓词返回 `None` 或失败 reason。"""
+        return [
+            lambda: "CANCELLED" if self.h.run_coordinator.is_cancelled(acb) else None,
+            lambda: self._renew_or_fail(acb),
+            lambda: ("BUDGET_EXHAUSTED"
+                     if not self.h.budget.check_reservations(acb.reservation_ids, 1)
+                     else None),
+            lambda: ("DEADLINE_EXCEEDED"
+                     if acb.deadline is not None and acb.step >= acb.deadline
+                     else None),
+            lambda: "MAX_STEPS" if acb.step > self.h.max_steps else None,
+            lambda: "NO_PROGRESS" if acb.no_progress_steps > self.h.aging_max else None,
+        ]
+
+    def _renew_or_fail(self, acb: ACB) -> str | None:
+        """§2.2 续租三态：
+
+        - 无有效租约（如已提交 revoke）→ `None`（**不判失败**，避免提交后误判）；
+        - 有有效租约但 `renew_for` 失败 → `"LEASE_EXPIRED"`。
+        """
+        live = [ls for leases in self.h.intents._active.values()
+                for ls in leases if ls.agent_id == acb.id and ls.valid]
+        if not live:
+            return None
+        return None if self.h.intents.renew_for(acb) else "LEASE_EXPIRED"
+
+    def guard(self, acb: ACB) -> tuple[bool, str | None]:
+        """§2.2：谓词列表求值；reason 非 `CANCELLED` 时落 `acb.failure`。"""
+        for chk in self._guard_checks(acb):
+            reason = chk()
+            if reason:
+                if reason != "CANCELLED":
+                    acb.failure = reason
+                return False, reason
+        return True, None
 
     def _consume_budget(self, acb: ACB, amount: int) -> Status:
         """按预留消费：找到**第一个**可支付 `amount` 的预留。
@@ -256,6 +325,7 @@ class AgentRuntime:
         st = self.h.commit_batch(acb, writes, Mode.COMMIT)
         if st == Status.OK:
             acb.staged.clear()
+            acb.last_committed_seq = self.h.event_log.tail()   # D13：提交成功后真实写入
         return st
 
     # ---- 冲突处理回路（文档 §5） ----------------------------------
@@ -405,7 +475,11 @@ class AgentRuntime:
                 acb.base_version[r] = actual
 
     def _retry_with_fresh_lease(self, acb: ACB, result: Result) -> Result:
-        """§5.4：REJECT_STALE → 重新 reserve（不是 renew）后重试一次。"""
+        """§5.4：REJECT_STALE → 重新 reserve（不是 renew）后重试一次。
+
+        D4：此处直接 reserve 的租约**不在** `commit_batch` 的 finally 撤销集合里，
+        重试后必须显式 revoke，否则遗留 valid 租约。
+        """
         resource = result.detail.get("resource")
         if resource is None:
             return result
@@ -416,7 +490,10 @@ class AgentRuntime:
             acb.failure = "RESERVE_FAILED"
             return result
         acb.leases.append(lease)
-        retry = self._commit_staged(acb)
+        try:
+            retry = self._commit_staged(acb)
+        finally:
+            self.h.intents.revoke(lease)          # D4：重试提交后 revoke 直接预留的租约
         if retry == Status.OK:
             return Result(Status.OK, {"rebased": True, "attempts": acb.rebase_attempts})
         if retry == Status.REJECT_STALE:              # 再失败 → FAILED

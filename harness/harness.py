@@ -68,11 +68,14 @@ class Harness:
         self.budget = (budget if budget is not None
                        else BudgetManager(run_limits, tombstone_ttl_s=tombstone_ttl_s))
         self.checkpoints = checkpoints if checkpoints is not None else CheckpointStore()
+        if hasattr(self.checkpoints, "event_log"):      # §2.4：注入全局水位源
+            self.checkpoints.event_log = self.event_log
         self.effects = (effects if effects is not None
                         else EffectJournal(self.event_log))
         self.comp_journal = CompensationJournal(self.event_log)
         self._applied_event_ids: set[str] = set()
         self.checkpoints.applied_event_ids = self._applied_event_ids
+        self._drain_skipped: list[tuple[str, str]] = []   # D11：调度跳过原因（不再静默）
         self.auth_gc_every = max(1, int(auth_gc_every))
         self._event_count = 0
         self._auth_secret = auth_secret
@@ -363,6 +366,9 @@ class Harness:
         """Supervisor 心跳超时回收（文档 §5.8③）。"""
         self.intents.revoke_all(acb.id)
         self.bump_epoch()
+        # §2.4：落盘（duck-typed 探针无 budget_node 时跳过，保持向后兼容）
+        if hasattr(acb, "budget_node"):
+            self.checkpoints.save(acb)
 
     def bump_epoch(self) -> None:
         self.intents.bump_epoch()
@@ -375,7 +381,7 @@ class Harness:
         run_id = plan["run_id"]
         acb = self.dispatcher.try_admit(plan["tasks"][task_id], run_id,
                                         required_tools=required_tools,
-                                        token=token)
+                                        token=token, plan=plan)
         self.plans[run_id] = plan
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
@@ -385,30 +391,58 @@ class Harness:
         return acb
 
     def run_task(self, acb: ACB, decisions, crash_at=None) -> Status:
+        """外部直接调用入口：注册 + push 到调度器 + 执行 + 消费调度器。"""
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
-        self.scheduler.push(acb.task_id)
+        self.scheduler.push(acb.id)            # D10：调度器存 acb.id（不再存 task_id）
         try:
-            return self.runtime.run(acb, decisions, crash_at=crash_at)
+            return self._run_one(acb, decisions, crash_at=crash_at)
+        finally:
+            self._drain_scheduler()            # D12：异常路径（含 CrashInjected）也消费队列
+
+    def _run_one(self, acb: ACB, decisions=None, crash_at=None) -> Status:
+        """执行体（§2.6）：`runtime.run` + `_finalize`；**不 push、不 drain**（防递归）。"""
+        try:
+            return self.runtime.run(acb, decisions or [], crash_at=crash_at)
         finally:
             self._finalize(acb)
-            self._drain_scheduler()
 
     def _drain_scheduler(self) -> None:
-        """消费 ready_queue（避免只写不读的死代码）。
+        """真消费 ready_queue（§2.6）：`pop → 找 ACB → 只启动 ADMITTED`。
 
-        `needs_readmit` 的 ACB 不进调度（§5.7）：需先 `requeue_readmit`。
+        - `_run_one` 不 push、不递归 drain → 无无限递归、无双重 run；
+        - `needs_readmit` 的 ACB 不进调度（§5.7）：需先 `requeue_readmit`；
+        - D10：优先按 `acb.id` 精确命中；`acb.id` 未命中时回退按 `task_id` 找
+          ADMITTED 的 ACB（兼容 `_finalize` 推入的 `task_id` 键）；
+        - D11：被跳过的键记录原因到 `_drain_skipped`（不再静默 continue）。
         """
-        while not self.scheduler.is_empty():
-            task_id = self.scheduler.pop()
-            acb = next((a for a in self.acbs.values() if a.task_id == task_id), None)
-            if acb is not None and acb.needs_readmit:
+        while True:
+            key = self.scheduler.pop()
+            if key is None:
+                break
+            acb = self.acbs.get(key)
+            if acb is None:
+                acb = next((a for a in self.acbs.values()
+                            if a.task_id == key and a.state is TaskState.ADMITTED
+                            and not a.needs_readmit), None)
+            if acb is None:
+                self._drain_skipped.append((key, "no_admitted_acb"))
                 continue
+            if acb.needs_readmit:
+                self._drain_skipped.append((key, "needs_readmit"))
+                continue
+            if acb.state is not TaskState.ADMITTED:
+                # PLANNED / 已终态等：按设计不调度，但记录原因（D11）
+                self._drain_skipped.append((key, f"state={acb.state.value}"))
+                continue
+            self._run_one(acb)
 
     def _finalize(self, acb: ACB) -> None:
         plan = self.plans.get(acb.run_id)
         if plan and acb.task_id in plan["tasks"]:
             plan["tasks"][acb.task_id]["state"] = acb.state
+        # §2.4：_finalize 落盘（K-3：在结算/归档**之前**，保留活跃预留供 recover 恢复）
+        self.checkpoints.save(acb)
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
                          TaskState.DONE, TaskState.DONE_PARTIAL, TaskState.QUARANTINED):
             # 终态 + QUARANTINED 结算全部预留（文档 §5.5：未消耗部分归还，已消耗留账）
@@ -420,13 +454,24 @@ class Harness:
                 acb.budget_node = None
         self.slots.release(acb.id)
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
-            self.propagate_failure(acb.task_id,
-                                   plan["tasks"][acb.task_id].get("plan_version", 1)
-                                   if plan else 1)
+            # D14：patch 后旧 ACB 的 task_id 可能已不在 plan["tasks"] 中 → 用 .get() 安全取值
+            task = plan.get("tasks", {}).get(acb.task_id) if plan else None
+            plan_version = task.get("plan_version", 1) if isinstance(task, dict) else 1
+            self.propagate_failure(acb.task_id, plan_version)
         # level-triggered 对账（文档 §5.2.1）：事件即真相
         if plan:
             self.reconcile.reconcile_events(acb.run_id)
-            self.reconcile.rebuild_ready_set(acb.run_id)
+            # D9：重建 ready 集后真正 push 到调度器（原返回值被丢弃 → 后继永不调度）。
+            # 只调度「因本任务完成而新就绪」的后继：早已就绪（无前驱）的任务仍由
+            # run_task/dispatch_and_run 显式驱动，避免把非终态任务一并拉起（A2/A11/I12）。
+            ready = set(self.reconcile.rebuild_ready_set(acb.run_id))
+            for edge in plan.get("edges", []) or []:
+                if isinstance(edge, dict):
+                    src, dst = edge.get("from"), edge.get("to")
+                else:
+                    src, dst = edge[0], edge[1]
+                if src == acb.task_id and dst in ready:
+                    self.scheduler.push(dst)
 
     def escalate_quarantined(self, acb: ACB) -> Result:
         """人工 escalate：QUARANTINED → DEAD_LETTER，释放预算并传播 failure（文档 §5.5）。"""
@@ -442,6 +487,7 @@ class Harness:
         if plan and acb.task_id in plan["tasks"]:
             self.propagate_failure(acb.task_id,
                                    plan["tasks"][acb.task_id].get("plan_version", 1))
+        self.checkpoints.save(acb)              # §2.4：escalate 落盘
         return Result(Status.OK, {"state": acb.state.value})
 
     # ---- 恢复（文档 §5.8 / §4.3） -------------------------------
@@ -524,6 +570,7 @@ class Harness:
         plan = self.plans.get(acb.run_id)
         task = plan.get("tasks", {}).get(acb.task_id) if plan else None
         if task is None:
+            self.checkpoints.save(acb)
             return acb
         token = self._effective_token(acb)
         old_node = acb.budget_node
@@ -541,9 +588,11 @@ class Harness:
                 acb.budget_node = None
             self.acbs.pop(acb.id, None)
             self.acbs[fresh.id] = fresh
+            self.checkpoints.save(fresh)        # §2.4：requeue 成功落盘
             return fresh
         self.slots.try_acquire(acb.id)
         acb.needs_readmit = True
+        self.checkpoints.save(acb)              # §2.4：requeue 失败落盘
         return acb
 
     def _restore_acb(self, data: dict, resume_policy: str = "RESUME") -> ACB:
@@ -558,7 +607,10 @@ class Harness:
             acb.staged = dict(data["staged"])
             acb.read_set = dict(data["read_set"])
             acb.base_version = dict(data["base_version"])
-            acb.cursor = data["cursor"]
+            # §2.4：优先用 per-ACB 物化游标；旧 checkpoint 回退到 `cursor`
+            acb.cursor = data.get("materialized_cursor", data.get("cursor", 0))
+            acb.pre_image = dict(data.get("pre_image") or {})
+            acb.last_committed_seq = int(data.get("last_committed_seq", 0) or 0)
             acb.aging_deadline = data.get("aging_deadline")
             acb.step = data.get("effect_journal_offset", 0)
             acb.hitl_result = data.get("hitl_result")
@@ -570,6 +622,13 @@ class Harness:
             acb.no_progress_steps = data.get("no_progress_steps", 0)
             acb.needs_readmit = bool(data.get("needs_readmit", False))
             self._restore_budget(acb, data)
+            # §2.4：`slots_active` 交叉校验——非终态快照若不含本 ACB 槽位，
+            # 说明快照摄于槽位释放之后（如 `_finalize` 末），标记 needs_readmit。
+            snap_active = data.get("slots_active")
+            if (isinstance(snap_active, list) and snap_active
+                    and acb.state not in TASK_TERMINAL
+                    and acb.id not in snap_active):
+                acb.needs_readmit = True
             if not self.slots.try_acquire(acb.id):
                 acb.state = TaskState.QUARANTINED
                 acb.failure = "NO_SLOT"
@@ -671,7 +730,7 @@ class Harness:
                 node.consumed = int(data.get("budget_consumed", 0))
             restored = []
             consumed = node.consumed
-            for index, rid in enumerate(list(data.get("reservation_ids") or [])):
+            for index, rid in enumerate(list(data.get("reservation_ids") or [])):  # legacy 字段
                 existing = self.budget._reservations.get(rid)
                 if (existing is not None and existing[0] is not node
                         and existing[0] in self.budget._nodes.values()):
@@ -689,6 +748,12 @@ class Harness:
         old_subtree = node.subtree_reserved
         node.subtree_reserved = node.self_reserved + sum(
             c.subtree_reserved for c in node.children)
+        # §2.4：`budget_subtree` 交叉校验（叶节点严格；有 children 时子树按子节点重算，
+        # 可与快照合法偏离 → 不据此判不一致）
+        if not node.children:
+            expected_subtree = int(data.get("budget_subtree", node.subtree_reserved))
+            if expected_subtree != node.subtree_reserved:
+                consistent = False
         self._propagate_subtree_delta(node, node.subtree_reserved - old_subtree)
         acb.budget_node = node
         acb.needs_readmit = acb.needs_readmit or not consistent

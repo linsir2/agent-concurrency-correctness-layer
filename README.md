@@ -16,6 +16,7 @@
 | [S3 详细方案 v1.3](docs/s3-rebase-and-compensation.md) | 结构化冲突的 JSON 3-way merge（`SET` 增并删减 / GROW_ONLY / REPLACE / PIVOT）、有界 rebase 回路、Delete 哨兵与 tombstone、resolver 三层安全防护 |
 | [S4 详细方案 v1.2](docs/s4-budget-and-admission.md) | 预算树（`Reservation` 句柄 + 子树守恒 + 幂等 release/settle）、准入四级回滚、`SlotTracker`、能力签发收口、并发阴性对照 |
 | [S5 详细方案 v1.2](docs/s5-recovery-and-journals.md) | effect/compensation journal 落盘 + probe 三态反查 + 补偿批量原子与续做 + `recover` 的 `resume_policy` + K-6..K-14 边界收口 |
+| [S6 详细方案 v1.2](docs/s6-runtime-and-e2e.md) | 动作注册表 + guard 谓词列表与续租三态 + 事件游标真水位 + snapshot 补字段 + `edges` 前驱闸门与环检测 + `_drain_scheduler` 真消费 + U 用例去假绿 + 10 条不变量 E2E |
 | [设计规范 v1.12](docs/multi-agent-harness-design-final.md) | 主设计规范：定位与承诺边界、Z0–Z3 分区、组件契约、RSC 提交与补偿、不变量 I1–I14、20 张数据流/架构/调用/扇入扇出图 |
 | [里程碑与模块划分](docs/milestones.md) | MS0–MS10 共 11 个里程碑，每个含目标 / 新增模块 / 依赖 / 出入口条件 / 扩展点 / 承上启下；含实现前决策 D1–D16 |
 | [用例与对抗测试](docs/use-cases-and-adversarial-tests.md) | 4 个真实用例 + 13 个对抗用例，逐步推演表 + 跑通判定标准 |

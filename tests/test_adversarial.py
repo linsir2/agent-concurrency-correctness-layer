@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from conftest import (admit, commit, decision, finish, hitl, make_harness,
                       seed, stage, state_of, tool)
-from harness import Mode, Status, TaskState, Write
+from harness import Mode, Status, TaskState, Write, EventKind, TASK_TERMINAL
 from harness.runtime import CrashInjected
 from harness.storage.blob import canonical_bytes
 
@@ -318,20 +318,22 @@ def test_a10_write_skew_logical_deps():
 
 # ---------------------------------------------------------------- A11
 def test_a11_finalize_not_triggered_with_nonterminal():
-    """A11：存在非终态任务时不 finalize（no active 判据）。"""
+    """A11：存在非终态任务时不 finalize —— 断言 Run 的可观测状态（事件/账本/槽位）。"""
     h = make_harness()
-    plan = h.planner.plan("A11", [{"task_id": "T1"}, {"task_id": "T2"}])
+    plan = h.planner.plan("A11", [{"task_id": "T1", "min_budget": 10},
+                                  {"task_id": "T2", "min_budget": 10}])
     h.plans["A11"] = plan
 
     t1 = admit(h, "A11", plan, "T1")
     t2 = admit(h, "A11", plan, "T2")
     h.run_task(t1, [decision(1, finish())])
-    assert t1.state == TaskState.DONE
+    assert t1.state is TaskState.DONE
 
-    # T2 仍 ADMITTED（非终态）→ Run 不应 DONE
-    active = [t for t in plan["tasks"].values() if t["state"] not in
-              (TaskState.DONE, TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER)]
-    assert len(active) == 1
+    assert plan["tasks"]["T2"]["state"] not in TASK_TERMINAL
+    assert h.event_log.has("T2", EventKind.TASK_COMPLETED) is False
+    assert t2.budget_node is not None
+    assert t2.budget_node.node_id in h.budget._nodes
+    assert t2.id in h.slots.active_keys()
 
 
 # ---------------------------------------------------------------- A12

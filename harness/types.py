@@ -297,6 +297,7 @@ class ACB:
     last_action_sig: Optional[str] = None
     retry_budget: int = 3
     rebase_attempts: int = 0          # 冲突 rebase 已尝试次数（跨调用累加，§5.5）
+    last_committed_seq: int = 0       # §2.4：per-ACB 已提交事件序号（recover 去重水位校验）
     trace_id: str = ""
     span_id: str = ""
     parent: "ACB | None" = None

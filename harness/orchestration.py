@@ -28,6 +28,37 @@ def _normalize_required(t) -> dict:
     return {}
 
 
+def _edge_endpoints(edge) -> tuple:
+    """统一取边的 `(src, dst)`：兼容 dict（`from`/`to`）与二元组两种表示。"""
+    if isinstance(edge, dict):
+        return edge.get("from"), edge.get("to")
+    return edge[0], edge[1]
+
+
+def _has_cycle(edges) -> bool:
+    """DFS 三色环检测（§2.5）：有向图存在后向边 → `True`。"""
+    adj: dict = {}
+    for e in edges or []:
+        src, dst = _edge_endpoints(e)
+        if src is None or dst is None:
+            continue
+        adj.setdefault(src, []).append(dst)
+    color: dict = {}                       # 0=未访 1=在栈 2=已完成
+
+    def visit(n) -> bool:
+        color[n] = 1
+        for m in adj.get(n, []):
+            c = color.get(m, 0)
+            if c == 1:
+                return True
+            if c == 0 and visit(m):
+                return True
+        color[n] = 2
+        return False
+
+    return any(color.get(n, 0) == 0 and visit(n) for n in list(adj))
+
+
 class Planner:
     def __init__(self, harness) -> None:
         self.h = harness
@@ -55,7 +86,12 @@ class Planner:
         return plan
 
     def add_logical_edge(self, plan: dict, from_id: str, to_id: str) -> None:
-        plan["edges"].append({"from": from_id, "to": to_id, "kind": "LOGICAL"})
+        """加逻辑边（§2.5）：先落边再做 DFS 环检测；**含环的边不落盘**。"""
+        edges = plan.setdefault("edges", [])
+        edges.append({"from": from_id, "to": to_id, "kind": "LOGICAL"})
+        if _has_cycle(edges):
+            edges.pop()
+            raise ValueError(f"logical edge {from_id}->{to_id} would form a cycle")
 
     def merge_policy_of(self, resource: str) -> dict:
         """§3.2：从 task spec 的 `merge_policy` 读 per-key 策略（缺省空 dict）。
@@ -72,13 +108,19 @@ class Planner:
         return {}
 
     def patch(self, plan: dict, diagnosis: dict) -> dict:
-        """文档 §8.1：诊断 → PlanPatch（复用 logical_subgoal_id）。"""
+        """文档 §8.1：诊断 → PlanPatch（复用 logical_subgoal_id）。
+
+        D6：任务改名（T1→T1'）后，边仍写旧 id；此处记录 `旧 id → logical_subgoal_id`
+        别名，供 `_predecessors_done` 兜底解析，避免后继永久 `PREDECESSOR_NOT_DONE`。
+        """
         new_plan = copy.deepcopy(plan)
         new_plan["version"] = plan["version"] + 1
         remade: dict[str, dict] = {}
+        id_aliases = new_plan.setdefault("_id_aliases", {})
         for tid, task in new_plan["tasks"].items():
             if task["logical_subgoal_id"] in diagnosis.get("failing_subgoals", []):
                 new_tid = f"{tid}'"
+                id_aliases[tid] = task["logical_subgoal_id"]
                 task["task_id"] = new_tid
                 task["state"] = TaskState.PLANNED
                 task["plan_version"] = new_plan["version"]
@@ -147,15 +189,51 @@ class Dispatcher:
             acb.id, token, tool, path, network=network, data_class=data_class)
             for tool, path in required.items())
 
+    def _predecessors_done(self, plan: dict, task_id: str) -> bool:
+        """§2.5 前驱闸门：所有指向 `task_id` 的边，其 `src` 必须已 DONE/CANCELLED。
+
+        - `src` 不在 `plan["tasks"]` 中 → 先按 `logical_subgoal_id` 兜底匹配
+          （D6：patch 把任务改名 T1→T1'，但边仍写旧 id，旧 id 需能解析到 remake 任务）；
+        - 兜底仍失败 → 视为未完成（保守拒绝）；
+        - 状态用 `TaskState`（str 枚举）比较，兼容字符串写法。
+        """
+        tasks = plan.get("tasks", {}) or {}
+        aliases = plan.get("_id_aliases", {}) or {}
+        by_subgoal: dict = {}
+        for t in tasks.values():
+            subgoal = t.get("logical_subgoal_id") if isinstance(t, dict) else None
+            if subgoal:
+                by_subgoal.setdefault(subgoal, t)
+        for edge in plan.get("edges", []) or []:
+            src, dst = _edge_endpoints(edge)
+            if dst != task_id:
+                continue
+            src_task = tasks.get(src)
+            if src_task is None:                    # D6：旧 id → 按子目标兜底匹配 remake 任务
+                subgoal = aliases.get(src)
+                src_task = by_subgoal.get(subgoal) if subgoal else None
+            state = src_task.get("state") if isinstance(src_task, dict) else None
+            if state not in (TaskState.DONE, TaskState.CANCELLED):
+                return False
+        return True
+
     def try_admit(self, task: dict, run_id: str,
                   required_tools: set[str] | None = None,
-                  token=None) -> ACB:
-        """准入谓词（文档 §5）：slots → 能力 → 预算 → 逻辑，失败零残留。"""
+                  token=None, plan: dict | None = None) -> ACB:
+        """准入谓词（文档 §5）：前驱 → slots → 能力 → 预算 → 逻辑，失败零残留。
+
+        `plan` 可选：显式传入（生产入口）或从 `h.plans[run_id]` 取；
+        **拿不到 plan/edges 时安全跳过**前驱闸门（向后兼容）。
+        """
         acb = ACB(id=f"A-{run_id}-{task['task_id']}-{self._next_attempt()}",
                   run_id=run_id, task_id=task["task_id"],
                   logical_subgoal_id=task["logical_subgoal_id"])
         if token is not None:                 # 显式 token 绑定到 ACB（§5.9）
             acb.capability = token
+
+        eff_plan = plan if plan is not None else self.h.plans.get(run_id)
+        if eff_plan is not None and not self._predecessors_done(eff_plan, task["task_id"]):
+            return self._deny(acb, "PREDECESSOR_NOT_DONE")
 
         node = None
         resv = None

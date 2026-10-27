@@ -7,7 +7,7 @@
 ## 运行
 
 ```bash
-cd /workspace && python3 -m pytest tests/ -q     # 91 passed
+cd /workspace && python3 -m pytest tests/ -q     # 123 passed
 ```
 
 无第三方依赖（仅标准库 + pytest）。
@@ -42,14 +42,16 @@ cd /workspace && python3 -m pytest tests/ -q     # 91 passed
 | `tests/test_ms1_rebase_loop.py` | MS1 出口：create 可补偿 + 幂等 / rebase 回路与状态回边 / 重试有界与预算消耗 / Delete 哨兵补偿交叉（4 个测试） |
 | `tests/test_ms2_budget.py` | MS2 出口：预算守恒 + 幂等释放 / 并发 reserve + 阴性对照 + yield 注入 / 准入四级零残留 / dispatch_and_run 唯一入口 / 能力收口（14 个测试） |
 | `tests/test_ms3_recovery.py` | MS3 出口：effect UNKNOWN 反查三分支 / 补偿中途崩溃续做（批次原子）/ idem_key 稳定性 / 逐笔账本恢复 / 补偿幂等键 / 生产不变量 / network+data_class+签名 / requeue_readmit（8 个测试） |
+| `tests/test_ms4_runtime.py` | MS4 出口：动作注册表（5 kind + 未知 kind + 异常映射 + 重复注册）/ guard 谓词与续租三态 / 事件游标 / `_drain_scheduler` 防递归 / 前驱闸门 / 环检测（16 个测试） |
+| `tests/test_e2e_invariants.py` | 端到端不变量：I1/I2/I3/I5/I6/I8/I10/I9/I12 + I4/I7/I11 补强（10 个测试，全部串行确定性构造） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |
 | `tests/test_adversarial.py` | A1–A13（含 A7b 背压） |
 | `tests/test_ms7_capability.py` | MS7 出口：能力强制（2 个测试） |
 | `tests/test_ms8_conformance.py` | MS8 出口：I1/I2/I3/I5/I6/I7/I8 |
 | `tests/test_ms8_spec.py` | MS8 出口：I9/I10/I13 + 资源模型 + 协调协议 + 收据链 |
 
-> **总计 91 个测试**：19 个用例测试 + 72 个里程碑出口/规范测试。
-> 按里程碑切子集：`pytest -m ms0`（14 个）、`pytest -m ms1`（15 个）、`pytest -m ms2`（9 个）、`pytest -m ms3`（8 个）；markers 见 `pyproject.toml`。
+> **总计 123 个测试**：19 个用例测试 + 104 个里程碑出口/规范/E2E 测试。
+> 按里程碑切子集：`pytest -m ms0`（14）、`-m ms1`（15）、`-m ms2`（9）、`-m ms3`（8）、`-m ms4`（16）、`-m e2e`（10）；markers 见 `pyproject.toml`。
 
 ## 设计要点
 

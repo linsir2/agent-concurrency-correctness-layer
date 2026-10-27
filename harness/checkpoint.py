@@ -67,12 +67,15 @@ class CheckpointStore:
             "read_set": dict(acb.read_set),
             "base_version": dict(acb.base_version),
             "cursor": acb.cursor,
+            "materialized_cursor": acb.cursor,       # §2.4：per-ACB 物化游标
+            "pre_image": copy.deepcopy(acb.pre_image),   # §2.4：补偿 PIVOT 判定依赖
+            "last_committed_seq": int(getattr(acb, "last_committed_seq", 0) or 0),
             "aging_deadline": acb.aging_deadline,
             "effect_journal_offset": acb.step,
             "hitl_result": copy.deepcopy(acb.hitl_result),
             "rebase_attempts": acb.rebase_attempts,
             "retry_budget": acb.retry_budget,
-            "reservation_ids": list(acb.reservation_ids),
+            "reservation_ids": list(acb.reservation_ids),   # legacy：新格式用 `reservations` 逐笔账本
             "needs_readmit": bool(getattr(acb, "needs_readmit", False)),
             "slots_active": (sorted(self.slots.active_keys())
                              if self.slots is not None else []),
