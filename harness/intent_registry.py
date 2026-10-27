@@ -126,6 +126,23 @@ class IntentRegistry:
             for lease in self._leases.values():
                 lease.valid = False
 
+    def get_epoch(self) -> int:
+        """当前 run 级 epoch（run 级 fencing 依据，§4.4）。"""
+        with self._lock:
+            return self._epoch
+
+    def set_epoch(self, epoch: int) -> int:
+        """从**持久化存储**恢复 run 级 epoch（单调，禁止回绕）。
+
+        S10a §3.4：跨进程恢复时 epoch 必须读持久化值，否则新进程从 0 开始
+        → 旧租约被误判为有效（fencing 失效）。
+        """
+        with self._lock:
+            epoch = int(epoch or 0)
+            if epoch > self._epoch:
+                self._epoch = epoch
+            return self._epoch
+
     def compatible(self, dep_id: str, agent_id: str, kind: str = "CONTRACT") -> bool:
         """准入判定（文档 §5.2⑤ / §7.3）——**真实 fail-fast**。
 

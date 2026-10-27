@@ -15,6 +15,7 @@ import uuid
 from typing import Callable, Iterable, Optional
 
 from .clock import Clock, SystemClock
+from .storage._lock import WAL_ORDER, _FileLock, wal_lock_path
 from .storage.wal import Wal
 from .types import Event, EventKind
 
@@ -62,6 +63,18 @@ class _EventLogBase:
         self._events: list[Event] = []
         self._by_subject: dict[str, list[Event]] = {}
         self._subscribers: list[Callable[[Event], None]] = []
+        self._close_hooks: list[Callable[[], None]] = []
+
+    def on_close(self, fn: Callable[[], None]) -> None:
+        """注册关闭钩子（写者会话结束：释放单写者租约等）。"""
+        self._close_hooks.append(fn)
+
+    def _run_close_hooks(self) -> None:
+        for fn in list(self._close_hooks):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001  # 关闭钩子不得阻断关闭
+                pass
 
     def _index(self, ev: Event) -> Event:
         self._events.append(ev)
@@ -118,6 +131,9 @@ class EventLog(_EventLogBase):
         self._lock = threading.RLock()
         self._seq = 0
 
+    def close(self) -> None:
+        self._run_close_hooks()
+
     def append(self, kind, subject: str, payload=None, producer: str = "",
                caused_by: str = "", idempotency_key: str = "", *,
                run_id: str = "", notify: bool = True) -> Event:
@@ -148,15 +164,44 @@ class EventLog(_EventLogBase):
 
 
 class WalEventLog(_EventLogBase):
-    """WAL 实现：`append_frame` 成功返回即已落盘。"""
+    """WAL 实现：`append_frame` 成功返回即已落盘。
+
+    S10b §3.2/§3.3/§3.4：
+    - `wal.lock`（跨进程 flock）覆盖 append 的「读-分配-写-fdatasync」全程；
+    - `eventlog._lock` 是全序末位（进程内 RLock，仅护内存索引）；
+    - fencing：`set_fencing(...)` 注入 store_flock + epoch 读口 + 本写者 epoch，
+      append 前**同一 flock 内**复验（`Wal.append_frame`）。
+    """
 
     def __init__(self, path, clock: Optional[Clock] = None,
                  fsync: bool = True) -> None:
         super().__init__(clock)
+        # eventlog._lock：全序末位（进程内，无跨进程语义）
         self._lock = threading.RLock()
-        self._wal = Wal(path, fsync=fsync)
+        # wal.lock：全序第 2 位（resource → receipts → wal → store → eventlog）
+        self._wal_lock = _FileLock(wal_lock_path(path), order=WAL_ORDER)
+        self._wal = Wal(path, fsync=fsync, lock=self._wal_lock)
+        # S10b §3.4：fencing 注入点（由 Harness 在组装后设置；默认关闭）
+        self._fencing_lock = None
+        self._fencing_reader = None
+        self._epoch_provider = None
         for rec in self._wal.records():
             self._index(_event(rec))
+
+    def set_fencing(self, *, lock, epoch_reader, epoch_provider) -> None:
+        """注入 fencing 三件套（S10b §3.4）。
+
+        - `lock`：store_flock（与 `bump_epoch` 共用同一把 `store.lock`）；
+        - `epoch_reader`：读 store.json 的 run 级 epoch；
+        - `epoch_provider`：返回**本写者**当前 run 级 epoch（用于复验比较）。
+        """
+        self._fencing_lock = lock
+        self._fencing_reader = epoch_reader
+        self._epoch_provider = epoch_provider
+
+    @property
+    def _fencing_enabled(self) -> bool:
+        return self._fencing_lock is not None and self._fencing_reader is not None
 
     @property
     def truncated_at(self) -> Optional[int]:
@@ -172,15 +217,24 @@ class WalEventLog(_EventLogBase):
         }], notify=notify)[0]
 
     def append_batch(self, drafts: list[dict], notify: bool = True) -> list[Event]:
-        with self._lock:
-            prepared = [
-                _draft(d["kind"], d["subject"], d.get("payload"),
-                       d.get("producer", ""), d.get("caused_by", ""),
-                       d.get("idempotency_key", ""), d.get("run_id", ""),
-                       self._clock)
-                for d in drafts
-            ]
+        prepared = [
+            _draft(d["kind"], d["subject"], d.get("payload"),
+                   d.get("producer", ""), d.get("caused_by", ""),
+                   d.get("idempotency_key", ""), d.get("run_id", ""),
+                   self._clock)
+            for d in drafts
+        ]
+        # ① wal.lock（+ 可选 store_flock）覆盖「读-分配-写-fdatasync」全程
+        if self._fencing_enabled:
+            fencing_epoch = int(self._epoch_provider() or 0)
+            records = self._wal.append_frame(
+                prepared, fencing_epoch=fencing_epoch,
+                fencing_lock=self._fencing_lock,
+                fencing_reader=self._fencing_reader)
+        else:
             records = self._wal.append_frame(prepared)      # ← 提交点
+        # ② eventlog._lock（全序末位）：仅护内存索引
+        with self._lock:
             events = [self._index(_event(rec)) for rec in records]
         if notify:
             self._notify(events)
@@ -188,3 +242,4 @@ class WalEventLog(_EventLogBase):
 
     def close(self) -> None:
         self._wal.close()
+        self._run_close_hooks()

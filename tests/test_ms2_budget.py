@@ -423,6 +423,39 @@ def test_ms2_restore_budget_children_never_overwritten():
 
 
 @pytest.mark.ms2
+def test_ms2_restore_budget_replay_recomputes_parent_subtree():
+    """P0-5′（重放路径）：带 `budget_cursor` → 走 EventLog 重放，parent.subtree
+    由子节点重算，**不被快照覆盖**（旧用例走旧分支，重放路径未被触发）。"""
+    h = make_harness(run_limits=100)
+    parent = h.budget.create_node("P", 100)
+    h.budget.create_node("C1", 60, parent_id="P")
+    h.budget.create_node("C2", 60, parent_id="P")
+    h.budget.reserve("C1", 20)
+    h.budget.reserve("C2", 15)
+    assert parent.subtree_reserved == 35
+
+    # 新进程：独立 budget 树，共享 EventLog（重放真相源）
+    h2 = Harness(run_limits=100, event_log=h.event_log)
+    acb = ACB(id="A-RB-RP", run_id="R", task_id="T1")
+    data = {
+        "budget_node_id": "P", "budget_parent_id": "run", "budget_limits": 100,
+        "budget_self": 0, "budget_subtree": 999, "budget_consumed": 0,
+        "budget_epoch": h.budget._epoch,
+        "budget_cursor": h.budget._last_budget_seq,
+        "run_limits": 100,
+        "reservations": [],
+    }
+    h2._restore_budget(acb, data)
+
+    node = h2.budget._nodes["P"]
+    assert node.subtree_reserved == 35, \
+        f"重放路径 parent.subtree 被快照覆盖：{node.subtree_reserved}（应 35）"
+    assert node.self_reserved == 0
+    assert acb.needs_readmit is False
+    h2.budget.check_invariants(cross_process=True)
+
+
+@pytest.mark.ms2
 def test_ms2_restore_budget_uses_limits_and_parent():
     """高-6：用 checkpoint 的 budget_limits/parent 重建，不用 max(...) 当上限。"""
     h = make_harness(run_limits=100)

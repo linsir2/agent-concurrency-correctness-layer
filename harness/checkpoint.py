@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .event_log import EventLog
+from .storage._lock import STORE_ORDER, _FileLock
 from .storage.atomic import atomic_write, fsync_dir, write_all
 from .storage.codec import CodecError, decode, dumps, encode, loads
 from .types import Action, Event, EventKind
@@ -73,46 +74,6 @@ class CheckpointCorrupt(Exception):
         super().__init__(f"checkpoint corrupt: {ref} ({reason})")
 
 
-class _FileLock:
-    """跨进程 `flock`；同线程可重入（`flock` 以 open file description 计）。"""
-
-    def __init__(self, path: str | Path) -> None:
-        self._path = os.fspath(path)
-        self._local = threading.local()
-
-    @contextmanager
-    def __call__(self):
-        depth = getattr(self._local, "depth", 0)
-        if depth:
-            self._local.depth = depth + 1
-            try:
-                yield
-            finally:
-                self._local.depth -= 1
-            return
-
-        parent = os.path.dirname(os.path.abspath(self._path))
-        os.makedirs(parent, exist_ok=True)
-        try:
-            import fcntl
-        except ImportError:  # pragma: no cover - 非 POSIX 平台降级为仅线程互斥
-            fcntl = None
-
-        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        self._local.depth = 1
-        try:
-            yield
-        finally:
-            self._local.depth = 0
-            try:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
-
-
 @dataclass
 class EffectEntry:
     """外部副作用条目（三态必处理，§3.3）。"""
@@ -142,6 +103,9 @@ class CheckpointStore:
         self.slots = None            # 由 Harness 注入，用于快照活跃槽位
         self.event_log = None        # 必存属性（Harness 无条件注入）
         self.applied_event_ids = None  # 由 Harness 注入，用于恢复去重持久化
+        self.budget = None           # S10a：由 Harness 注入（聚合值 + 游标同临界区读取）
+        self.run_limits = None       # S10a：配置的 run 级上限（漂移检测基准）
+        self._epoch = 0              # S10a：run 级 fencing epoch（内存版）
 
     def save(self, acb) -> str:
         ref = f"CP{next(self._counter)}"
@@ -166,9 +130,78 @@ class CheckpointStore:
                             logical_subgoal_id: str) -> str | None:
         return None
 
+    # ---- S10a §3.4：run 级 fencing epoch（同一 flock 内 read-modify-write）----
+    def read_epoch(self) -> int:
+        return int(getattr(self, "_epoch", 0) or 0)
+
+    def bump_epoch(self) -> int:
+        """RMW：读旧值 + 1 写回（**同一临界区**，禁止跨 flock 读-改-写）。"""
+        self._epoch = self.read_epoch() + 1
+        return self._epoch
+
+    def _budget_view(self, node) -> dict:
+        """S10a §2.1：在 `budget._lock` **同一临界区**内取聚合值 + `budget_cursor`。
+
+        必须与事件 append 同临界区，否则「聚合含新 reserve 而 cursor 不含」→
+        重放双份（§8 P1-3）。`budget_siblings` **仅作交叉校验，非权威**（§2.2）。
+        """
+        budget = getattr(self, "budget", None)
+        if budget is None:
+            return {
+                "run_limits": getattr(self, "run_limits", None),
+                "budget_cursor": 0,
+                "budget_epoch": 0,
+                "budget_node_id": node.node_id if node is not None else None,
+                "budget_parent_id": (node.parent.node_id
+                                     if node is not None and node.parent is not None
+                                     else None),
+                "budget_limits": node.limits if node is not None else None,
+                "budget_self": node.self_reserved if node is not None else 0,
+                "budget_subtree": node.subtree_reserved if node is not None else 0,
+                "budget_consumed": node.consumed if node is not None else 0,
+                "budget_folded_consumed": (node.folded_consumed
+                                           if node is not None else 0),
+                "budget_siblings": {},
+            }
+        with budget._lock:
+            return {
+                "run_limits": budget.root.limits,
+                "budget_cursor": int(budget._last_budget_seq),
+                "budget_epoch": int(budget._epoch),
+                "budget_node_id": node.node_id if node is not None else None,
+                "budget_parent_id": (node.parent.node_id
+                                     if node is not None and node.parent is not None
+                                     else None),
+                "budget_limits": node.limits if node is not None else None,
+                "budget_self": node.self_reserved if node is not None else 0,
+                "budget_subtree": node.subtree_reserved if node is not None else 0,
+                "budget_consumed": node.consumed if node is not None else 0,
+                "budget_folded_consumed": (node.folded_consumed
+                                           if node is not None else 0),
+                # 非权威：仅供 `_restore_budget` 交叉校验，绝不作为重建基线
+                "budget_siblings": self._budget_siblings(node),
+            }
+
+    def _budget_siblings(self, node) -> dict:
+        """与本节点**同 parent** 的兄弟节点聚合摘要（仅交叉校验，非权威）。"""
+        if node is None or node.parent is None:
+            return {}
+        out: dict = {}
+        for c in node.parent.children:
+            if c is node:
+                continue
+            out[c.node_id] = {
+                "self_reserved": c.self_reserved,
+                "subtree_reserved": c.subtree_reserved,
+                "consumed": c.consumed,
+                "folded_consumed": c.folded_consumed,
+            }
+        return out
+
     def _build_payload(self, acb) -> dict:
         """构造扁平 payload（内存 / 文件两版共用）。"""
         node = acb.budget_node
+        view = self._budget_view(node)
         return {
             "acb_id": acb.id,
             "run_id": acb.run_id,
@@ -198,16 +231,19 @@ class CheckpointStore:
             "needs_readmit": bool(getattr(acb, "needs_readmit", False)),
             "slots_active": (sorted(self.slots.active_keys())
                              if self.slots is not None else []),
-            "budget_node_id": node.node_id if node is not None else None,
-            "budget_parent_id": (node.parent.node_id
-                                 if node is not None and node.parent is not None
-                                 else None),
-            "budget_limits": node.limits if node is not None else None,
-            "budget_self": node.self_reserved if node is not None else 0,
-            "budget_subtree": node.subtree_reserved if node is not None else 0,
-            "budget_consumed": node.consumed if node is not None else 0,
-            "budget_folded_consumed": (node.folded_consumed
-                                       if node is not None else 0),
+            # ---- S10a：run_limits 持久化 + budget_cursor（漂移检测 / 重放锚点）----
+            "run_limits": view["run_limits"],
+            "budget_cursor": view["budget_cursor"],
+            "budget_epoch": view["budget_epoch"],
+            "budget_node_id": view["budget_node_id"],
+            "budget_parent_id": view["budget_parent_id"],
+            "budget_limits": view["budget_limits"],
+            "budget_self": view["budget_self"],
+            "budget_subtree": view["budget_subtree"],
+            "budget_consumed": view["budget_consumed"],
+            "budget_folded_consumed": view["budget_folded_consumed"],
+            # 非权威：仅交叉校验（§2.2），权威值来自 EventLog 重放
+            "budget_siblings": view["budget_siblings"],
             # ---- S5 第一波新增（§5.1/§5.2/§4.3）----
             "reservations": self._reservations_snapshot(node),
             "budget_path": self._budget_path(node),
@@ -279,7 +315,8 @@ class FileCheckpointStore(CheckpointStore):
         super().__init__(root=root)
         self.root = Path(root)
         self._thread_lock = threading.RLock()
-        self._flock = _FileLock(self.root / "store.lock")
+        # store.lock：三锁全序的第 3 位（resource → receipts → wal → store → eventlog）
+        self._flock = _FileLock(self.root / "store.lock", order=STORE_ORDER)
         self._meta: dict = {}
         self._init_meta()
 
@@ -476,6 +513,65 @@ class FileCheckpointStore(CheckpointStore):
         if not isinstance(meta, dict) or "store_uuid" not in meta:
             raise RuntimeError("store.json 缺少 store_uuid")
         return meta
+
+    # ---- S10a §3.4：run 级 fencing epoch ----
+    def read_epoch(self) -> int:
+        """**无锁原子读**（S10 终审 P0-1 修复）。
+
+        `store.json` 由 `atomic_write`（temp + `os.replace`）写入 → 无锁读要么
+        拿到旧完整值、要么新完整值，**不会撕裂**。这样 `budget._lock → _emit →
+        append → read_epoch` 路径**不取 `store.lock`**，断开与
+        `store.lock → _build_payload → budget._lock` 的 AB-BA 环（否则 durable
+        模式下并发结算 = 进程挂死）。
+
+        失败（文件缺失/损坏）返回 0 —— 调用方据此判定「无 fencing 信息」，
+        由上层 `needs_readmit` 兜底，绝不因读 epoch 失败而抛。
+        """
+        try:
+            meta = loads(self._meta_path.read_bytes().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return 0
+        if not isinstance(meta, dict):
+            return 0
+        return int(meta.get("epoch", 0) or 0)
+
+    def bump_epoch(self) -> int:
+        """同一 `store.lock` 临界区内 read-modify-write（禁止「读旧值+1 写回」）。"""
+        with self._thread_lock, self._flock():
+            meta = self._read_meta_locked()
+            meta["epoch"] = int(meta.get("epoch", 0) or 0) + 1
+            atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
+            self._meta = meta
+            return int(meta["epoch"])
+
+    # ---- S10a §2.5：槽位下沉共享存储（与预算同属一个配额服务）----
+    def read_slots(self) -> list:
+        with self._thread_lock, self._flock():
+            return list(self._read_meta_locked().get("slots_active", []) or [])
+
+    def write_slots(self, keys) -> None:
+        with self._thread_lock, self._flock():
+            meta = self._read_meta_locked()
+            meta["slots_active"] = list(keys or [])
+            atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
+            self._meta = meta
+
+    def update_slots(self, mutate):
+        """**同一 flock 内**的读-判-写 CAS（槽位占用/释放）。
+
+        `mutate(current_set) -> (new_set, result)`。旧的 `read_slots` +
+        `write_slots` 是两次独立 flock，中间无锁 → 两个进程都读到 `{}` → 都判定
+        可占 → 最终只剩后者（`max_concurrent` 被击穿）。合并为一次临界区后，
+        判定与写入原子完成。
+        """
+        with self._thread_lock, self._flock():
+            meta = self._read_meta_locked()
+            current = set(meta.get("slots_active") or [])
+            new_keys, result = mutate(current)
+            meta["slots_active"] = sorted(new_keys)
+            atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
+            self._meta = meta
+            return result
 
     # ---- 路径 -------------------------------------------------------
     def _ref_path(self, ref: str) -> Path:

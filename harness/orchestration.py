@@ -167,34 +167,113 @@ class Planner:
 
 
 class SlotTracker:
-    """活跃槽位计数（可回滚的资源，文档 §5.2）。"""
+    """活跃槽位计数（可回滚的资源，文档 §5.2）。
 
-    def __init__(self, limit: int) -> None:
+    S10a §2.5：可选 `shared` 后端（durable checkpoint store）—— 槽位与预算同属
+    一个配额服务，避免「槽位与预算各超各的」。`shared=None` 时退化为纯进程内计数
+    （保持既有语义）。
+    """
+
+    def __init__(self, limit: int, shared=None) -> None:
         self._limit = limit
         self._active: set[str] = set()
         self._lock = threading.Lock()
+        self._shared = shared
+
+    def _shared_read(self) -> set[str]:
+        if self._shared is None:
+            return set()
+        reader = getattr(self._shared, "read_slots", None)
+        if not callable(reader):
+            return set()
+        try:
+            return set(reader())
+        except Exception:  # noqa: BLE001
+            return set()
+
+    def _shared_write(self, keys) -> None:
+        if self._shared is None:
+            return
+        writer = getattr(self._shared, "write_slots", None)
+        if not callable(writer):
+            return
+        try:
+            writer(sorted(keys))
+        except Exception:  # noqa: BLE001
+            pass
 
     def try_acquire(self, key: str) -> bool:
+        """占用槽位。
+
+        共享后端支持 `update_slots`（同一 flock 内 CAS）时，判定与写入**原子**
+        完成；否则退回旧的 `read + write`（仅内存后端）。
+        """
+        cas = getattr(self._shared, "update_slots", None)
+        if callable(cas):
+            def mutate(shared: set[str]):
+                if key in shared:
+                    return shared, True          # 幂等
+                if len(shared) >= self._limit:
+                    return shared, False
+                return shared | {key}, True
+
+            try:
+                outcome = cas(mutate)
+            except Exception:  # noqa: BLE001
+                outcome = None
+            if outcome is not None:
+                ok = bool(outcome)
+                with self._lock:
+                    if ok:
+                        self._active.add(key)
+                return ok
         with self._lock:
-            if key in self._active:
+            active = self._active | self._shared_read()
+            if key in active:
+                self._active.add(key)
                 return True                     # 幂等
-            if len(self._active) >= self._limit:
+            if len(active) >= self._limit:
                 return False
             self._active.add(key)
+            self._shared_write(active | {key})
             return True
 
     def release(self, key: str) -> None:
+        cas = getattr(self._shared, "update_slots", None)
+        if callable(cas):
+            try:
+                cas(lambda shared: (shared - {key}, None))
+                with self._lock:
+                    self._active.discard(key)
+                return
+            except Exception:  # noqa: BLE001
+                pass
         with self._lock:
             self._active.discard(key)
+            shared = self._shared_read()
+            shared.discard(key)
+            self._shared_write(shared)
 
     @property
     def active(self) -> int:
+        reader = getattr(self._shared, "read_slots", None)
+        if callable(reader):
+            try:
+                return len(set(reader()))
+            except Exception:  # noqa: BLE001
+                pass
         with self._lock:
-            return len(self._active)
+            return len(self._active | self._shared_read())
 
     def active_keys(self) -> list[str]:
+        reader = getattr(self._shared, "read_slots", None)
+        if callable(reader):
+            try:
+                return sorted(set(reader()))
+            except Exception:  # noqa: BLE001
+                pass
         with self._lock:
-            return list(self._active)
+            return sorted(self._active | self._shared_read())
 
 
 class Dispatcher:
@@ -275,14 +354,32 @@ class Dispatcher:
         resv = None
         declared: list[str] = []
         committed = False                           # 哨兵：副作用全部完成才置 True
+        with self.h.budget.suppressed():            # 准入事务：失败零事件残留
+            committed = self._try_admit_commit(
+                acb, task, required_tools, eff_plan)
+        if committed:
+            self.h.budget.flush_pending()           # 成功 → 同帧 append_batch
+        else:
+            self.h.budget.discard_pending()         # 失败 → 丢弃草稿
+        return acb
+
+    def _try_admit_commit(self, acb: ACB, task: dict, required_tools,
+                          eff_plan: dict | None) -> bool:
+        """准入临界区（槽位 → 能力 → 预算 → 逻辑）；失败逆序回滚。"""
+        node = None
+        resv = None
+        declared: list[str] = []
+        committed = False
         try:
             # ① slots
             if not self.h.slots.try_acquire(acb.id):
-                return self._deny(acb, "NO_SLOT")
+                self._deny(acb, "NO_SLOT")
+                return False
 
             # ② 能力
             if required_tools and not self._capability_ok(acb, required_tools):
-                return self._deny(acb, "DENIED_CAPABILITY")
+                self._deny(acb, "DENIED_CAPABILITY")
+                return False
 
             # ③ 预算：limits 留出重试余量，但只预留 min_budget
             min_budget = task["footprint"]["min_budget"]
@@ -291,11 +388,13 @@ class Dispatcher:
                 f"B-{acb.id}", limits,
                 parent_id=task["footprint"].get("parent_budget", "run"))
             if node is None:
-                return self._deny(acb, "BUDGET_UNAVAILABLE")
+                self._deny(acb, "BUDGET_UNAVAILABLE")
+                return False
             node.owner = acb.id
             resv = self.h.budget.reserve(node.node_id, min_budget)
             if resv is None:
-                return self._deny(acb, "BUDGET_EXHAUSTED")
+                self._deny(acb, "BUDGET_EXHAUSTED")
+                return False
             acb.reservation_ids = [resv.reservation_id]
             acb.budget_node = node
 
@@ -304,13 +403,12 @@ class Dispatcher:
                 self.h.intents.declare_logical(dep["id"], acb.id, dep["kind"])
                 declared.append(dep["id"])
                 if not self.h.intents.compatible(dep["id"], acb.id, dep["kind"]):
-                    return self._deny(acb, "CONTRACT_CONFLICT")
+                    self._deny(acb, "CONTRACT_CONFLICT")
+                    return False
 
             acb.state = TaskState.ADMITTED
-            self.h.event_log.append(EventKind.BUDGET_RESERVED, node.node_id,
-                                    {"amount": resv.amount})
             committed = True
-            return acb
+            return True
         finally:
             if not committed:
                 self._rollback(acb, node, resv, declared)

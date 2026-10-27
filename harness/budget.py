@@ -5,6 +5,13 @@
 - `subtree_reserved` 显式维护「自身 + 全部后代」占用，沿祖先链传播（O(depth)）；
 - `reserve` 返回 `Reservation` 句柄，`release(reservation_id)` **幂等**；
 - 单写者锁，检查与扣减同临界区，避免「check + deduct」非原子超支。
+
+v1.11（S10a §2.1）：**预算变更事件溯源 = 唯一真相源**。
+- `reserve` / `release` / `settle` / `consume` / `archive_node` / `create_node`
+  在**同一临界区**内 append 对应 `BUDGET_*` 事件（`notify=False`，避免触发 gc）；
+- `check_invariants` 增 **3 条全局对账等式**；树完整性校验
+  （`declared` = EventLog 声明的节点集 vs `rebuilt` = `_nodes`）**仅跨进程恢复启用**
+  （`cross_process=True`），单进程保持原语义（§8.3 防护 3）。
 """
 
 from __future__ import annotations
@@ -12,9 +19,11 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Optional
 
-from .types import Result, Status
+from .types import Event, EventKind, Result, Status
 
 
 class InvariantError(RuntimeError, AssertionError):
@@ -79,18 +88,73 @@ class BudgetNode:
         return sum(c.subtree_reserved for c in self.children)
 
 
+_BUDGET_KINDS = frozenset({
+    EventKind.BUDGET_NODE_CREATED, EventKind.BUDGET_RESERVED,
+    EventKind.BUDGET_CONSUMED, EventKind.BUDGET_RELEASED,
+    EventKind.BUDGET_SETTLED, EventKind.BUDGET_ARCHIVED,
+    EventKind.BUDGET_EPOCH,
+})
+_BUDGET_VALUES = frozenset(k.value for k in _BUDGET_KINDS)
+
+
+def _is_budget_kind(kind) -> bool:
+    if isinstance(kind, EventKind):
+        return kind in _BUDGET_KINDS
+    value = getattr(kind, "value", kind)
+    return str(value) in _BUDGET_VALUES
+
+
+def _node_payload(node: BudgetNode, rid: str, amount: int, consumed: int,
+                  state: str, epoch: int) -> dict:
+    """统一的 BUDGET_* payload（node_id/rid/amount/consumed/state/limits/parent_id/epoch）。"""
+    return {
+        "node_id": node.node_id,
+        "rid": rid,
+        "amount": amount,
+        "consumed": consumed,
+        "state": state,
+        "limits": node.limits,
+        "parent_id": node.parent.node_id if node.parent is not None else None,
+        "budget_epoch": epoch,
+    }
+
+
 class BudgetManager:
-    def __init__(self, run_limits: int = 1000, tombstone_ttl_s: float = 86400.0) -> None:
+    def __init__(self, run_limits: int = 1000, tombstone_ttl_s: float = 86400.0,
+                 event_log=None) -> None:
         self.root = BudgetNode("run", run_limits)
         self._lock = threading.RLock()
         self._nodes: dict[str, BudgetNode] = {"run": self.root}
         # 全局索引：rid -> (node, resv)；生命周期长于节点（tombstone）
         self._reservations: dict[str, tuple[BudgetNode, Reservation]] = {}
         self._tombstone_ttl_s = tombstone_ttl_s
+        # ---- S10a：事件溯源（唯一真相源）----
+        self.event_log = event_log          # 由 Harness 注入（可 None）
+        self._epoch = 0                      # 预算 epoch（run 级，单调递增）
+        self._suppress_depth = 0             # 事件抑制深度（准入事务用）
+        self._pending: list[dict] = []       # 被抑制的事件草稿（set 语义）
+        self._last_budget_seq = 0            # 最近一条已 append 预算事件的 seq
+        # fencing：durable epoch 读取入口（由 Harness 注入 `checkpoints.read_epoch`）。
+        # 仅用于**写操作**的 fence 校验；重放/恢复路径不经过该守卫。
+        self._epoch_source = None
 
     # ------------------------------------------------------------------ #
     # 内部工具
     # ------------------------------------------------------------------ #
+    def _durable_epoch(self) -> int:
+        """读取持久化 run 级 epoch（无注入 → 退回本地值，不 fence）。"""
+        source = self._epoch_source
+        if source is None:
+            return self._epoch
+        try:
+            return int(source())
+        except Exception:  # noqa: BLE001  # 读失败不得误杀写路径
+            return self._epoch
+
+    def _epoch_fenced(self, durable: int) -> bool:
+        """本地 epoch 落后于持久化 epoch → 本写者已被 fence（慢写者被接管）。"""
+        return self._epoch < durable
+
     def _chain(self, node: BudgetNode) -> list[BudgetNode]:
         """[node, parent, ..., root]"""
         chain: list[BudgetNode] = []
@@ -105,12 +169,80 @@ class BudgetManager:
         return isinstance(amount, int) and not isinstance(amount, bool) and amount > 0
 
     # ------------------------------------------------------------------ #
+    # 事件溯源（S10a §2.1 / §2.6）
+    # ------------------------------------------------------------------ #
+    def _emit(self, kind: EventKind, node_id: str, payload: dict) -> None:
+        """临界区内 append 预算事件（`notify=False`）。
+
+        抑制期间只记录草稿（`_pending`），由 `flush_pending` 一次性 append_batch；
+        被丢弃时由 `discard_pending` 清空 —— 保证「失败准入零残留」（含事件）。
+        """
+        if self.event_log is None:
+            return
+        if self._suppress_depth > 0:
+            self._pending.append({"kind": kind, "subject": node_id,
+                                  "payload": payload})
+            return
+        ev = self.event_log.append(kind, node_id, payload, notify=False)
+        self._last_budget_seq = max(self._last_budget_seq, ev.seq)
+
+    @contextmanager
+    def suppressed(self):
+        """抑制预算事件 append（进入准入/恢复等事务）。"""
+        self._suppress_depth += 1
+        try:
+            yield self
+        finally:
+            self._suppress_depth -= 1
+
+    def flush_pending(self) -> None:
+        """把被抑制的事件草稿一次性 append_batch（同帧，原子）。
+
+        §4.4：交换 `_pending` 必须在 `_lock` 内完成 —— 锁外 `drafts = self._pending;
+        self._pending = []` 是非原子交换，并发调用可各取同一批 → 重复 append。
+        """
+        with self._lock:
+            if not self._pending:
+                return
+            drafts = self._pending
+            self._pending = []
+            if self.event_log is not None:
+                events = self.event_log.append_batch(drafts, notify=False)
+                if events:
+                    self._last_budget_seq = max(self._last_budget_seq, events[-1].seq)
+
+    def discard_pending(self) -> None:
+        with self._lock:
+            self._pending = []
+
+    def set_epoch(self, epoch: int, emit: bool = True) -> int:
+        """设置 run 级 epoch（单调；`emit` 控制是否写入事件流）。"""
+        with self._lock:
+            epoch = int(epoch or 0)
+            if epoch <= self._epoch:
+                return self._epoch
+            self._epoch = epoch
+            if emit:
+                self._emit(EventKind.BUDGET_EPOCH, "run",
+                           {"epoch": epoch, "reason": "fence"})
+            return self._epoch
+
+    def bump_epoch(self, reason: str = "") -> int:
+        """run 级 epoch 单调递增（fencing 依据），并写入事件流。"""
+        with self._lock:
+            return self.set_epoch(self._epoch + 1, emit=True)
+
+    # ------------------------------------------------------------------ #
     # 预留 / 释放 / 结算
     # ------------------------------------------------------------------ #
     def reserve(self, node_id: str, amount: int) -> Reservation | None:
         if not self._valid_amount(amount):
             return None
+        # fencing：先读 durable epoch（不得在 `_lock` 内读 → 避免 budget→checkpoint 反向锁序）
+        durable = self._durable_epoch()
         with self._lock:
+            if self._epoch_fenced(durable):
+                return None
             node = self._nodes.get(node_id)
             if node is None:
                 return None
@@ -124,11 +256,17 @@ class BudgetManager:
             resv = Reservation(uuid.uuid4().hex, node_id, amount)
             node.reservations[resv.reservation_id] = resv
             self._reservations[resv.reservation_id] = (node, resv)
+            self._emit(EventKind.BUDGET_RESERVED, node_id,
+                       _node_payload(node, resv.reservation_id, amount, 0, "ACTIVE",
+                                     self._epoch))
             self._check_local(node)
             return resv
 
     def release(self, reservation_id: str) -> int:
+        durable = self._durable_epoch()
         with self._lock:
+            if self._epoch_fenced(durable):
+                return 0
             found = self._reservations.get(reservation_id)
             if found is None:
                 return 0
@@ -141,11 +279,17 @@ class BudgetManager:
                     a.subtree_reserved -= freed
                 node.self_reserved -= freed
             resv.state = "RELEASED"
+            self._emit(EventKind.BUDGET_RELEASED, node.node_id,
+                       _node_payload(node, reservation_id, resv.amount, resv.consumed,
+                                     "RELEASED", self._epoch))
             self._check_local(node)
             return freed
 
     def settle(self, reservation_id: str) -> int:
+        durable = self._durable_epoch()
         with self._lock:
+            if self._epoch_fenced(durable):
+                return 0
             found = self._reservations.get(reservation_id)
             if found is None:
                 return 0
@@ -158,13 +302,22 @@ class BudgetManager:
                     a.subtree_reserved -= freed
                 node.self_reserved -= freed
             resv.state = "SETTLED"
+            self._emit(EventKind.BUDGET_SETTLED, node.node_id,
+                       _node_payload(node, reservation_id, resv.amount, resv.consumed,
+                                     "SETTLED", self._epoch))
             self._check_local(node)
             return freed
 
     def consume(self, reservation_id: str, amount: int = 1) -> Result:
         if not self._valid_amount(amount):
             return Result(Status.INVALID_INPUT, {"reason": "bad_amount", "amount": amount})
+        durable = self._durable_epoch()
         with self._lock:
+            if self._epoch_fenced(durable):
+                return Result(Status.REJECT_STALE, {
+                    "reason": "budget_epoch_fenced",
+                    "budget_epoch": self._epoch, "durable_epoch": durable,
+                })
             found = self._reservations.get(reservation_id)
             if found is None:
                 return Result(Status.INVALID_INPUT, {"reason": "unknown_reservation"})
@@ -181,7 +334,12 @@ class BudgetManager:
                 )
             resv.consumed += amount
             node.consumed += amount
+            payload = _node_payload(node, reservation_id, resv.amount, resv.consumed,
+                                    resv.state, self._epoch)
             self._check_local(node)
+            # 事件 append 必须在 `_lock` 内：否则与 release/settle 交错时事件序变成
+            # RESERVED→RELEASED→CONSUMED，重放态与实时态不符（E3 误破）。
+            self._emit(EventKind.BUDGET_CONSUMED, node.node_id, payload)
             return Result(
                 Status.OK, {"consumed": resv.consumed, "balance": resv.balance}
             )
@@ -228,6 +386,9 @@ class BudgetManager:
                 return None
             node = BudgetNode(node_id, limits, parent)
             self._nodes[node_id] = node
+            self._emit(EventKind.BUDGET_NODE_CREATED, node_id,
+                       {"node_id": node_id, "parent_id": parent_id, "limits": limits,
+                        "budget_epoch": self._epoch})
             return node
 
     def remove_node(self, node_id: str, *, owner: str = "") -> bool:
@@ -294,6 +455,9 @@ class BudgetManager:
                 if node in parent.children:
                     parent.children.remove(node)
                 self._check_local(parent)
+                folded_consumed = total_consumed
+            else:
+                folded_consumed = 0
             now = int(time.time())
             for n in subtree:
                 for rid in list(n.reservations):
@@ -301,6 +465,9 @@ class BudgetManager:
                     resv.state = "ARCHIVED"
                     resv.expires_at = now + int(self._tombstone_ttl_s)
                 self._nodes.pop(n.node_id, None)
+            self._emit(EventKind.BUDGET_ARCHIVED, node_id,
+                       {"node_id": node_id, "folded_consumed": folded_consumed,
+                        "budget_epoch": self._epoch})
             return True
 
     def gc(self, now: float) -> int:
@@ -317,7 +484,188 @@ class BudgetManager:
         return removed
 
     # ------------------------------------------------------------------ #
-    # 不变量（K-14 / §5.4）
+    # 事件重放（S10a §2.2）—— 唯一真相源
+    # ------------------------------------------------------------------ #
+    def budget_events(self) -> list[Event]:
+        """EventLog 中的全部 `BUDGET_*` 事件（按 seq 升序）。"""
+        if self.event_log is None:
+            return []
+        return [e for e in self.event_log.all() if _is_budget_kind(e.kind)]
+
+    def _reset_baseline(self) -> None:
+        """重放前重置基线为 0（只留 `run`，清空全部账）—— 修 P1-3 双份。
+
+        §4.4：必须在 `_lock` 内完成（并发 recover 不得读到中间态），并同时把
+        `_epoch` 归零 —— 重放会按 `BUDGET_EPOCH` 事件重建 epoch；若不归零，
+        残留的高 epoch 会放大树完整性豁免面（旧节点被误判为已 fence）。
+        """
+        with self._lock:
+            root = self.root
+            for nid in list(self._nodes):
+                if nid != "run":
+                    del self._nodes[nid]
+            root.children = []
+            root.self_reserved = 0
+            root.subtree_reserved = 0
+            root.consumed = 0
+            root.folded_consumed = 0
+            root.reservations = {}
+            self._reservations = {}
+            self._epoch = 0
+
+    def apply_budget_event(self, ev: Event) -> bool:
+        """按 `rid` / `node_id` **幂等**应用一条 `BUDGET_*` 事件（set 语义）。
+
+        返回是否被接受（`True`）或被视为重复（`True`）；无法应用返回 `False`。
+        """
+        p = ev.payload or {}
+        with self._lock:
+            kind = ev.kind
+            if kind == EventKind.BUDGET_EPOCH:
+                self._epoch = max(self._epoch, int(p.get("epoch", 0) or 0))
+                return True
+            if kind == EventKind.BUDGET_NODE_CREATED:
+                nid = p.get("node_id")
+                if not nid:
+                    return False
+                parent_id = p.get("parent_id") or "run"
+                limits = int(p.get("limits", 0) or 0)
+                cur = self._nodes.get(nid)
+                if cur is not None:
+                    return (cur.limits == limits
+                            and cur.parent is self._nodes.get(parent_id))
+                if limits <= 0:
+                    return False
+                parent = self._nodes.get(parent_id)
+                if parent is None:
+                    return False
+                self._nodes[nid] = BudgetNode(nid, limits, parent)
+                return True
+            if kind in (EventKind.BUDGET_RESERVED, EventKind.BUDGET_CONSUMED,
+                        EventKind.BUDGET_RELEASED, EventKind.BUDGET_SETTLED):
+                return self._apply_reservation_event(kind, p)
+            if kind == EventKind.BUDGET_ARCHIVED:
+                return self._apply_archived(p)
+            return False
+
+    def _apply_reservation_event(self, kind: EventKind, p: dict) -> bool:
+        rid = p.get("rid")
+        if not rid:
+            return False
+        found = self._reservations.get(rid)
+        if kind == EventKind.BUDGET_RESERVED:
+            if found is not None:
+                # set 语义：已存在 → 幂等跳过；但必须比对身份/额度，否则
+                # 「同 rid 不同 amount/node_id/limits」会被静默吞掉（重放态失真）。
+                existing_node, existing = found
+                amount = int(p.get("amount", existing.amount) or 0)
+                node_id = p.get("node_id") or existing.node_id
+                limits = p.get("limits")
+                mismatch = (existing.amount != amount
+                            or existing.node_id != node_id
+                            or (limits is not None
+                                and existing_node.limits != int(limits)))
+                return not mismatch
+            node = self._nodes.get(p.get("node_id") or "")
+            if node is None:
+                return False
+            amount = int(p.get("amount", 0) or 0)
+            consumed = int(p.get("consumed", 0) or 0)
+            state = p.get("state") or "ACTIVE"
+            if amount <= 0:
+                return False
+            resv = Reservation(rid, node.node_id, amount, consumed, state)
+            node.reservations[rid] = resv
+            self._reservations[rid] = (node, resv)
+            if state == "ACTIVE":
+                node.self_reserved += amount
+                for a in self._chain(node):
+                    a.subtree_reserved += amount
+            else:
+                node.self_reserved += consumed
+                node.consumed += consumed
+            return True
+        if found is None:
+            return False
+        node, resv = found
+        if kind == EventKind.BUDGET_CONSUMED:
+            # 对齐运行时守卫：非 ACTIVE 条目不得再累加 consumed。否则
+            # RESERVED→RELEASED→CONSUMED 的交错重放会污染永久账（E3 误破）。
+            if resv.state != "ACTIVE":
+                return True
+            target = int(p.get("consumed", resv.consumed) or 0)
+            if target == resv.consumed:
+                return True
+            if target < resv.consumed:
+                return True                     # 幂等：不回退
+            delta = target - resv.consumed
+            resv.consumed = target
+            node.consumed += delta
+            return True
+        # RELEASED / SETTLED：只归还「未消耗部分」
+        if resv.state == "ACTIVE":
+            freed = resv.balance
+            if freed > 0:
+                for a in self._chain(node):
+                    a.subtree_reserved -= freed
+                node.self_reserved -= freed
+        resv.state = (p.get("state")
+                      or ("RELEASED" if kind == EventKind.BUDGET_RELEASED else "SETTLED"))
+        return True
+
+    def _apply_archived(self, p: dict) -> bool:
+        nid = p.get("node_id")
+        if not nid:
+            return False
+        node = self._nodes.get(nid)
+        if node is None:
+            return True                          # 幂等：已摘除
+        folded = int(p.get("folded_consumed", 0) or 0)
+        parent = node.parent
+        if parent is not None:
+            parent.self_reserved += folded
+            parent.subtree_reserved += folded - node.subtree_reserved
+            parent.consumed += folded
+            parent.folded_consumed += folded
+            if node in parent.children:
+                parent.children.remove(node)
+        now = int(time.time())
+        for r in node.reservations.values():
+            r.state = "ARCHIVED"
+            r.expires_at = now + int(self._tombstone_ttl_s)
+        self._nodes.pop(nid, None)
+        return True
+
+    def node_epoch(self, node_id: str) -> int:
+        """该节点相关预算事件的**最大** `budget_epoch`（-1 = 无事件）。"""
+        best = -1
+        for e in self.budget_events():
+            p = e.payload or {}
+            if p.get("node_id") == node_id:
+                best = max(best, int(p.get("budget_epoch", 0) or 0))
+        return best
+
+    def snapshot(self) -> dict:
+        """预算聚合快照（供 checkpoint 交叉校验，**非权威**）。"""
+        with self._lock:
+            return {
+                "run_limits": self.root.limits,
+                "budget_cursor": self._last_budget_seq,
+                "budget_epoch": self._epoch,
+                "nodes": {
+                    nid: {
+                        "self_reserved": n.self_reserved,
+                        "subtree_reserved": n.subtree_reserved,
+                        "consumed": n.consumed,
+                        "folded_consumed": n.folded_consumed,
+                        "limits": n.limits,
+                    }
+                    for nid, n in self._nodes.items()
+                },
+            }
+
+    # ------------------------------------------------------------------ #
+    # 不变量（K-14 / §5.4 / S10a §2.4）
     # ------------------------------------------------------------------ #
     def _check_local(self, node: BudgetNode) -> None:
         """O(1) 单节点断言（热路径默认开）。"""
@@ -325,7 +673,96 @@ class BudgetManager:
                 <= node.subtree_reserved <= node.limits):
             raise InvariantError(f"local invariant broken at {node.node_id}")
 
-    def check_invariants(self) -> None:
+    def _global_equations(self) -> None:
+        """S10a §2.4：3 条全局对账等式（不依赖单节点遍历的重复）。
+
+        - E1 `root.subtree_reserved == Σ_n self_reserved`（子树守恒的全局形式）
+        - E2 `Σ_n consumed == Σ_{现有节点预留} r.consumed + Σ_n folded_consumed`
+          （I5c 的 consumed 子句之和；等价于 run 级 consumed 恒等式）
+        - E3 `Σ_{ACTIVE} amount == Σ_n self_reserved − Σ_{非ACTIVE} consumed − Σ_n folded`
+        """
+        total_self = sum(n.self_reserved for n in self._nodes.values())
+        if self.root.subtree_reserved != total_self:
+            raise InvariantError(
+                f"global E1 broken: root.subtree_reserved="
+                f"{self.root.subtree_reserved} != Σ self_reserved={total_self}")
+        existing: set[str] = set()
+        for n in self._nodes.values():
+            existing.update(n.reservations)
+        ledger_consumed = sum(self._reservations[rid][1].consumed for rid in existing)
+        total_folded = sum(n.folded_consumed for n in self._nodes.values())
+        total_consumed = sum(n.consumed for n in self._nodes.values())
+        if total_consumed != ledger_consumed + total_folded:
+            raise InvariantError(
+                f"global E2 broken: Σ consumed={total_consumed} != "
+                f"Σ ledger.consumed={ledger_consumed} + Σ folded={total_folded}")
+        active_amount = sum(self._reservations[rid][1].amount for rid in existing
+                            if self._reservations[rid][1].state == "ACTIVE")
+        nonactive_consumed = sum(self._reservations[rid][1].consumed for rid in existing
+                                 if self._reservations[rid][1].state != "ACTIVE")
+        if active_amount != total_self - nonactive_consumed - total_folded:
+            raise InvariantError(
+                f"global E3 broken: Σ ACTIVE amount={active_amount} != "
+                f"Σ self_reserved - Σ non-ACTIVE.consumed - Σ folded = "
+                f"{total_self - nonactive_consumed - total_folded}")
+
+    def _tree_integrity(self) -> None:
+        """S10a §2.3：树完整性**锚定 EventLog 声明的节点集**（非同义反复）。
+
+        `declared` = 事件声明的 node_id 集（ARCHIVED 视为已摘除）；
+        `rebuilt` = `self._nodes`。**双向**校验：
+        - `declared - rebuilt`：缺席节点必须是「确有显式 fence 记录」的旧 epoch 节点；
+        - `rebuilt - declared`：重放不得凭空造出事件未声明的节点（单向检查的假阴性）。
+
+        fence 判定不再只比较数值：必须存在一条 `BUDGET_EPOCH` 事件，其 epoch
+        **大于该节点最大事件 epoch**（显式 fence 记录），且不低于当前 cutoff。
+        否则「checkpoint meta 里的高 epoch（emit=False）」会把所有旧节点都豁免。
+        """
+        total_self = sum(n.self_reserved for n in self._nodes.values())
+        if self.root.subtree_reserved != total_self:
+            raise InvariantError(
+                f"tree integrity broken: root.subtree_reserved="
+                f"{self.root.subtree_reserved} != Σ self_reserved={total_self}")
+
+        declared: set[str] = set()
+        node_max: dict[str, int] = {}
+        fence_epochs: list[int] = []
+        for ev in self.budget_events():
+            p = ev.payload or {}
+            if ev.kind == EventKind.BUDGET_EPOCH:
+                fence_epochs.append(int(p.get("epoch", 0) or 0))
+                continue
+            nid = p.get("node_id")
+            if not nid or nid == "run":
+                continue
+            if ev.kind == EventKind.BUDGET_ARCHIVED:
+                declared.discard(nid)
+            else:
+                declared.add(nid)
+            node_max[nid] = max(node_max.get(nid, -1),
+                                int(p.get("budget_epoch", 0) or 0))
+        rebuilt = set(self._nodes) - {"run"}
+
+        extra = rebuilt - declared
+        if extra:
+            raise InvariantError(
+                f"tree integrity broken: node {min(extra)!r} rebuilt but "
+                f"not declared by EventLog")
+
+        missing = declared - rebuilt
+        if not missing:
+            return
+        cutoff = self._epoch
+        fence = max(fence_epochs) if fence_epochs else -1
+        for nid in sorted(missing):
+            node_epoch = node_max.get(nid, -1)
+            if node_epoch >= 0 and fence > node_epoch and fence >= cutoff:
+                continue                        # 显式 fence 记录 → 合法缺席
+            raise InvariantError(
+                f"tree integrity broken: node {nid!r} declared by EventLog "
+                f"but not rebuilt")
+
+    def check_invariants(self, *, cross_process: bool = False) -> None:
         """O(N) 全树校验（只在 recover 后 / debug 调用）。不用 `assert`。
 
         I5c 必须与 `settle` / `release` / `archive` 的语义自洽：
@@ -337,6 +774,10 @@ class BudgetManager:
 
         §4.4：加 `_lock`，避免周期 `gc` 与 recover 后的 `check_invariants` 并发
         读到中间态 → 偶发 `InvariantError`（新 flaky）。
+
+        S10a §2.4：追加 3 条全局对账等式（E1/E2/E3）。
+        S10a §8.3 防护 3：树完整性（`cross_process=True`）**仅跨进程恢复启用**，
+        单进程保持原语义。
         """
         with self._lock:
             for n in self._nodes.values():
@@ -358,3 +799,6 @@ class BudgetManager:
                     raise InvariantError(f"self_reserved mismatch at {n.node_id}")
                 if n.consumed != consumed_sum + n.folded_consumed:
                     raise InvariantError(f"consumed mismatch at {n.node_id}")
+            self._global_equations()
+            if cross_process:
+                self._tree_integrity()

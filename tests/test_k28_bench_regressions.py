@@ -6,7 +6,7 @@
 - `_py_line_merge` 零长插入块冲突（并与 `git merge-file` 差分）；
 - `oracle_merge` 驱动 `expected_by_resource` 的自检；
 - `_diff_keys` 的 missing/extra/changed 三路互斥；
-- `assert_deterministic` 与 `judge_cell(degraded=True)`。
+- `assert_deterministic`（B1/B2 逐值相等）与 `assert_b3_bounded`（B3 有界带）与 `judge_cell(degraded=True)`。
 """
 
 from __future__ import annotations
@@ -167,22 +167,74 @@ def test_diff_keys_absent_resource():
     assert d == {"missing": {"/"}, "extra": set(), "changed": set()}
 
 
-# ================================================================ 7. 方差断言
-def _fake_summary(value: float) -> dict:
-    cell = {k: {"values": [value, value], "mean": value, "variance": 0.0}
-            for k in RB.DISCRETE_METRICS}
-    return {"C1": {"B3": cell}}
+# ================================================================ 7. 确定性判定
+# B1/B2（确定性算法）逐值相等；B3（并发）有界带（见 run_bench.py 模块 docstring）。
+def _cell(values_by_metric: dict) -> dict:
+    return {
+        k: {"values": list(v), "mean": sum(v) / len(v), "variance": 0.0,
+            "min": min(v), "max": max(v), "unique": sorted(set(v))}
+        for k, v in values_by_metric.items()
+    }
+
+
+def _c1_cell(conflict, wasted, lost=0.0, silent=0.0, n=3) -> dict:
+    """C1 一格的四指标 cell；conflict/wasted 可为标量或序列。"""
+    def rep(x):
+        return list(x) if isinstance(x, (list, tuple)) else [x] * n
+    return _cell({
+        "lost_update_rate": rep(lost),
+        "conflict_rate_silent": rep(silent),
+        "conflict_rate_detected": rep(conflict),
+        "wasted_work": rep(wasted),
+    })
+
+
+def _summary(b1=None, b2=None, b3=None) -> dict:
+    b1 = b1 if b1 is not None else _c1_cell(4 / 9, 4 / 3)      # C1/B1 典型值
+    b2 = b2 if b2 is not None else _c1_cell(0.0, 0.0)           # C1/B2 典型值
+    b3 = b3 if b3 is not None else _c1_cell(5 / 9, 5 / 3)       # C1/B3 期望值
+    return {"C1": {"B1": b1, "B2": b2, "B3": b3}}
 
 
 def test_assert_deterministic_passes_when_samples_equal():
-    RB.assert_deterministic(_fake_summary(0.5))
+    RB.assert_deterministic(_summary())
 
 
-def test_assert_deterministic_fails_when_samples_differ():
-    s = _fake_summary(0.5)
-    s["C1"]["B3"]["wasted_work"]["values"] = [0.5, 0.6667]
+def test_assert_deterministic_fails_when_b1_differs():
+    """反证：B1 某指标随机 → 逐值相等断言必须失败（B1/B2 的牙还在）。"""
+    b1 = _c1_cell([4 / 9, 4 / 9, 0.9], 4 / 3)
     with pytest.raises(AssertionError):
-        RB.assert_deterministic(s)
+        RB.assert_deterministic(_summary(b1=b1))
+
+
+def test_assert_deterministic_fails_when_b2_differs():
+    b2 = _c1_cell(0.0, [0.0, 0.0, 0.4])
+    with pytest.raises(AssertionError):
+        RB.assert_deterministic(_summary(b2=b2))
+
+
+def test_assert_deterministic_ignores_b3_jitter():
+    """B3 的并发抖动（5/9↔6/10）不得触发逐值相等断言（那是 B1/B2 的职责）。"""
+    b3 = _c1_cell([5 / 9, 5 / 9, 6 / 10], [5 / 3, 5 / 3, 2.0])
+    RB.assert_deterministic(_summary(b3=b3))
+
+
+def test_assert_b3_bounded_passes_within_band():
+    b3 = _c1_cell([5 / 9, 5 / 9, 6 / 10], [5 / 3, 5 / 3, 2.0])
+    RB.assert_b3_bounded(_summary(b3=b3))
+
+
+def test_assert_b3_bounded_fails_outside_band():
+    b3 = _c1_cell(5 / 9, [5 / 3, 5 / 3, 3.0])
+    with pytest.raises(AssertionError):
+        RB.assert_b3_bounded(_summary(b3=b3))
+
+
+def test_assert_b3_bounded_fails_when_correctness_metric_nonzero():
+    """期望为 0 的 B3 正确性指标（lost/silent）必须严格 0（模拟 K-28 丢写）。"""
+    b3 = _c1_cell(5 / 9, 5 / 3, lost=0.333, silent=0.333)
+    with pytest.raises(AssertionError):
+        RB.assert_b3_bounded(_summary(b3=b3))
 
 
 # ================================================================ 8. degraded 判定

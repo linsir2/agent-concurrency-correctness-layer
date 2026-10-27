@@ -769,7 +769,8 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S7** | ✅ 完成（2026-10-27） | `bench/`（workloads/conditions/metrics/run_bench/report）三条件×四负载 + 外部差分度量 + 二级指标 + 环境信息与测量局限 | 基准可运行（n≥30）；C2 主终点成立；离散指标确定性（48 项方差 0）；详见 [S7 方案 v1.2](s7-benchmark-and-coverage.md) §10 |
 | **S8** | ✅ 完成（2026-10-27） | 覆盖率分模块阈值落地（`fail_under=80` + `scripts/check_coverage.py`）、补 `recover(COMPENSATE)`/resolver/`_restore_path` 三缺口、S8-1..S8-4 补强、`budget.gc` 接上 + `check_invariants` 加锁 | **152 passed**；整体 **83.89%**、budget 95.88%；**评审发现并修复真缺陷 K-28**（C1 静默丢写，残值归零） |
 | **S9** | ✅ 完成（2026-10-27） | K-25（`CrashInjected(BaseException)` + probe 不吞）+ K-26（`retention` 安全语义）+ K-24（`commit_batch` 同帧收据链 + `commit_key` 去重 + scope 锁）+ K-30（`FileCheckpointStore`：信封/codec/双层锁/唯一 ref/损坏隔离）+ 跨进程恢复 + 四阶段 SIGKILL | **214 passed**；覆盖率 **84.69%**；三轮对抗评审修 **2 P0（静默丢写）+ 6 P1 + 11 P2/P3**；详见 [S9 方案 v1.2](s9-persistence-and-receipts.md) §8 |
-| S10 | ⏳ 待开工 | MS9 跨进程预算对账、egress gateway 下沉、跨进程 scope 锁（K-34） | — |
+| **S10** | ✅ 完成（2026-10-27） | MS9 跨进程预算对账（预算变更事件溯源 + 全量重放建完整树 + 树完整性锚定事件声明 + 全局对账等式 + 单写者 lease）+ K-34 跨进程 flock（`_FileLock` 下沉 + 三锁全序 + WAL seq 的 fstat 缓存 + fencing epoch）+ `FinalitySink` 接口草案 | **250 passed**；覆盖率 **83.91%**；两轮对抗评审修 **1 P0（budget↔store 死锁）+ 4 P1 + 10 P2/P3**；详见 [S10 方案 v1.2](s10-cross-process-reconciliation.md) §9 |
+| S11 | ⏳ 待开工 | egress 真强制点（档 c/d：eBPF/Landlock 或 gVisor/Kata）+ 跨进程 scope 锁收口（K-46）+ 收据增量索引（K-44） | — |
 
 **S0–S4 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。

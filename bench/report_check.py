@@ -10,6 +10,10 @@
 - **容差**：`wall_time` / `speedup` / `throughput` / `commit_latency`（相对 25%）、
   `serialization_rate`（近零比值，用绝对容差 + 量级合理性）。
 
+**B3（并发）例外**：`conflict_rate` / `wasted_work` 是**线程交错的函数**，本质非确定，
+故对 B3 用**有界带**（±`B3_BAND_REL`）而非逐值相等；B1/B2 保持逐值相等（确定性算法）。
+期望为 0 的 B3 指标（`lost_update_rate` / `conflict_rate_silent`）仍严格 0。
+
 容差判定打印「容差内」；**超出容差仍判不一致**（不无脑放过）。
 
 用法::
@@ -29,11 +33,14 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from bench.run_bench import B3_BAND_REL
+
 # ---------------------------------------------------------------- 指标分类
 # 确定性（严格逐值相等）：lost_update_rate / conflict_rate_detected /
 #   conflict_rate_silent / wasted_work / oracle 自检 / C0 sanity / 主终点 verdict
 # 容差（非确定）：wall/speedup/throughput/latency（相对）、serialization_rate（绝对+量级）
 REL_TOL = 0.25          # 时序指标相对容差（wall/speedup/throughput/latency）
+SCAL_REL_TOL = 0.40     # scalability_curve 相对容差（GIL + 线程池方差更大，见 report.md §3.6）
 SER_ABS_TOL = 0.05      # serialization_rate 绝对容差（近零比值，相对误差无意义）
 SER_MAX = 1.0           # serialization_rate 量级上界（= lock_wait / wall ≤ 1）
 
@@ -153,6 +160,38 @@ def _expect_ratio(out: CheckOutcome, where: str, got_cell: str, want: float,
         out.tol_fail.append(where)
 
 
+def _expect_b3(out: CheckOutcome, where: str, got_cell: str, want: float) -> None:
+    """B3（并发）离散指标：以 result.json 均值为基准的**有界带**；`want==0` 时严格。
+
+    理由：B3 是 `ThreadPoolExecutor` + `Barrier` 并发负载，`conflict_rate` /
+    `wasted_work` 取决于线程交错（rebase 重试次数），本质非确定 → 用有界带而非
+    逐值相等。期望为 0 的正确性指标（`lost_update_rate` / `conflict_rate_silent`）
+    退化为严格 0（任何非零即 bug）。B1/B2 不走此函数（确定性算法 → 逐值相等）。
+    """
+    got = _num(got_cell)
+    if got is None:
+        out.errors.append(f"{where}: report={_plain(got_cell)!r} 无法解析为数值 "
+                          f"（期望 {want:.4g}）")
+        out.tol_fail.append(where)
+        return
+    if want == 0.0:
+        if got != 0.0:
+            out.errors.append(f"{where}: report={got:.4g} result={want:.4g} "
+                              f"（B3 正确性指标应严格 0）")
+            out.tol_fail.append(where)
+        else:
+            out.strict_ok += 1
+        return
+    rel = abs(got - want) / abs(want)
+    if rel <= B3_BAND_REL:
+        out.tol_ok.append(f"{where}: report={got:.4g} result={want:.4g} "
+                          f"(rel {rel:.1%} ≤ {B3_BAND_REL:.0%}) 带内")
+    else:
+        out.errors.append(f"{where}: report={got:.4g} result={want:.4g} "
+                          f"(rel {rel:.1%} > {B3_BAND_REL:.0%}) 超出带")
+        out.tol_fail.append(where)
+
+
 def _check_oracle(out: CheckOutcome, result: dict, report_text: str) -> None:
     """oracle 自检（确定性）：报告里的自检结果必须与 result.json 一致。"""
     line = next((ln.strip() for ln in report_text.splitlines()
@@ -190,16 +229,19 @@ def check_report(result: dict, report_text: str) -> CheckOutcome:
             out.errors.append(f"§3 未知行：{cells[:2]}")
             continue
         s = summary[wl][cond]
-        _expect_strict(out, f"§3 {wl}/{cond}/lost_update_rate", cells[2],
-                       f"{s['lost_update_rate']['mean']:.3f}")
-        _expect_strict(out, f"§3 {wl}/{cond}/conflict_rate_detected", cells[3],
-                       f"{s['conflict_rate_detected']['mean']:.3f}")
-        _expect_strict(out, f"§3 {wl}/{cond}/conflict_rate_silent", cells[4],
-                       f"{s['conflict_rate_silent']['mean']:.3f}")
+        # B1/B2（确定性算法）逐值相等；B3（并发）有界带（期望 0 的指标在
+        # `_expect_b3` 内退化为严格 0）。
+        for idx, key in ((2, "lost_update_rate"),
+                         (3, "conflict_rate_detected"),
+                         (4, "conflict_rate_silent"),
+                         (6, "wasted_work")):
+            where = f"§3 {wl}/{cond}/{key}"
+            if cond == "B3":
+                _expect_b3(out, where, cells[idx], s[key]["mean"])
+            else:
+                _expect_strict(out, where, cells[idx], f"{s[key]['mean']:.3f}")
         _expect_ratio(out, f"§3 {wl}/{cond}/serialization_rate", cells[5],
                       s["serialization_rate"]["mean"])
-        _expect_strict(out, f"§3 {wl}/{cond}/wasted_work", cells[6],
-                       f"{s['wasted_work']['mean']:.3f}")
 
     # ---- §3.3 speedup（时序容差）----
     rows = _table_after(report_text, "### 3.3")
@@ -219,13 +261,15 @@ def check_report(result: dict, report_text: str) -> CheckOutcome:
             _expect_rel(out, f"§4.1 {wl}/{cond}", cells[idx],
                         summary[wl][cond]["throughput"]["mean"])
 
-    # ---- §4.5 scalability（时序容差）----
+    # ---- §4.5 scalability（时序容差；GIL/线程池方差更大 → 40%）----
     rows = _table_after(report_text, "### 4.5")
     by_n = result["secondary"]["scalability_curve"]["by_n"]
     for cells in rows[1:]:
         n = _plain(cells[0])
-        _expect_rel(out, f"§4.5 N={n}/wall", cells[1], by_n[n]["wall_time"] * 1000)
-        _expect_rel(out, f"§4.5 N={n}/speedup", cells[2], by_n[n]["speedup"])
+        _expect_rel(out, f"§4.5 N={n}/wall", cells[1], by_n[n]["wall_time"] * 1000,
+                    rel=SCAL_REL_TOL)
+        _expect_rel(out, f"§4.5 N={n}/speedup", cells[2], by_n[n]["speedup"],
+                    rel=SCAL_REL_TOL)
 
     # ---- §5 预注册判定（确定性）----
     rows = _table_after(report_text, "## 5. ")

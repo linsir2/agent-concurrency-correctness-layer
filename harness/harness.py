@@ -8,9 +8,10 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+from contextlib import nullcontext
 
 from .auth import Signer
-from .budget import BudgetManager, InvariantError, Reservation
+from .budget import BudgetManager, InvariantError, Reservation, _is_budget_kind
 from .checkpoint import (CheckpointCorrupt, CheckpointStore, EffectJournal,
                          FileCheckpointStore)
 from .clock import SystemClock
@@ -25,9 +26,12 @@ from .resolver import ScriptedResolver
 from .runtime import AgentRuntime, CrashInjected
 from .spec.receipt import (GENESIS_HASH, Receipt, ReceiptMalformed,
                            build_receipt, receipt_hash, verify_chain_detailed)
+from .storage._lock import (RECEIPTS_ORDER, FencingRejected, _FileLock,
+                            receipts_lock_path)
+from .storage.atomic import atomic_write
+from .storage.codec import CodecError, dumps, loads
 from .subscription import SubscriptionRegistry
 from .storage.blob import InMemoryBlobStore, canonical_bytes
-from .storage.codec import CodecError
 from .types import (ACB, TASK_TERMINAL, EventKind, Mode, ReceiptConflict, Result,
                     Status, TaskState, Write, advance)
 from .workspace import WorkspaceManager, WorkspaceVersionStore
@@ -56,7 +60,8 @@ class Harness:
                  gc_every: int = 1000,
                  per_action_delay: float = 0.0,
                  receipts_enabled: bool = True,
-                 checkpoint_root=None) -> None:
+                 checkpoint_root=None,
+                 writer_id: str | None = None) -> None:
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -77,11 +82,29 @@ class Harness:
                                                 lock_timeout_s=lock_timeout_s))
         self.budget = (budget if budget is not None
                        else BudgetManager(run_limits, tombstone_ttl_s=tombstone_ttl_s))
+        # S10a §2.1：预算事件溯源 = 唯一真相源（预算变更必须落到全局 EventLog）
+        self.budget.event_log = self.event_log
+        self._run_limits = int(run_limits)
         self.checkpoints = (checkpoints if checkpoints is not None
                             else (FileCheckpointStore(checkpoint_root)
                                   if checkpoint_root is not None
                                   else CheckpointStore()))
         self.checkpoints.event_log = self.event_log      # §2.4：无条件注入全局水位源
+        self.checkpoints.budget = self.budget            # S10a：聚合值 + 游标同临界区
+        self.checkpoints.run_limits = self._run_limits   # S10a：run_limits 漂移基准
+        # S10a §3.4：预算写操作的 fencing 依据（慢写者被接管后不得再写预算）
+        self.budget._epoch_source = self.checkpoints.read_epoch
+        # ---- S10b §3.2：跨进程三锁全序（写死）--------------------------------
+        #   resource → receipts.lock → wal.lock → store.lock → eventlog._lock
+        # 三把 flock 按上表偏序获取；反向获取（如「持 store.lock 取
+        # receipts.lock」）会成环死锁 → 由 `_FileLock(order=...)` 运行期断言拦截。
+        # `receipts.lock`：durable 模式跨进程互斥；内存模式退回进程内 RLock。
+        cp_root = getattr(self.checkpoints, "root", None)
+        self._receipts_flock = (
+            _FileLock(receipts_lock_path(cp_root), order=RECEIPTS_ORDER)
+            if cp_root is not None else None)
+        # S10b §3.4：WAL append 的 fencing（同一 flock 内复验 run 级 epoch）
+        self._wire_wal_fencing()
         self.effects = (effects if effects is not None
                         else EffectJournal(self.event_log))
         self.comp_journal = CompensationJournal(self.event_log)
@@ -106,7 +129,7 @@ class Harness:
         self.resolver = (resolver if resolver is not None
                          else ScriptedResolver())       # §7 默认 scripted（不联网）
 
-        self.slots = SlotTracker(max_concurrent)
+        self.slots = SlotTracker(max_concurrent, shared=self.checkpoints)
         self.checkpoints.slots = self.slots        # checkpoint 快照活跃槽位
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)
@@ -130,7 +153,24 @@ class Harness:
         self._receipt_ids: set[str] = set()
         self._tainted_scopes: set[tuple[str, str]] = set()
         self._malformed_receipts: list[dict] = []
+        # 锁内增量刷新：水位（已扫到的最大 seq）+ 刷新互斥（内存模式 per-scope
+        # 锁不互斥 → 需串行化，避免共享水位被并发推进而漏扫）。durable 模式
+        # scope 锁即跨进程 flock，天然串行；此锁仍保证同进程多线程一致。
+        self._receipt_scan_watermark = 0
+        self._receipt_refresh_lock = threading.RLock()
         self._rebuild_receipts()
+
+        # ---- S10a §2.5：单写者租约（durable 模式在构造期即 acquire）----
+        # 生产路径必须真正持有租约：此前 `_try_acquire_writer_lease` 只被测试调用，
+        # 单写者形同虚设。acquire 失败 → `_writer_lease_ok=False`，写入口拒绝服务。
+        self._writer_id = writer_id or f"harness-{os.getpid()}"
+        self._durable = self._lease_path() is not None
+        self._writer_lease_ok = True
+        if self._durable:
+            self._try_acquire_writer_lease()
+            on_close = getattr(self.event_log, "on_close", None)
+            if callable(on_close):
+                on_close(self._release_writer_lease)
 
         self.event_log.subscribe(self._on_event)
 
@@ -181,6 +221,132 @@ class Harness:
         self._receipt_ids = ids
         self._tainted_scopes = tainted
         self._malformed_receipts = malformed
+        # 首次构建完成 → 水位推到当前尾：之后锁内刷新只扫「新增」收据，
+        # 不重复扫旧事件（否则每次 commit 全量扫 EventLog → O(N²)）。
+        try:
+            self._receipt_scan_watermark = self.event_log.tail()
+        except Exception:  # noqa: BLE001  # tail 不可用 → 0（刷新退回全扫，仍正确）
+            self._receipt_scan_watermark = 0
+
+    @staticmethod
+    def _scan_receipts(records, heads: dict, ids: set, tainted: set,
+                       malformed: list) -> int:
+        """按 seq 顺序应用收据记录，维护 running head + 连续性校验。
+
+        `_rebuild_receipts`（首次构建）与 `_refresh_receipts_locked`（锁内增量
+        刷新）**共用**此逻辑：`prev_receipt_hash` 必须等于 running head 且
+        `receipt_id` 不重复；失败 → 该 scope tainted 并拒绝继续扩展；畸形
+        payload → 记入 `malformed`（**不得抛**）。返回处理到的最大 seq
+        （推进水位用）。
+
+        注意 `running`/`heads` 合一（原实现两者恒等）：每 scope 的 head 就是
+        该 scope 最后一条被接受的收据的链接值。
+        """
+        max_seq = -1
+        for seq, payload in records:
+            max_seq = seq
+            try:
+                receipt = Receipt.from_dict(payload)
+            except ReceiptMalformed as exc:
+                malformed.append({"seq": seq, "error": str(exc),
+                                  "payload": payload})
+                scope = Harness._payload_scope(payload)
+                if scope is not None:
+                    tainted.add(scope)
+                continue
+            scope = (receipt.run_id, receipt.logical_subgoal_id)
+            if scope in tainted:
+                continue
+            if receipt.receipt_id in ids:            # 重复 receipt_id → 断链
+                tainted.add(scope)
+                continue
+            head = heads.get(scope, GENESIS_HASH)
+            if receipt.prev_receipt_hash != head:    # 乱序/断链
+                tainted.add(scope)
+                continue
+            ids.add(receipt.receipt_id)
+            heads[scope] = receipt_hash(receipt)
+        return max_seq
+
+    def _receipt_records(self) -> list[tuple[int, dict]]:
+        """返回全部 `RECEIPT_ISSUED` 记录 `[(seq, payload)]`（按 seq 升序）。
+
+        **跨进程安全**：`WalEventLog` 的内存索引 `_events` 只含「构造期加载
+        + 本进程 append」的记录；别的进程 append 的收据只落在 WAL **文件**里
+        → 先（`wal.lock` flock 内）O(1) fstat 比对回扫磁盘，再取原始记录。
+        内存 `EventLog` 直接读 `all()`。
+        """
+        log = self.event_log
+        wal = getattr(log, "_wal", None)
+        if wal is None:
+            recs = [(ev.seq, ev.payload) for ev in log.all()
+                    if ev.kind == EventKind.RECEIPT_ISSUED]
+        else:
+            lock = getattr(wal, "_lock", None)
+            if lock is not None:                     # 锁序 receipts → wal
+                with lock():
+                    self._rescan_wal_from_disk(wal)
+                    raw = wal.records()
+            else:
+                self._rescan_wal_from_disk(wal)
+                raw = wal.records()
+            recs = [(r.get("seq", 0), r.get("payload"))
+                    for r in raw
+                    if r.get("kind") == EventKind.RECEIPT_ISSUED.value]
+        recs.sort(key=lambda rp: rp[0])
+        return recs
+
+    @staticmethod
+    def _rescan_wal_from_disk(wal) -> None:
+        """flock 内 O(1) fstat 比对：仅当别的进程写过才回扫（复用 WAL 既有优化）。"""
+        try:
+            fd = getattr(wal, "_fd", None)
+            cached = getattr(wal, "_cached_end", None)
+            if fd is not None and cached is not None:
+                if os.fstat(fd).st_size == cached:
+                    return
+            rescan = getattr(wal, "_rescan_from_disk", None)
+            if callable(rescan):
+                rescan()
+        except Exception:  # noqa: BLE001  # 回扫失败 → 调用方回退内存态
+            pass
+
+    def _refresh_receipts_locked(self) -> None:
+        """scope 临界区内：从 EventLog **增量**刷新 head/ids（跨进程安全）。
+
+        根因（K-24 后续）：`_receipt_heads`/`_receipt_ids` 只在 `__init__`/
+        `recover` 重建一次；跨进程下另一进程可能在我们构建之后才 append 收据
+        → 锁内读到**过期 head** → 链分叉。故在 `commit_batch` 的 scope 临界区
+        内、读 head 前调用本方法：取锁 → 刷新 → 读 head → 构造 drafts →
+        append_batch → 提交内存态。
+
+        增量：只处理 `seq > _receipt_scan_watermark` 的 RECEIPT_ISSUED（水位
+        在首次构建时推到当前尾），避免每次 commit 全量扫。刷新失败（EventLog
+        不可用 / 回扫失败）→ 静默回退现有内存态，**不得让提交失败**。
+        """
+        if not self.receipts_enabled:
+            return
+        with self._receipt_refresh_lock:
+            try:
+                records = self._receipt_records()
+            except Exception:  # noqa: BLE001  # EventLog 不可用 → 回退内存态
+                return
+            watermark = self._receipt_scan_watermark
+            new_records = [rp for rp in records if rp[0] > watermark]
+            if not new_records:
+                return
+            heads = dict(self._receipt_heads)
+            ids = set(self._receipt_ids)
+            tainted = set(self._tainted_scopes)
+            malformed = list(self._malformed_receipts)
+            max_seq = self._scan_receipts(new_records, heads, ids, tainted,
+                                          malformed)
+            self._receipt_heads = heads
+            self._receipt_ids = ids
+            self._tainted_scopes = tainted
+            self._malformed_receipts = malformed
+            if max_seq > watermark:
+                self._receipt_scan_watermark = max_seq
 
     @staticmethod
     def _payload_scope(payload: dict) -> tuple[str, str] | None:
@@ -192,17 +358,41 @@ class Harness:
             return None
         return (run_id, payload.get("logical_subgoal_id") or "")
 
-    def _scope_lock(self, scope: tuple[str, str]) -> threading.RLock:
+    def _scope_lock(self, scope: tuple[str, str]):
         """取（必要时创建）scope 锁；只护锁表，极短，不覆盖临界区。
 
-        **进程内锁**：跨进程不互斥 —— durable 模式按单写者使用（见 `__init__`）。
+        **durable 模式**：返回跨进程 `receipts.lock`（flock，全序第 1 位），
+        跨进程互斥 → 同 scope 并发提交串行化（链不分叉）。
+        **内存模式**：退回每 scope 一把进程内 `RLock`（跨进程不互斥，§K-34）。
         """
+        if self._receipts_flock is not None:
+            return self._receipts_flock()
         with self._lock:
             lock = self._scope_locks.get(scope)
             if lock is None:
                 lock = threading.RLock()
                 self._scope_locks[scope] = lock
             return lock
+
+    def _wire_wal_fencing(self) -> None:
+        """S10b §3.4：把 fencing 三件套注入 `WalEventLog`（若为 WAL 实现）。
+
+        - `lock`：`checkpoints._flock`（store.lock，与 `bump_epoch` **同一把**）；
+        - `epoch_reader`：`checkpoints.read_epoch`（读 store.json 的 run 级 epoch）；
+        - `epoch_provider`：本写者当前 run 级 epoch（`intents.get_epoch()`）。
+
+        非 WAL 实现 / 无 `_flock`（内存 store）→ 不注入，fencing 不生效。
+        """
+        log = self.event_log
+        setter = getattr(log, "set_fencing", None)
+        if not callable(setter):
+            return
+        store_lock = getattr(self.checkpoints, "_flock", None)
+        read_epoch = getattr(self.checkpoints, "read_epoch", None)
+        if store_lock is None or not callable(read_epoch):
+            return
+        setter(lock=store_lock, epoch_reader=read_epoch,
+               epoch_provider=lambda: int(self.intents.get_epoch() or 0))
 
     def _receipt_secret(self) -> str:
         """收据签名密钥来源：构造参数优先，否则读 env（开关独立于 secret 是否存在）。"""
@@ -498,6 +688,11 @@ class Harness:
         """
         if not writes:
             return Result(Status.OK, {"noop": True, "seq": None})
+        # S10a §2.5：提交前续租（心跳）；租约被其他写者持有时拒绝服务。
+        if not self._ensure_writer_lease():
+            return Result(Status.UPSTREAM_FAILED, {
+                "reason": "writer_lease_held", "writer": self._writer_id,
+            })
         resources = {w.resource for w in writes}
         if len(resources) != len(writes):                          # ① 同批重复 resource
             return Result(Status.INVALID_INPUT,
@@ -570,6 +765,7 @@ class Harness:
             # P2：去重检查**必须**在临界区内 —— 否则同 scope 跨资源场景下，去重判断
             # 与 head/append 非原子（并发写各自判定「非去重」→ 重复提交 + 重复收据）。
             with self._scope_lock(scope):                          # 锁序 resource → scope → eventlog
+                self._refresh_receipts_locked()
                 # 幂等短路（S9 §2.3.3 / P0-1②③）：逐写匹配既有提交事件
                 #   键 = (run_id, logical_subgoal_id, resource, content_hash, mode)，
                 #   且已提交 blob_hash 必须 == 新内容 hash（内容不同 → 不得短路）。
@@ -640,11 +836,24 @@ class Harness:
                     })
                     head = receipt_hash(receipt)
                     issued.append(receipt.receipt_id)
-                events = self.event_log.append_batch(drafts, notify=False)   # ⑥ 提交点
+                try:
+                    events = self.event_log.append_batch(drafts, notify=False)   # ⑥ 提交点
+                except FencingRejected as exc:
+                    # S10b §3.4：旧 epoch 写者被接管 → 拒绝写入（不写入、不 ack、
+                    # 不改 head）。未 append → 链未污染，故不 taint scope。
+                    return Result(Status.REJECT_STALE, {
+                        "reason": "fencing_epoch_rejected",
+                        "scope": list(scope), "detail": str(exc)})
                 # ③ head 后置提交：append 成功后才改内存态
-                if self.receipts_enabled:
-                    self._receipt_heads[scope] = head
-                    self._receipt_ids.update(issued)
+                # 水位随 append 同步推进：否则下次锁内刷新会重扫本进程刚 append
+                # 的收据，与「已更新的 head」比对 → 误判断链 → 误 taint scope。
+                with self._receipt_refresh_lock:
+                    if self.receipts_enabled:
+                        self._receipt_heads[scope] = head
+                        self._receipt_ids.update(issued)
+                    for e in events:
+                        if e.seq > self._receipt_scan_watermark:
+                            self._receipt_scan_watermark = e.seq
 
             # ⑦ 投影（锁外，可重放）：去重写走版本守卫，新写走 _apply_locked
             for (w, _d, _vb, version_after, _ck), ev in zip(records, dedup_events):
@@ -845,8 +1054,128 @@ class Harness:
         if hasattr(acb, "budget_node"):
             self.checkpoints.save(acb)
 
-    def bump_epoch(self) -> None:
-        self.intents.bump_epoch()
+    # ---- 单写者租约 + fencing epoch（S10a §2.5 / §3.4）------------------
+    def _lease_path(self):
+        root = getattr(self.checkpoints, "root", None)
+        if root is None:
+            return None
+        return os.path.join(str(root), "writer_lease.json")
+
+    def _read_lease(self) -> dict | None:
+        path = self._lease_path()
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            data = loads(open(path, "r", encoding="utf-8").read())
+        except Exception:  # noqa: BLE001
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _store_flock(self):
+        lock = getattr(self.checkpoints, "_flock", None)
+        return lock() if lock is not None else nullcontext()
+
+    def _try_acquire_writer_lease(self) -> bool:
+        """获取 durable 单写者租约。
+
+        接管 = 确认旧租约**过期** → `bump_epoch` → 落盘 → 才开始服务（§2.5）。
+        旧租约仍有效且属于**其他写者** → 返回 False（拒绝服务，避免双写者）；
+        同一写者（同 owner）重入 → 仅续期（同进程多 Harness 共享同一写者身份）。
+        """
+        path = self._lease_path()
+        if not path:
+            self._writer_lease_ok = True
+            return True
+        with self._store_flock():
+            now = self.clock.now_ms()
+            cur = self._read_lease()
+            if cur is not None:
+                exp = int(cur.get("expires_at", 0) or 0)
+                same_owner = cur.get("owner") == self._writer_id
+                if exp and now < exp:
+                    if not same_owner:
+                        self._writer_lease_ok = False
+                        return False
+                    doc = dict(cur)                  # 同写者重入：续期，不 bump epoch
+                    doc["expires_at"] = now + int(self.lease_ms)
+                    atomic_write(path, dumps(doc).encode("utf-8"))
+                    self._writer_lease_ok = True
+                    return True
+                if not same_owner:
+                    self.bump_epoch()                # 旧租约已过期 → 接管
+            doc = {"owner": self._writer_id,
+                   "epoch": self.intents.get_epoch(),
+                   "expires_at": now + int(self.lease_ms)}
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            atomic_write(path, dumps(doc).encode("utf-8"))
+            self._writer_lease_ok = True
+            return True
+
+    def _renew_writer_lease(self) -> bool:
+        """续租（仅当本写者仍是持有者）；过期则走接管。"""
+        path = self._lease_path()
+        if not path:
+            self._writer_lease_ok = True
+            return True
+        with self._store_flock():
+            cur = self._read_lease()
+            now = self.clock.now_ms()
+            if cur is not None and cur.get("owner") == self._writer_id:
+                doc = dict(cur)
+                doc["expires_at"] = now + int(self.lease_ms)
+                atomic_write(path, dumps(doc).encode("utf-8"))
+                self._writer_lease_ok = True
+                return True
+            return self._try_acquire_writer_lease()
+
+    def _ensure_writer_lease(self) -> bool:
+        """写入口守卫：durable 模式下必须持有/可续租；失败 → 拒绝服务。"""
+        if not self._durable:
+            return True
+        return self._renew_writer_lease()
+
+    def _release_writer_lease(self) -> None:
+        """释放本写者的租约（EventLog 关闭 = 写者会话结束）。"""
+        path = self._lease_path()
+        if not path:
+            return
+        with self._store_flock():
+            cur = self._read_lease()
+            if cur is not None and cur.get("owner") == self._writer_id:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def _restore_epoch(self) -> int:
+        """从持久化存储读 run 级 epoch（RMW 语义，§3.4）。"""
+        reader = getattr(self.checkpoints, "read_epoch", None)
+        epoch = 0
+        if callable(reader):
+            try:
+                epoch = int(reader())
+            except Exception:  # noqa: BLE001
+                epoch = 0
+        self.intents.set_epoch(epoch)
+        self.budget.set_epoch(epoch, emit=False)
+        return epoch
+
+    def bump_epoch(self, reason: str = "") -> int:
+        """run 级 epoch 单调递增（同一 flock 内 read-modify-write，§2.5/§3.4）。"""
+        bumper = getattr(self.checkpoints, "bump_epoch", None)
+        epoch = None
+        if callable(bumper):
+            try:
+                epoch = int(bumper())
+            except Exception:  # noqa: BLE001
+                epoch = None
+        if epoch is None:
+            epoch = self.intents.get_epoch() + 1
+        self.intents.set_epoch(epoch)
+        self.budget.set_epoch(epoch, emit=True)
+        return epoch
 
     # ---- 端到端运行 -----------------------------------------------
     def dispatch_and_run(self, plan: dict, task_id: str, decisions, *,
@@ -929,15 +1258,19 @@ class Harness:
         # §2.4：_finalize 落盘（K-3：在结算/归档**之前**，保留活跃预留供 recover 恢复）；
         # P1-5：保存失败**不得**阻断下面的结算/归档/槽位释放（否则槽位泄漏）。
         self._safe_save(acb)
-        if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
-                         TaskState.DONE, TaskState.DONE_PARTIAL, TaskState.QUARANTINED):
-            # 终态 + QUARANTINED 结算全部预留（文档 §5.5：未消耗部分归还，已消耗留账）
-            for rid in list(acb.reservation_ids):
-                self.budget.settle(rid)
-        if acb.state in TASK_TERMINAL and acb.budget_node is not None:
-            # §5.3（K-13）：终态且无 ACTIVE 预留 → 归档（consumed 折入父级）
-            if self.budget.archive_node(acb.budget_node.node_id):
-                acb.budget_node = None
+        # S10a §2.1：结算 + 归档的预算事件**同帧 append_batch**（一次临界区，
+        # 避免逐笔 append 放大事件日志锁竞争 → 基准时序抖动）
+        with self.budget.suppressed():
+            if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
+                             TaskState.DONE, TaskState.DONE_PARTIAL, TaskState.QUARANTINED):
+                # 终态 + QUARANTINED 结算全部预留（文档 §5.5：未消耗部分归还，已消耗留账）
+                for rid in list(acb.reservation_ids):
+                    self.budget.settle(rid)
+            if acb.state in TASK_TERMINAL and acb.budget_node is not None:
+                # §5.3（K-13）：终态且无 ACTIVE 预留 → 归档（consumed 折入父级）
+                if self.budget.archive_node(acb.budget_node.node_id):
+                    acb.budget_node = None
+        self.budget.flush_pending()
         self.slots.release(acb.id)                     # P1-5：先释放槽位（不因落盘失败跳过）
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
             # D14：patch 后旧 ACB 的 task_id 可能已不在 plan["tasks"] 中 → 用 .get() 安全取值
@@ -993,6 +1326,20 @@ class Harness:
         - `resume_policy="RESUME"`：probe 三态对账（`True` → CONFIRMED；`None` → 隔离）；
         - `resume_policy="COMPENSATE"`：**终态策略**（清 staged，补偿后不恢复执行）。
         """
+        # S10a §2.5：恢复即写者接管，必须持租约；被其他写者持有 → 拒绝服务。
+        if not self._ensure_writer_lease():
+            header = self._pointer_header_fallback(ref)
+            acb = ACB(id=header.get("acb_id", ""),
+                      run_id=header.get("run_id", ""),
+                      task_id=header.get("task_id", ""))
+            acb.generation = int(header.get("generation", 1) or 1) + 1
+            acb.state = TaskState.QUARANTINED
+            acb.failure = "WRITER_LEASE_HELD"
+            acb.needs_readmit = True
+            if acb.id:
+                self.acbs[acb.id] = acb
+                self.run_coordinator.register(acb)
+            return acb
         try:
             data = self.checkpoints.load_strict(ref)  # 绕过缓存，校验双 checksum
         except CheckpointCorrupt as exc:
@@ -1016,6 +1363,7 @@ class Harness:
         mine = [e for e in events if e.producer == data.get("acb_id")]
         self.effects.rebuild_from(mine)
         self.comp_journal.rebuild_from(mine)
+        self._restore_epoch()                          # S10a §3.4：epoch 读持久化值
         acb = self._restore_acb(data, resume_policy)
         # 恢复已应用事件集合（去重键持久化，避免重放重复投影）
         persisted = data.get("applied_event_ids")
@@ -1063,8 +1411,9 @@ class Harness:
                 self.slots.release(acb.id)
             self.checkpoints.save(acb)
         # ③ 恢复后全树必查（K-14）；失败 → QUARANTINED + slots.release
+        #    S10a §2.3：跨进程恢复额外做**树完整性**校验（锚定 EventLog 声明集）
         try:
-            self.budget.check_invariants()
+            self.budget.check_invariants(cross_process=True)
         except InvariantError:
             acb.state = TaskState.QUARANTINED
             acb.failure = acb.failure or "INVARIANT_BROKEN"
@@ -1080,6 +1429,12 @@ class Harness:
         成功重新准入后必须清理旧 ACB 的槽位 / 预留 / 预算节点，否则旧账会
         与新准入叠加（槽位泄漏 + `subtree_reserved` 虚高）。
         """
+        # S10-2：`RUN_LIMITS_DRIFT` 是**上限被静默改写**的信号，必须由人工处置；
+        # 直接 re-admit 会永久抹除漂移告警。拒绝重新准入（保留 needs_readmit）。
+        if acb.failure == "RUN_LIMITS_DRIFT":
+            acb.needs_readmit = True
+            self.checkpoints.save(acb)
+            return acb
         acb.needs_readmit = False
         plan = self.plans.get(acb.run_id)
         task = plan.get("tasks", {}).get(acb.task_id) if plan else None
@@ -1161,7 +1516,158 @@ class Harness:
             return acb
 
     def _restore_budget(self, acb: ACB, data: dict) -> None:
-        """恢复预算节点与预留（§5.1 / K-6）。
+        """恢复预算节点与预留（S10a §2.2 重写）。
+
+        **新格式**（payload 含 `run_limits` / `budget_cursor`）→ 从 EventLog 重放：
+        ① `run_limits` 漂移检测（与配置不一致 → `needs_readmit` + `RUN_LIMITS_DRIFT`）；
+        ② 重放前**重置基线为 0**（不叠加 checkpoint 聚合 → 修 P1-3 双份）；
+        ③ 按 `rid` 幂等（set 语义）；
+        ④ 摘要（含 `budget_siblings`）**仅交叉校验**，不等 → `needs_readmit`。
+
+        **旧格式**（手构 dict，无新字段）→ 走旧分支（保 `test_ms2`/`test_s8`
+        直接调用不破，§8.3 防护 2）。
+        """
+        node_id = data.get("budget_node_id")
+        run_limits = data.get("run_limits")
+        new_format = ("budget_cursor" in data) or ("run_limits" in data)
+
+        if new_format and run_limits is not None:
+            if int(run_limits) != int(self.budget.root.limits):
+                acb.reservation_ids = []
+                acb.budget_node = None
+                acb.state = TaskState.QUARANTINED
+                acb.needs_readmit = True
+                acb.failure = acb.failure or "RUN_LIMITS_DRIFT"
+                return
+
+        if not node_id:
+            acb.reservation_ids = []
+            acb.budget_node = None
+            acb.needs_readmit = True
+            return
+
+        if new_format and self.budget.budget_events():
+            if self._restore_budget_by_replay(acb, data, node_id):
+                return
+        self._restore_budget_ledger(acb, data, node_id)
+
+    def _replay_budget_events(self, cutoff_epoch: int) -> tuple[bool, list[str]]:
+        """从 EventLog 重放 `BUDGET_*` 事件（**重放前重置基线为 0**）。
+
+        epoch 过滤：`budget_epoch < cutoff_epoch` 的事件视为**旧 epoch 已 fence**，
+        不重建（真实路径，**不删文件**，§2.3 / S10-4）。
+        返回 `(ok, built_nodes)`；失败时已回滚已建节点。
+        """
+        budget = self.budget
+        built: list[str] = []
+        with budget.suppressed():
+            budget._reset_baseline()
+            try:
+                for ev in budget.budget_events():
+                    p = ev.payload or {}
+                    if ev.kind == EventKind.BUDGET_EPOCH:
+                        budget.apply_budget_event(ev)
+                        continue
+                    if int(p.get("budget_epoch", 0) or 0) < cutoff_epoch:
+                        continue
+                    if ev.kind == EventKind.BUDGET_NODE_CREATED:
+                        nid = p.get("node_id")
+                        node = budget.create_node(
+                            nid, int(p.get("limits", 0) or 0),
+                            parent_id=p.get("parent_id") or "run")
+                        if node is None:
+                            raise ValueError(
+                                f"budget replay: create_node({nid!r}) failed")
+                        if node.node_id not in built:
+                            built.append(node.node_id)
+                        continue
+                    if not budget.apply_budget_event(ev):
+                        raise ValueError(f"budget replay failed at seq={ev.seq}")
+            except Exception:  # noqa: BLE001
+                # 失败回滚必须**强制摘除**已建节点：`remove_node` 对「有预留 /
+                # 已消耗 / 有子」返回 False → 原实现不回滚 → 残留 + 二次传播双份。
+                for nid in reversed(built):
+                    node = budget._nodes.pop(nid, None)
+                    if node is None:
+                        continue
+                    if node.parent is not None and node in node.parent.children:
+                        node.parent.children.remove(node)
+                    for rid in list(node.reservations):
+                        budget._reservations.pop(rid, None)
+                    node.reservations.clear()
+                    node.children.clear()
+                    node.self_reserved = 0
+                    node.subtree_reserved = 0
+                    node.consumed = 0
+                    node.folded_consumed = 0
+                budget.discard_pending()
+                # 清 root 残留计数（reserve 已沿祖先链累加）+ 归零 epoch
+                budget._reset_baseline()
+                return False, []
+            budget.discard_pending()
+        return True, built
+
+    def _declared_budget_nodes(self) -> set[str]:
+        """EventLog 声明的节点集（`ARCHIVED` 视为已摘除）——树完整性的真相源。"""
+        declared: set[str] = set()
+        for ev in self.budget.budget_events():
+            p = ev.payload or {}
+            nid = p.get("node_id")
+            if not nid or nid == "run":
+                continue
+            if ev.kind == EventKind.BUDGET_ARCHIVED:
+                declared.discard(nid)
+            else:
+                declared.add(nid)
+        return declared
+
+    def _restore_budget_by_replay(self, acb: ACB, data: dict, node_id: str) -> bool:
+        """重放重建整棵树；成功且含本 ACB 节点 → 返回 True。"""
+        cutoff = int(data.get("budget_epoch", 0) or 0)
+        ok, _built = self._replay_budget_events(cutoff)
+        if not ok:
+            acb.reservation_ids = []
+            acb.budget_node = None
+            acb.needs_readmit = True
+            return False
+        # 已应用事件身份入去重集合（避免 `_replay_events` 二次投影 → 双份）
+        for ev in self.budget.budget_events():
+            if ev.event_id:
+                self._applied_event_ids.add(ev.event_id)
+        node = self.budget._nodes.get(node_id)
+        if node is None:
+            return False
+        # 摘要**仅交叉校验**（非权威）：不等 → needs_readmit
+        consistent = True
+        expected_self = int(data.get("budget_self", node.self_reserved))
+        expected_consumed = int(data.get("budget_consumed", node.consumed))
+        if node.self_reserved != expected_self or node.consumed != expected_consumed:
+            consistent = False
+        if not node.children:
+            expected_subtree = int(data.get("budget_subtree", node.subtree_reserved))
+            if expected_subtree != node.subtree_reserved:
+                consistent = False
+        siblings = data.get("budget_siblings")
+        if isinstance(siblings, dict):
+            for sid, snap in siblings.items():
+                if not isinstance(snap, dict):
+                    continue
+                sib = self.budget._nodes.get(sid)
+                if sib is None:
+                    continue
+                if (int(snap.get("self_reserved", sib.self_reserved)) != sib.self_reserved
+                        or int(snap.get("consumed", sib.consumed)) != sib.consumed):
+                    consistent = False
+        # 树完整性（§2.3）：declared（EventLog） vs rebuilt（_nodes）
+        if self._declared_budget_nodes() != (set(self.budget._nodes) - {"run"}):
+            consistent = False
+        acb.budget_node = node
+        acb.reservation_ids = list(node.reservations)
+        acb.needs_readmit = acb.needs_readmit or not consistent
+        return True
+
+    def _restore_budget_ledger(self, acb: ACB, data: dict, node_id: str) -> None:
+        """旧分支：逐笔账本为准，聚合快照仅作交叉校验（§5.1 / K-6）。
 
         - **逐笔账本为准**：ACTIVE 按 `amount`、已结算按 `consumed` 重建
           `self_reserved`；`consumed = Σconsumed`；
@@ -1169,13 +1675,6 @@ class Harness:
         - 无 `reservations`（旧 checkpoint）→ 退回聚合快照兼容路径，
           但**不能**据此把 `needs_readmit` 清成 False（无逐笔依据）。
         """
-        node_id = data.get("budget_node_id")
-        if not node_id:
-            acb.reservation_ids = []
-            acb.budget_node = None
-            acb.needs_readmit = True
-            return
-
         node = self.budget._nodes.get(node_id)
         if node is None:
             path = data.get("budget_path") or []
@@ -1324,18 +1823,27 @@ class Harness:
 
         投影按 `(resource, version)` 做版本守卫（幂等）；`event_id` 去重集合
         会写入 checkpoint（`applied_event_ids`），跨进程恢复后仍可去重。
+
+        S10a §2.2：增 **budget 投影**（`BUDGET_*` 事件 → 重建树，按 `rid` 幂等）。
+        已由 `_restore_budget` 重放过的事件身份在 `_applied_event_ids` 中，
+        `dedup=True` 时会被跳过 → 不会双份（修 P1-3）。
         """
         applied = 0
-        for ev in self.event_log.all():
-            if ev.seq < from_seq:
-                continue
-            if (dedup and ev.event_id
-                    and ev.event_id in self._applied_event_ids):
-                continue
-            self.workspace.apply_event(ev)
-            if dedup and ev.event_id:
-                self._applied_event_ids.add(ev.event_id)
-            applied += 1
+        with self.budget.suppressed():
+            for ev in self.event_log.all():
+                if ev.seq < from_seq:
+                    continue
+                if (dedup and ev.event_id
+                        and ev.event_id in self._applied_event_ids):
+                    continue
+                if _is_budget_kind(ev.kind):
+                    self.budget.apply_budget_event(ev)
+                else:
+                    self.workspace.apply_event(ev)
+                if dedup and ev.event_id:
+                    self._applied_event_ids.add(ev.event_id)
+                applied += 1
+            self.budget.discard_pending()
         return applied
 
     @staticmethod
