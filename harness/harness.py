@@ -314,6 +314,8 @@ class Harness:
         self._applied_event_ids: set[str] = set()
         self.checkpoints.applied_event_ids = self._applied_event_ids
         self._drain_skipped: list[tuple[str, str]] = []   # D11：调度跳过原因（不再静默）
+        # S14 K-69：`tick` 的跳过原因（水合失败等），与调度跳过分开，避免混淆
+        self._tick_skipped: list[tuple[str, str]] = []
         self.auth_gc_every = max(1, int(auth_gc_every))
         self.gc_every = max(1, int(gc_every))
         self._event_count = 0
@@ -1622,8 +1624,17 @@ class Harness:
         """
         depth = int(getattr(self._tls, "depth", 0) or 0)
         if depth >= _MAX_INLINE_DEPTH:
+            # S14 K-71(a)：这是**终局**，不是可重试的普通拒绝。走状态机显式边
+            # （ADMITTED/RUNNING → FAILED）+ `_finalize` 传播，Run 才能 finalize
+            # 且事件流能看到原因（旧写法返回 INVALID_INPUT 会被调用方当可重试）。
             self._drain_skipped.append((acb.id, "inline_depth_exceeded"))
-            return Result(Status.INVALID_INPUT, {"reason": "inline_depth_exceeded"})
+            if advance(acb, "inline_depth_exceeded") == Status.OK:
+                acb.failure = "INLINE_DEPTH_EXCEEDED"
+                self.intents.revoke_all(acb.id)
+                self._finalize(acb)
+            return Result(Status.GUARD_VIOLATION,
+                          {"reason": "INLINE_DEPTH_EXCEEDED",
+                           "max_inline_depth": _MAX_INLINE_DEPTH})
         self._tls.depth = depth + 1
         parent = getattr(self._tls, "running_acb", None)
         claim = None
@@ -2461,7 +2472,8 @@ class Harness:
             return Status.CANCELLED
         return Status.SEMANTIC_REJECTED
 
-    def tick(self, now_ms: int | None = None) -> None:
+    def tick(self, now_ms: int | None = None, *,
+             persist_scan: bool = True) -> None:
         """S13a P0-3：唯一超时驱动面（fail-closed）。
 
         supervisor / 调度器每轮调用；`recover()` 结束也调一次（否则恢复出的
@@ -2473,7 +2485,10 @@ class Harness:
         F4：`advance` 返回值必须校验（非法迁移 → 不结算）。
         """
         now = int(self.clock.now_ms() if now_ms is None else now_ms)
-        for acb in list(self.acbs.values()):
+        # K-69：候选集 = 内存 ∪ **持久真相**（未 `recover` 的等待态也要能结算）。
+        # 锁序红线（S14 §2.2）：`_tick_candidates` 读完即返回，下面的 `_finalize`
+        # **不持 store 锁** —— 否则 budget(1) 套 store(5) 反向获取 → LockOrderViolation。
+        for acb in self._tick_candidates(persist_scan=persist_scan):
             if acb.state is not TaskState.WAITING_APPROVAL:
                 continue
             with self.hitl._lock:
@@ -2503,6 +2518,88 @@ class Harness:
         # S13d §2.5 / B-4：aging（墙钟）与 HITL 超时共用**唯一**驱动面；
         # 扫描入口在 ReconcileLoop（`scan_deadlines`），便于观测/替换。
         self.reconcile.scan_deadlines(now)
+
+    # ---- S14 K-69：tick 的持久候选集 + 外部驱动器 ---------------------
+    def _tick_candidates(self, *, persist_scan: bool = True) -> list[ACB]:
+        """`tick` 的候选集 = 内存 ∪ **持久真相**（`persist_scan=False` 时仅内存）。
+
+        为什么必须含持久：S13a 的 `tick` 只遍历 `self.acbs`，而 `recover()` 一次
+        只恢复 1 个 ACB → **未 `recover` 的等待态永远不在扫描范围**，反复调
+        `tick` 也结算不到（K-69 的真 bug，不是「记得调 tick」能解决的）。
+
+        `persist_scan=False` 供 `recover()` 使用：恢复尚未完成时，别的 ACB 可能
+        只恢复了一半，**此时结算它们是错的**（S13 评审 R-5）。恢复结束后的
+        首次 `pump()` 会补上。
+
+        锁序红线（S14 §2.2）：本方法内 `refs_all()` / `load_strict()` **读完即
+        返回**，调用方在**无 store 锁**下再调 `_finalize`；否则 `budget(1)` 会
+        套在 `store(5)` 里 → 反向获取 → `LockOrderViolation`。
+
+        失败不静默：枚举/读取/水合的任一步失败都记 `_tick_skipped`。
+        """
+        out: list[ACB] = []
+        seen: set[str] = set()
+        for acb in list(self.acbs.values()):
+            seen.add(acb.id)
+            out.append(acb)
+        if not persist_scan:
+            return out
+        try:
+            refs = self.checkpoints.refs_all()
+        except Exception:                       # noqa: BLE001 —— 枚举失败降级为仅内存
+            self._tick_skipped.append(("", "refs_all_failed"))
+            return out
+        for acb_id, ref in refs:
+            if acb_id in seen or ref is None:
+                continue
+            try:
+                payload = self.checkpoints.load_strict(ref)
+            except Exception:                   # noqa: BLE001
+                self._tick_skipped.append((acb_id, "tick_load_failed"))
+                continue
+            try:
+                out.append(self._restore_acb(payload))
+            except Exception:                   # noqa: BLE001
+                self._tick_skipped.append((acb_id, "tick_hydrate_failed"))
+        return out
+
+    def _pending_deadlines(self) -> list[tuple[int, str]]:
+        """当前**待结算**项 `[(deadline_ms, acb_id)]`（HITL 超时 ∪ aging）。"""
+        out: list[tuple[int, str]] = []
+        for acb in self._tick_candidates():
+            if acb.state is TaskState.WAITING_APPROVAL:
+                _, deadline = self._approval_slot(acb)
+            elif acb.state is TaskState.ADMITTED and acb.aging_deadline is not None:
+                deadline = acb.aging_deadline
+            else:
+                continue
+            if deadline is None:
+                continue
+            out.append((int(deadline), acb.id))
+        return out
+
+    def next_deadline_ms(self) -> int | None:
+        """最近的到期时刻；`None` = 当前无待结算项。
+
+        供外部驱动器**精确定时**（睡到最近到期点），而不是固定间隔轮询
+        （对齐 K8s 的 level-triggered resync 只作兜底）。
+        """
+        pending = self._pending_deadlines()
+        return min((d for d, _ in pending), default=None)
+
+    def pump(self, now_ms: int | None = None) -> int:
+        """驱动器入口：`tick()` 后返回**仍待结算**项数（`0` = 可退出）。
+
+        典型用法（supervisor，**不引后台线程**）::
+
+            while h.pump() > 0:
+                h.tick(h.next_deadline_ms())
+
+        注：`now_ms` 透传给 `tick`，便于 `ManualClock` 精确构造（不用 sleep）。
+        """
+        self.tick(now_ms)
+        return len(self._pending_deadlines())
+
 
     # ---- S13d §2.5：aging（墙钟 deadline）+ claim fencing --------------
     def _arm_aging(self, acb: ACB) -> None:
@@ -3045,7 +3142,16 @@ class Harness:
             # 否则会丢掉 staged / 预算 / 能力等字段）。
             updater = getattr(self.checkpoints, "update_children", None)
             if callable(updater):
-                updater(parent_id, _patch)
+                # S14 K-68：条件写 —— 用**本次读到的**父 ref 作为期望值，
+                # 避免两个并发 replan 互相覆盖（后写者丢更新）。
+                expect = self.checkpoints.latest_ref_for_acb(parent_id)
+                try:
+                    updater(parent_id, _patch, expect_ref=expect)
+                except FencingRejected:
+                    # CAS 冲突耗尽重试：显式记录（不静默丢更新），父的下次
+                    # 汇总/取消会由 `_index_child` 的反扫索引兜底。
+                    self._drain_skipped.append(
+                        (parent_id, "child_ref_cas_conflict"))
             return
         parent.children = [fresh if child is old else child
                            for child in list(getattr(parent, "children", []) or [])]
@@ -3293,7 +3399,10 @@ class Harness:
         self._reconcile_children_refs(acb)
         self._reconcile_children_pending(acb)
         # S13a P0-3：恢复结束即驱动一次超时结算（否则恢复出的过期审批永不结算）。
-        self.tick()
+        # S14 K-69：此处 **persist_scan=False** —— 恢复尚未完成，别的 ACB 可能只
+        # 恢复了一半，此时结算它们是错的（S13 评审 R-5）。恢复后的首次 `pump()`
+        # 会做持久扫描补上。
+        self.tick(persist_scan=False)
         return acb
 
     def replan(self, acb: ACB, plan: dict | None = None, *,
@@ -3355,8 +3464,43 @@ class Harness:
             self.plans[acb.run_id] = new_plan
             # ⑥ 清理旧节点 + 再准入（P0-6，复用 requeue_readmit 序列）；
             #    R7：superseded 的标记与落盘在同一临界区内完成
+            # 注意顺序：`_readmit_after_replan` 内部还要用**旧 task_id** 解析
+            # （`task_for(new_plan, acb.task_id)`），所以剪枝必须放在它**之后**。
             self._readmit_after_replan(acb, new_plan)
+            # S14 K-67(A)：别名剪枝（判据含「活跃 ACB 的 task_id / subgoal」）。
+            self._prune_id_aliases(acb.run_id, new_plan)
             return new_plan
+
+    def _prune_id_aliases(self, run_id: str, plan: dict) -> None:
+        """S14 K-67(A)：剪掉**已不可能再被引用**的旧 id → logical_subgoal 映射。
+
+        判据（修正 S13 §2.3 的漏洞）::
+
+            keep = edges 端点 ∪ plan["tasks"] ∪ 本 run 活跃 ACB 的 task_id
+                                    ∪ 本 run 活跃 ACB 的 logical_subgoal_id
+
+        为什么必须含最后两项：`patch()` 已把 `edges` 端点**物化**为 canonical id，
+        于是边不再引用旧 id；但 `_finalize` / `_readmit_after_replan` 仍按
+        **活跃 ACB 的旧 `task_id`** 解析。只按 edges 剪枝会把它们剪掉 →
+        `replan_no_task`。这正是 K-67 的判据修正。
+
+        收益：`patch()` 每次 `deepcopy(plan)` 会连别名表一起拷，别名无界增长会让
+        单 plan 内 n 次 replan 退化为 O(n²)；剪枝让它**单调不增**。
+        """
+        aliases = plan.get("_id_aliases")
+        if not isinstance(aliases, dict) or not aliases:
+            return
+        keep: set[str] = set(plan.get("tasks") or {})
+        for edge in plan.get("edges", []) or []:
+            keep.add(str(edge.get("from", "")))
+            keep.add(str(edge.get("to", "")))
+        for acb in list(self.acbs.values()):
+            if acb.run_id != run_id:
+                continue
+            keep.add(str(acb.task_id))
+            if acb.logical_subgoal_id:
+                keep.add(str(acb.logical_subgoal_id))
+        plan["_id_aliases"] = {k: v for k, v in aliases.items() if str(k) in keep}
 
     def replan_from_quarantine(self, acb: ACB, plan: dict | None = None, *,
                                diagnosis: dict | None = None) -> dict | None | Result:

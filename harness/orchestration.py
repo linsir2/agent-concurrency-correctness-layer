@@ -277,6 +277,29 @@ class Planner:
         # S13b §2.3：走 add_logical_edge（含 `_has_cycle` + 去重 + 端点规范化）
         for dep in diagnosis.get("missing_deps", []):
             self.add_logical_edge(new_plan, dep["from"], dep["to"])
+        # S14 K-67(B)：**物化 edges 端点**为当前 canonical id。
+        # 与 Camunda「迁移时把 A→C 物化成实例挂在 C 上」同构：patch 之后 edges
+        # 不再引用旧 id，别名只剩「**活跃 ACB 的旧 task_id** → 当前 task」这一种
+        # 用途 —— 这样剪枝才有安全判据（否则会剪掉在途 ACB 的映射）。
+        _subgoal_to_tid: dict[str, str] = {}
+        for _tid, _task in remade.items():
+            _subgoal_to_tid.setdefault(_task["logical_subgoal_id"], _tid)
+
+        def _canon(x: str) -> str:
+            if x in remade:
+                return x
+            sg = id_aliases.get(x)
+            if sg is not None:
+                return _subgoal_to_tid.get(sg, x)
+            return x
+
+        materialized: list[dict] = []
+        for edge in new_plan.get("edges", []) or []:
+            edge = dict(edge)
+            edge["from"] = _canon(str(edge.get("from", "")))
+            edge["to"] = _canon(str(edge.get("to", "")))
+            materialized.append(edge)
+        new_plan["edges"] = materialized
         event_draft = {
             "kind": EventKind.PLAN_PATCHED,
             "subject": plan["run_id"],

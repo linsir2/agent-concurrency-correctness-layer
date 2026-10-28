@@ -221,7 +221,7 @@ L5 门面      harness（组装 + 端到端）
 | **依赖** | MS0–MS7 |
 | **入口条件** | MS7 出口通过 |
 | **出口条件** | `test_ms8_conformance.py`（I1/I2/I3/I5/I6/I7/I8）+ `test_ms8_spec.py`（I9/I10/I13 + 资源模型 + 协调协议 + 收据链）+ `test_ms7_capability.py`（I4）+ `test_a7/a11/a13`（I11/I12/I14） |
-| **覆盖强度（v1.1 诚实分级）** | **强**（断言机制本身）：I1/I2/I3/I5/I7；**中**（断言方向对但只覆盖单一路径）：I4/I6/I8/I9/I10；**弱/未落地（必须在本里程碑补强）**：I11（`retention` 未读取、无 cursor floor）、I12（只断言「存在非终态任务」，未验证不饿死）、I13（运行时**从不产生收据**，只测了 spec 层 hash-chain）、I14（`no_progress_steps` 从无写入，`NO_PROGRESS` 不可达） |
+| **覆盖强度（v1.2 已按代码复核修正）** | **强**（断言机制本身）：I1/I2/I3/I5/I7；**强（S9–S14 已补齐，原 v1.1 的自评已过期）**：I11（`retention` 在 `context.py` 真读取、`floor_for` 在 `harness.py` per-run 实现，S12 K-33）、I13（`RECEIPT_ISSUED` 由 `commit_batch` 在 `harness.py` 真产生）、I14（`no_progress_steps` 在 `runtime.py` 写入、`NO_PROGRESS` 谓词可达）；**中**：I4/I6/I8/I9/I10；**S14 补强**：I12（新增 `test_s14_i12.py`：aging 有界离开 ADMITTED，不再只断言「存在非终态」） |
 | **扩展点** | 规范与实现分离（实现可换） |
 | **承上启下** | MS9 的分布式替换必须仍通过 conformance suite |
 
@@ -235,7 +235,7 @@ L5 门面      harness（组装 + 端到端）
 | **入口条件** | MS8 出口通过 |
 | **出口条件** | 全部 35 个测试在 Raft 后端下仍通过 |
 | **扩展点** | **这是 MS1–MS7 预留的最大扩展点** |
-| **前置条件（v1.1 硬门槛）** | 「实现同一接口」要求先有接口：当前 `EventLog`/`BudgetManager`/`IntentRegistry`/`PolicyEngine` 均为**具体类直接实例化**，无 `Protocol`/ABC、无构造注入。**MS9 不得开工，直到 D2 落定并把组件改为可注入** |
+| **前置条件（v1.2 已按代码复核修正）** | 「实现同一接口」要求先有接口。**实测：`Harness.__init__` 已支持全组件 keyword 注入**（`event_log`/`intents`/`workspace`/`budget`/`checkpoints`/`effects`/`policy`/`context`/`subscriptions`/`clock`/`blobs`），故 v1.1 的「无构造注入、MS9 不得开工」**已过期**。真正缺的只有两件：① 无 `Protocol`/`ABC` 契约声明（`grep` 零命中）→ 无法类型校验替代后端；② 无后端一致性测试套件。二者均为纯 Python，见 S15 大类 C |
 | **承上启下** | MS10 的 HA 前提 |
 
 ### MS10 · 生产化
@@ -246,7 +246,7 @@ L5 门面      harness（组装 + 端到端）
 | **新增模块** | `observability`、`admin`、`dlq` |
 | **依赖** | MS8、MS9 |
 | **入口条件** | MS9 出口通过 |
-| **出口条件** | `test_dlq`（毒任务转 `DEAD_LETTER`，**需新增**：当前 `DEAD_LETTER` 无任何产生路径）、`test_admin_pause_resume`（**需新增**）、`test_ingress_idempotent`（**需新增**：用户重复请求不重复建 Run） |
+| **出口条件** | `test_dlq`（毒任务转 `DEAD_LETTER` —— **产生路径已有 4 条**：aging `AGING_EXHAUSTED`、`escalate_quarantined`、replan 预算耗尽、aging 上限；缺的是「毒任务自动识别 + redrive」的测试）、`test_admin_pause_resume`（**需新增**：当前无 pause/resume 语义）、`test_ingress_idempotent`（**需新增**：`RunCoordinator.submit_command` 仍是空壳） |
 | **扩展点** | OTel / Prometheus 适配器 |
 | **承上启下** | 交付给外部用户 |
 

@@ -194,6 +194,10 @@ TRANSITIONS: dict[tuple[TaskState, str], TaskState] = {
     (TaskState.REPLANNING, "replan_budget_exhausted"): TaskState.DEAD_LETTER,
     (TaskState.INADMISSIBLE, "escalate"): TaskState.REPLANNING,
     (TaskState.INADMISSIBLE, "give_up"): TaskState.FAILED,
+    # S14 K-71(a)：worker 内嵌套超过 `_MAX_INLINE_DEPTH` → **终局**（不是可重试的
+    # INVALID_INPUT）。必须走状态机显式边，让 `_finalize` 能传播 failure。
+    (TaskState.ADMITTED, "inline_depth_exceeded"): TaskState.FAILED,
+    (TaskState.RUNNING, "inline_depth_exceeded"): TaskState.FAILED,
     # S13d §2.5：aging（墙钟）—— 准入后迟迟未被调度 → INADMISSIBLE（非终态）。
     # P1-1：INADMISSIBLE 非终态 → Run 永不 finalize，故必须给两条出路：
     #   ① 单次超时可 `readmit` 重新准入（→ PLANNED，重新 try_admit）；
@@ -303,7 +307,17 @@ class ResultEnvelope:
     `status` ∈ {DONE, DONE_PARTIAL, FAILED, CANCELLED}；`coverage` 记录覆盖了
     哪些子目标；`artifacts` 收集 commit/effect/收据 id；`conflicts` 记录与其他
     子的矛盾；`budget_usage` 为子任务已消耗预算合计。`DONE_PARTIAL` 由
-    「有子完成 + 有子未完成」产生（此前无任何产生路径）。
+    「有子终态 + ≥1 完成 + ≥1 失败/取消」产生。
+
+    **S14 K-70 语义预留（未实现，禁止误用）**：`coverage` 将来可承载
+    `required_coverage` 声明，形态二选一（对齐业界，见 S14 §2.7）::
+
+        {"min_done_ratio": 0.8}        # 计数阈值（K8s Job `completions` 形态）
+        {"require": {"S2": "DONE"}}    # 命名集合（Airflow trigger_rule 形态）
+
+    **若实现严格化**：不满足时必须 `UPSTREAM_INSUFFICIENT` **终态失败**
+    （对齐 Airflow `upstream_failed`），**绝不**让下游永久 `PLANNED`。
+    当前默认宽松：`DONE_PARTIAL ∈ PREDECESSOR_SATISFIED`（避免悬挂）。
     """
     status: str = "DONE"
     coverage: dict = field(default_factory=dict)

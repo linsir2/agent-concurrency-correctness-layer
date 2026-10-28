@@ -56,15 +56,32 @@ def test_s13_4_rebuild_ready_set_returns_successor_via_alias():
 
 
 def test_s13_4_negative_control_without_alias_ready_empty():
-    """负对照：去掉 alias 解析 → 旧 id `T1` 落在 done 之外 → T2 不就绪。"""
+    """负对照：**在途 ACB 的旧 task_id** 仍只能靠别名解析到当前 task。
+
+    S14 K-67(B) 之后 `patch()` 会把 `edges` 端点物化为 canonical id，所以
+    「后继就绪」不再依赖别名；但 `_finalize` / `_readmit_after_replan` 仍按
+    **活跃 ACB 的旧 `task_id`** 解析 —— 这条路径**仍必须**依赖别名。
+    这正是 K-67 剪枝判据必须含「活跃 ACB 的 task_id」的原因（用旧判据
+    「只在 edges.from 里找」会剪掉它 → `replan_no_task`）。
+    """
     h = make_harness()
     plan = _plan_with_edge(h)
     new_plan = _patched(h, plan)
+
+    # ① edges 已物化：端点都是 canonical id，不再引用被改名的旧 id
+    assert [e["to"] for e in new_plan["edges"]] == ["T2"]
+    assert all(e["from"] in new_plan["tasks"] for e in new_plan["edges"])
+
+    # ② 后继就绪确实不再依赖别名（旧负对照的前提已随 K-67(B) 改变）
     new_plan["tasks"]["T1'"]["state"] = TaskState.DONE
     assert "T2" in h.reconcile.rebuild_ready_set("S4")
 
+    # ③ 但「旧 task_id → 当前 task」仍然只能用别名解析；去掉别名即解析不到
+    assert h.planner.task_for(new_plan, "T1")["task_id"] == "T1'"
     h.planner.resolve_alias = lambda old_id, plan=None: old_id
-    assert h.reconcile.rebuild_ready_set("S4") == []
+    stale = h.planner.task_for(new_plan, "T1")
+    assert stale is None or stale["task_id"] != "T1'", (
+        "去掉别名解析后仍能解析到当前 task —— 说明别名不是唯一映射（判据失效）")
 
 
 def test_s13_4_execution_pushes_and_runs_successor_after_rename():
@@ -102,7 +119,14 @@ def test_s13_4_execution_pushes_and_runs_successor_after_rename():
 
 
 def test_s13_4_two_replans_still_resolve_old_ids():
-    """③ 两次 replan（T1''）后，T1 / T1' 仍一跳解析到 S1。"""
+    """③ 两次 replan（T1''）后：edges 全是 canonical id，后继仍能就绪，别名表有界。
+
+    S14 K-67 变更（判据修正）：
+    - K-67(B) `patch()` **物化 edges 端点** → 边不再引用被改名的旧 id，后继就绪
+      不再依赖别名（对照 S13 时「必须靠别名兜底」）；
+    - K-67(A) 别名表**有界**：第一代 `T1` 在再准入后已无任何引用 → 被剪；
+      `_readmit_after_replan` 需要旧 id 的窗口在剪枝**之前**，故安全。
+    """
     h = make_harness(run_limits=100)
     plan = _plan_with_edge(h, "S4T")
     a1 = admit(h, "S4T", plan, "T1")
@@ -112,16 +136,22 @@ def test_s13_4_two_replans_still_resolve_old_ids():
                      diagnosis={"failing_subgoals": ["S1"], "missing_deps": []})
     assert first is not None and first["version"] == 2
     assert _acb_for(h, "S4T", "T1'") is not None
+    # K-67(B)：edges 端点已物化为 canonical（不再引用旧 id `T1`）
+    assert all(e["from"] in first["tasks"] for e in first["edges"])
+    # K-67(A)：别名表有界（旧代至多保留到再准入结束）
+    assert len(first["_id_aliases"]) <= 1
 
     _acb_for(h, "S4T", "T1'").state = TaskState.QUARANTINED
     second = h.replan(plan=first, acb=_acb_for(h, "S4T", "T1'"),
                       diagnosis={"failing_subgoals": ["S1"], "missing_deps": []})
     assert second is not None and second["version"] == 3
     assert "T1''" in second["tasks"]
-    assert h.planner.resolve_alias("T1", second) == "S1"
-    assert h.planner.resolve_alias("T1'", second) == "S1"
-    assert h.planner.task_for(second, "T1")["task_id"] == "T1''"
+    # 有界：不随 replan 次数线性增长（无剪枝时此处会是 2：{T1, T1'}）
+    assert len(second["_id_aliases"]) <= 1
+    assert all(e["from"] in second["tasks"] for e in second["edges"])
+    assert all(e["to"] in second["tasks"] for e in second["edges"])
 
+    # 关键行为：当前代完成 → 后继仍能就绪（不靠别名也成立，因为边已物化）
     second["tasks"]["T1''"]["state"] = TaskState.DONE
     assert "T2" in h.reconcile.rebuild_ready_set("S4T")
     h.budget.check_invariants()
