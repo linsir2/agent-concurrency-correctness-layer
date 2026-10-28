@@ -115,6 +115,8 @@ class EventKind(str, Enum):
     APPROVAL_RAISED = "APPROVAL_RAISED"
     APPROVAL_RESOLVED = "APPROVAL_RESOLVED"
     TASK_COMPLETED = "TASK_COMPLETED"
+    # S13c C1：spawn 两阶段落盘的孤儿回收留痕（绝不静默跳过）。
+    SPAWN_ORPHAN_RECLAIMED = "SPAWN_ORPHAN_RECLAIMED"
 
 
 class TaskState(str, Enum):
@@ -131,7 +133,9 @@ class TaskState(str, Enum):
     INADMISSIBLE = "INADMISSIBLE"
     REPLANNING = "REPLANNING"
     DONE = "DONE"
-    DONE_PARTIAL = "DONE_PARTIAL"   # 兼容保留：归属 RunState，S4 从 TaskState 移除
+    # S13c C3：父汇总的 DONE_PARTIAL 是**任务级终态**（否则预算节点永不归档、
+    # 后继永不就绪、Run 永不 finalize）。表 B 的 RunState 仍保留同名值。
+    DONE_PARTIAL = "DONE_PARTIAL"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     DEAD_LETTER = "DEAD_LETTER"
@@ -149,7 +153,8 @@ class RunState(str, Enum):
 
 
 TASK_TERMINAL = frozenset({
-    TaskState.DONE, TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER,
+    TaskState.DONE, TaskState.DONE_PARTIAL, TaskState.FAILED,
+    TaskState.CANCELLED, TaskState.DEAD_LETTER,
 })
 RUN_TERMINAL = frozenset({
     RunState.DONE, RunState.DONE_PARTIAL, RunState.FAILED, RunState.CANCELLED,
@@ -168,6 +173,8 @@ TRANSITIONS: dict[tuple[TaskState, str], TaskState] = {
     (TaskState.INSTANTIATING, "spawn_failed"): TaskState.FAILED,
     (TaskState.READY, "schedule"): TaskState.RUNNING,
     (TaskState.RUNNING, "finish_ok"): TaskState.DONE,
+    # S13c C3：父汇总为「部分完成」的显式边（终态）。
+    (TaskState.RUNNING, "partial"): TaskState.DONE_PARTIAL,
     (TaskState.RUNNING, "request_approval"): TaskState.WAITING_APPROVAL,
     (TaskState.RUNNING, "verifier_failed"): TaskState.REBASING,
     (TaskState.RUNNING, "transient_error"): TaskState.RETRYING,
@@ -355,6 +362,10 @@ class ACB:
     superseded: bool = False              # R7：已被 replan/requeue 取代的旧 ACB
     parent_id: str = ""                   # 父 ACB id（spawn_child 用，空 = 无父）
     children_ids: list = field(default_factory=list)  # [(acb_id, checkpoint_ref)]
+    # S13c C1：两阶段落盘的**第一阶段**登记（ref 尚未产生）。可重建：
+    # {child_id: {task_id, min_budget, slice, run_id, ...}}；② 成功后才转为
+    # `children_ids`，崩溃窗口内取消/恢复按此找回子或做孤儿结算。
+    children_pending: dict = field(default_factory=dict)
     # ---- S13d §2.5：Scheduler claim + fencing（P0-10）----
     claim_epoch: int = 0                  # 本 worker 持有的 fence epoch（写路径比对）
     claim_worker: str = ""                # 当前 claim 的 worker_id（可观测性）

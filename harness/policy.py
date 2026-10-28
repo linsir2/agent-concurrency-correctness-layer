@@ -13,6 +13,7 @@ v1.1（S5 第二波，§5.9）：
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import time
 from dataclasses import dataclass, field
@@ -53,17 +54,122 @@ def _lower_class(a: str, b: Optional[str]) -> str:
     ❌ `min("public", "confidential") == "confidential"`（字面量比较 → 越权）；
     ✅ 用 `_DATA_CLASS_LEVELS` 比较。`"*"`：父 `*` → 取 requested；requested
     `*`（或 None）→ 取父。未知等级 → `CapabilityAttenuationError`（fail-closed）。
+
+    C4：**任一分支**都必须校验等级可达 —— `a == "*"` 不得成为「未知 b 绕过
+    fail-closed」的后门；`b is None/*` 也同样不得让未知 `a` 原样通过。
     """
+    if a != "*" and a not in _DATA_CLASS_LEVELS:
+        raise CapabilityAttenuationError(
+            f"未知 data_class: {a!r}（无法按分级序比较 → 拒绝派生）")
+    if b is not None and b != "*" and b not in _DATA_CLASS_LEVELS:
+        raise CapabilityAttenuationError(
+            f"未知 data_class: {b!r}（无法按分级序比较 → 拒绝派生）")
     if a == "*":
         return b if b else "*"
     if b is None or b == "*":
         return a
-    la = _DATA_CLASS_LEVELS.get(a)
-    lb = _DATA_CLASS_LEVELS.get(b)
-    if la is None or lb is None:
-        raise CapabilityAttenuationError(
-            f"未知 data_class: {a!r}/{b!r}（无法按分级序比较 → 拒绝派生）")
+    la = _DATA_CLASS_LEVELS[a]
+    lb = _DATA_CLASS_LEVELS[b]
     return a if la <= lb else b
+
+
+def _path_contains_one(wide: str, narrow: str) -> bool:
+    """路径前缀包含：`narrow` 是否被 `wide` 覆盖（`allows_path` 同谓词）。"""
+    if wide == "*":
+        return True
+    if narrow == "*":
+        return False
+    return narrow == wide or narrow.startswith(wide)
+
+
+def _paths_contains(parent_paths: set[str], child_paths: set[str]) -> bool:
+    """`child` 的路径语言是否 ⊆ `parent`（每项至少被一个父前缀覆盖）。"""
+    parent = set(parent_paths or ())
+    if "*" in parent:
+        return True
+    child = set(child_paths or ())
+    if "*" in child:
+        return False
+    return all(any(_path_contains_one(p, c) for p in parent) for c in child)
+
+
+def _intersect_paths(parent_set, requested_set) -> set[str]:
+    """C4：paths 按**语义包含**求交（不是集合精确交集）。
+
+    父 `{"/src"}` 与请求 `{"/src/lib"}` → 收窄保留 `{"/src/lib"}`（子只能访问
+    更窄子树）；请求更宽 `{"/"}` 而父 `{"/src"}` → 保留父项 `{"/src"}`。
+    """
+    parent = set(parent_set or ())
+    requested = set(requested_set or ())
+    if "*" in parent:
+        return requested
+    if "*" in requested:
+        return parent
+    out: set[str] = set()
+    for r in requested:
+        for p in parent:
+            if _path_contains_one(p, r):
+                out.add(r)                 # 请求更窄（父覆盖请求项）
+            elif _path_contains_one(r, p):
+                out.add(p)                 # 父更窄（父项覆盖请求项）
+    return out
+
+
+def _network_contains_one(wide: str, narrow: str) -> bool:
+    """`narrow` 允许的主机集合是否 ⊆ `wide`（host/port/CIDR/通配）。"""
+    if wide == "*":
+        return True
+    if narrow == "*":
+        return False
+    w_host, w_port = _split_host_port(wide)
+    n_host, n_port = _split_host_port(narrow)
+    if w_port is not None and w_port != n_port:
+        return False
+    w_host = w_host.lower()
+    n_host = n_host.lower()
+    if not w_host or not n_host:
+        return False
+    if w_host == n_host:
+        return True
+    if "/" in w_host:
+        if "/" in n_host:
+            try:
+                return ipaddress.ip_network(n_host, strict=False).subnet_of(
+                    ipaddress.ip_network(w_host, strict=False))
+            except ValueError:
+                return False
+        return _ip_in_cidr(n_host, w_host)
+    if w_host.startswith("*."):
+        return n_host.endswith(w_host[1:])
+    return False
+
+
+def _networks_contains(parent_net: set[str], child_net: set[str]) -> bool:
+    parent = set(parent_net or ())
+    if "*" in parent:
+        return True
+    child = set(child_net or ())
+    if "*" in child:
+        return False
+    return all(any(_network_contains_one(p, c) for p in parent) for c in child)
+
+
+def _intersect_network(parent_set, requested_set) -> set[str]:
+    """C4：network 用语义包含求交（父网段/通配覆盖请求项则保留请求项）。"""
+    parent = set(parent_set or ())
+    requested = set(requested_set or ())
+    if "*" in parent:
+        return requested
+    if "*" in requested:
+        return parent
+    out: set[str] = set()
+    for r in requested:
+        for p in parent:
+            if _network_contains_one(p, r):
+                out.add(r)
+            elif _network_contains_one(r, p):
+                out.add(p)
+    return out
 
 
 def _intersect_scope(parent_set, requested_set) -> set[str]:
@@ -77,14 +183,60 @@ def _intersect_scope(parent_set, requested_set) -> set[str]:
     return parent & requested
 
 
+def _scope_digest(scope: dict) -> str:
+    """能力快照摘要（C6：lineage 锚定不可变快照，不读全局 `_tokens`）。"""
+    payload = {
+        "tools": sorted(scope.get("tools") or ()),
+        "paths": sorted(scope.get("paths") or ()),
+        "network": sorted(scope.get("network") or ()),
+        "data_class": scope.get("data_class") or "public",
+    }
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()[:32]
+
+
+def _scope_of_token(token) -> dict:
+    return {
+        "tools": sorted(getattr(token, "tools", ()) or ()),
+        "paths": sorted(getattr(token, "paths", ()) or ()),
+        "network": sorted(getattr(token, "network", ()) or ()),
+        "data_class": getattr(token, "data_class", "public") or "public",
+    }
+
+
+def _token_contains_scope(child: "CapabilityToken", scope: dict) -> bool:
+    """`child` 是否 ⊆ 给定父能力快照（语义包含，C4）。"""
+    if not _paths_contains(set(scope.get("paths") or ()), child.paths):
+        return False
+    if not _networks_contains(set(scope.get("network") or ()),
+                              child.network):
+        return False
+    p_tools = set(scope.get("tools") or ())
+    if "*" not in p_tools:
+        if "*" in child.tools or not (child.tools <= p_tools):
+            return False
+    pd = scope.get("data_class", "public") or "public"
+    cd = child.data_class
+    if pd == "*":
+        return True
+    pc = _DATA_CLASS_LEVELS.get(pd)
+    cc = _DATA_CLASS_LEVELS.get(cd)
+    if pc is None or cc is None:
+        return cd == pd
+    return cc <= pc
+
+
 def _token_contains(child: "CapabilityToken", parent: "CapabilityToken") -> bool:
-    """`child` 每一维是否 ⊆ `parent`（父 `"*"` 视作全集）。"""
-    for dim in ("tools", "paths", "network"):
-        p = set(getattr(parent, dim, ()) or ())
-        c = set(getattr(child, dim, ()) or ())
-        if "*" in p:
-            continue
-        if "*" in c or not c <= p:
+    """`child` 每一维是否 ⊆ `parent`（父 `"*"` 视作全集；C4 语义包含）。"""
+    if not _paths_contains(set(getattr(parent, "paths", ()) or ()),
+                           set(getattr(child, "paths", ()) or ())):
+        return False
+    if not _networks_contains(set(getattr(parent, "network", ()) or ()),
+                              set(getattr(child, "network", ()) or ())):
+        return False
+    p_tools = set(getattr(parent, "tools", ()) or ())
+    c_tools = set(getattr(child, "tools", ()) or ())
+    if "*" not in p_tools:
+        if "*" in c_tools or not (c_tools <= p_tools):
             return False
     pd = getattr(parent, "data_class", "public")
     cd = getattr(child, "data_class", "public")
@@ -103,6 +255,10 @@ def attenuate_token(parent: "CapabilityToken", requested: Scope,
 
     这是**唯一**给子签发能力（派生）的路径；`policy.issue` 的合同保持不变
     （`test_i4_capability_production_no_self_issue` 依赖旧签名/自证拒绝）。
+
+    C4：tools 仍为集合精确交集；paths/network 按**语义包含**求交。
+    C6：把父能力快照写进 token（`parent_scope` + 摘要），lineage 校验不再
+    依赖可被任意 `issue` 覆盖的全局 `_tokens`。
     """
     if not isinstance(child_id, str) or not child_id:
         raise ValueError("attenuate_token: child_id 必须是非空字符串")
@@ -112,13 +268,16 @@ def attenuate_token(parent: "CapabilityToken", requested: Scope,
             paths=set(requested.get("paths") or ()),
             network=set(requested.get("network") or ()),
             data_class=requested.get("data_class"))
+    parent_scope = _scope_of_token(parent)
     token = CapabilityToken(
         child_id,
         tools=_intersect_scope(parent.tools, requested.tools),
-        paths=_intersect_scope(parent.paths, requested.paths),
-        network=_intersect_scope(parent.network, requested.network),
+        paths=_intersect_paths(parent.paths, requested.paths),
+        network=_intersect_network(parent.network, requested.network),
         data_class=_lower_class(parent.data_class, requested.data_class),
         parent_id=parent.agent_id,
+        parent_scope=parent_scope,
+        parent_scope_digest=_scope_digest(parent_scope),
     )
     return token
 
@@ -159,7 +318,9 @@ class CapabilityToken:
                  paths: Optional[set[str]] = None,
                  network: Optional[set[str]] = None,
                  data_class: str = "public",
-                 parent_id: str = "") -> None:
+                 parent_id: str = "",
+                 parent_scope: Optional[dict] = None,
+                 parent_scope_digest: str = "") -> None:
         self.agent_id = agent_id
         self.tools = set(tools or ())
         self.paths = set(paths or ())
@@ -167,6 +328,16 @@ class CapabilityToken:
         self.data_class = data_class
         # S13c §2.4：派生 token 的父身份（`attenuate_token` 写入；根 token 为空）。
         self.parent_id = parent_id
+        # C6：父能力**快照**（签发时冻结），lineage 校验只认它，不认全局 dict。
+        self.parent_scope = (None if parent_scope is None
+                             else {
+                                 "tools": sorted(parent_scope.get("tools") or ()),
+                                 "paths": sorted(parent_scope.get("paths") or ()),
+                                 "network": sorted(parent_scope.get("network") or ()),
+                                 "data_class": parent_scope.get("data_class") or "public",
+                             })
+        self.parent_scope_digest = parent_scope_digest or (
+            _scope_digest(self.parent_scope) if self.parent_scope is not None else "")
 
     def allows_tool(self, tool: str) -> bool:
         return "*" in self.tools or tool in self.tools
@@ -343,19 +514,34 @@ class PolicyEngine:
         return None
 
     def _traceable(self, token: CapabilityToken, depth: int = 0) -> bool:
-        """`parent_id` 非空 → 父 token 必须已签发且 `token ⊆ parent`（可递归）。"""
+        """`parent_id` 非空 → 父 token 必须已签发且 `token ⊆ parent`（可递归）。
+
+        C6：lineage 锚定到签发时冻结的**父能力快照**（`parent_scope`）。全局
+        `_tokens[parent_id]` 可被任意 `issue` 覆盖成宽 token，绝不能作为
+        attenuation 的唯一依据；快照缺失（伪造 parent_id 的自签 token）→
+        fail-closed。
+
+        C5：跨进程恢复后父 token 由 `_restore_capability` 按需加载并注册，
+        因此仍要求 `_tokens[parent_id]` 存在来递归校验父链。
+        """
         parent_id = getattr(token, "parent_id", "") or ""
         if not parent_id:
             return True
         if depth >= 16:                       # 防御性上限（避免伪造环）
             return False
+        snapshot = getattr(token, "parent_scope", None)
+        if not isinstance(snapshot, dict):
+            return False                      # 有父却无快照 → 不可追溯（fail-closed）
+        digest = getattr(token, "parent_scope_digest", "") or ""
+        if digest and digest != _scope_digest(snapshot):
+            return False                      # 快照被篡改
+        if not _token_contains_scope(token, snapshot):
+            return False
         parent_raw = self._tokens.get(parent_id)
         if parent_raw is None:
-            return False
+            return False                      # 父链未注册（恢复缺失 → 拒绝）
         parent = self._resolve_raw(parent_raw)
         if parent is None:
-            return False
-        if not _token_contains(token, parent):
             return False
         return self._traceable(parent, depth + 1)
 

@@ -463,13 +463,25 @@ class Dispatcher:
         """
         plan_version = int(task.get("plan_version", 1) or 1)
         key = (run_id, task["task_id"], plan_version)
+        prev = None
         if not replace:
             existing = self.h._lookup_admission(key)
             if existing is not None:
                 return existing
+        else:
+            # C6：replace 也必须继承**旧 ACB 的 lineage**（parent_id 不可变）。
+            prev = self.h._lookup_admission(key)
         acb = ACB(id=f"A-{run_id}-{task['task_id']}-{self._next_attempt()}",
                   run_id=run_id, task_id=task["task_id"],
                   logical_subgoal_id=task["logical_subgoal_id"])
+        if prev is not None:
+            acb.parent_id = prev.parent_id
+            acb.children_ids = list(prev.children_ids)
+            acb.children_pending = copy.deepcopy(prev.children_pending)
+            if prev.parent_id and token is None:
+                # 子被重新准入仍必须是原子树之子：预先按旧 token 签发继承快照，
+                # 否则 `_capability_ok` 会因 parent_id 非空而 fail-closed。
+                self.h._adopt_capability(prev, acb)
         # S13b D10：记录准入时的 plan 版本 —— `_finalize` / `_drain_scheduler`
         # 按 `(run_id, task_id, plan_version)` 解析「当前版本唯一 ACB」，
         # 避免 replan 后旧代际 ACB 被误跑（双跑）。
@@ -534,7 +546,15 @@ class Dispatcher:
 
             # ③ 预算：limits 留出重试余量与**子任务份额**，但只预留 min_budget
             min_budget = task["footprint"]["min_budget"]
+            # C7：`child_alloc` 缺省/0 → 可推导默认（max_fanout × 每个子最小预算）；
+            # 显式正值过小 → 准入 fail-fast（否则父永远 spawn 不出一个合格子）。
             child_alloc = task["footprint"].get("child_alloc", 0) or 0
+            if child_alloc <= 0:
+                child_alloc = max(self.h.max_fanout, 1) * self.h.min_budget_per_child
+            if child_alloc < self.h.min_budget_per_child:
+                acb.spec["admission_error"] = "child_alloc_too_small"
+                self._deny(acb, "INVALID_INPUT")
+                return False
             limits = min_budget + child_alloc + acb.retry_budget + 1
             node = self.h.budget.create_node(
                 f"B-{acb.id}", limits,
@@ -550,6 +570,10 @@ class Dispatcher:
                 return False
             acb.reservation_ids = [resv.reservation_id]
             acb.budget_node = node
+            # C7：父 spawn 时按 `child_alloc_used` 记账（初值 0，随快照持久化）。
+            acb.spec["child_alloc"] = int(child_alloc)
+            acb.spec["min_budget"] = int(min_budget)
+            acb.spec["child_alloc_used"] = 0
 
             # ④ 逻辑声明（文档 §7.3：先声明，再判定他人是否已声明同一依赖）
             for dep in task["footprint"].get("logical_deps", []):
@@ -787,7 +811,11 @@ class RunCoordinator:
 
     # ---- 级联实现 --------------------------------------------------
     def _cancel_one(self, acb: ACB, seen: set[str], *, cascade: bool) -> None:
-        """取消单个 ACB（幂等结算）并按 `cascade` 递归其子。"""
+        """取消单个 ACB（幂等结算）并按 `cascade` 递归其子。
+
+        C3/C10：父即使已终态，也必须继续遍历其子（A2 语义：父 DONE 而子仍
+        active 时，Run 取消仍要级联）；只跳过父自身的结算。
+        """
         if acb.id in seen:
             return
         seen.add(acb.id)
@@ -795,10 +823,14 @@ class RunCoordinator:
             self._cancelled_acbs.add(acb.id)
         if acb.state in TASK_TERMINAL:
             self.h._drain_skipped.append((acb.id, "cancel_skip_terminal"))
+            if cascade:
+                self._walk_children(acb, seen)
             return
-        self._settle_cancel(acb)
+        # 先撤销子树，再结算自身：父预算节点含活跃子预留时无法归档，反序会
+        # 留下永不归档的父节点（预算泄漏）。
         if cascade:
             self._walk_children(acb, seen)
+        self._settle_cancel(acb)
 
     def _settle_cancel(self, acb: ACB) -> None:
         """状态 → CANCELLED + 租约/预算/槽位**幂等**结算 + 落盘。"""
@@ -822,31 +854,60 @@ class RunCoordinator:
         self.h.bump_epoch()
 
     def _walk_children(self, acb: ACB, seen: set[str]) -> None:
-        """内存快路径（`children`）+ 持久化链（`children_ids`）双源遍历。"""
-        entries: list[tuple[ACB | None, str | None]] = []
+        """内存快路径（`children`）+ 持久化链（`children_ids`）+ pending 三源遍历。
+
+        C1：`children_ids` 的 ref 为 `None`（两阶段窗口）→ 按 `child_id`
+        反查最新快照；仍找不到 → 孤儿结算（不静默 skip）。`children_pending`
+        （phase ① 已落盘、② 未完成）同样按此处理。
+        """
+        entries: list[tuple[ACB | None, str | None, str]] = []
         for child in list(getattr(acb, "children", []) or []):
             if isinstance(child, ACB):
-                entries.append((child, None))
+                entries.append((child, None, child.id))
         for entry in list(getattr(acb, "children_ids", []) or []):
             if isinstance(entry, ACB):
-                entries.append((entry, None))
+                entries.append((entry, None, entry.id))
                 continue
             try:
-                cid, ref = entry[0], (entry[1] if len(entry) > 1 else None)
+                cid, ref = str(entry[0]), (entry[1] if len(entry) > 1 else None)
             except (TypeError, IndexError):
                 self.h._drain_skipped.append((acb.id, "cancel_bad_child_entry"))
                 continue
-            entries.append((self.h.acbs.get(str(cid)), ref))
-        for child, ref in entries:
+            entries.append((self.h.acbs.get(cid), ref, cid))
+        pending = getattr(acb, "children_pending", None) or {}
+        for cid, info in pending.items():
+            cid = str(cid)
+            entries.append((self.h.acbs.get(cid), None, cid))
+            # 保留 info 供孤儿结算使用
+            if not isinstance(info, dict):
+                pending[cid] = {}
+        for child, ref, cid in entries:
             if child is not None:
                 self._cancel_one(child, seen, cascade=True)
-            else:
-                self._cancel_from_ref(ref, seen)
+                continue
+            if not ref:
+                ref = self.h._ref_for_child(cid, pending.get(cid)
+                                            if isinstance(pending.get(cid), dict)
+                                            else None)
+            if ref:
+                self._cancel_from_ref(ref, seen, child_id=cid)
+                continue
+            # C1：无 ref 且无快照 → 孤儿结算（事件留痕 + _drain_skipped）。
+            self.h._settle_orphan_child(acb, cid, pending.get(cid))
 
-    def _cancel_from_ref(self, ref: str | None, seen: set[str]) -> None:
-        """持久化子（进程内已无 ACB）：按 ref 加载快照后取消；缺失/终态 skip。"""
+    def _cancel_from_ref(self, ref: str | None, seen: set[str],
+                         *, child_id: str | None = None) -> None:
+        """持久化子（进程内已无 ACB）：按 ref 加载快照后取消；缺失/终态 skip。
+
+        C1：`ref=None` 但给了 `child_id` → 按 `latest_ref_for_acb` 找回。
+        C3：终态子也要继续遍历其后代（父终态不代表子树终态）。
+        """
+        if not ref and child_id:
+            ref = self.h._ref_for_child(str(child_id))
         if not ref:
-            self.h._drain_skipped.append((str(ref), "cancel_skip_missing_ref"))
+            self.h._drain_skipped.append(
+                (str(child_id if child_id is not None else ref),
+                 "cancel_skip_missing_ref"))
             return
         try:
             data = self.h.checkpoints.load_strict(ref)
@@ -862,6 +923,7 @@ class RunCoordinator:
         seen.add(acb.id)
         if acb.state in TASK_TERMINAL:
             self.h._drain_skipped.append((acb.id, "cancel_skip_terminal"))
+            self._walk_children(acb, seen)
             return
         node_id = data.get("budget_node_id")
         node = self.h.budget._nodes.get(node_id) if node_id else None
@@ -871,22 +933,59 @@ class RunCoordinator:
         acb.reservation_ids = list(data.get("reservation_ids") or [])
         with self._lock:
             self._cancelled_acbs.add(acb.id)
-        self._settle_cancel(acb)
+        # 子树先撤（与 `_cancel_one` 同序，保证父节点可归档）。
         self._walk_children(acb, seen)
+        self._settle_cancel(acb)
 
     def _cascade_from_persisted(self, run_id: str, seen: set[str]) -> None:
-        """进程内已无该 run 的 ACB 时，从 `latest_ref_for_run` 兜底定位根。"""
-        if any(acb.run_id == run_id for acb in self.h.acbs.values()):
-            return
-        getter = getattr(self.h.checkpoints, "latest_ref_for_run", None)
+        """C2：枚举该 run 的**全部** ACB 快照并重建父子图后撤销。
+
+        root 不能再取 `latest_ref_for_run` —— 该指针会被任意同 run 的后代
+        `save` 覆盖成后代，导致父/兄弟漏取消。这里按 `refs_for_run` 逐项加载，
+        以 `parent_id ∉ 本 run 集合` 者为根（图断开时也兜底全撤）。
+        """
+        getter = getattr(self.h.checkpoints, "refs_for_run", None)
         if not callable(getter):
             return
         try:
-            ref = getter(run_id)
+            entries = getter(run_id)
         except Exception:  # noqa: BLE001
             return
-        if ref:
-            self._cancel_from_ref(ref, seen)
+        loaded: dict[str, tuple[str, dict]] = {}
+        for acb_id, ref in entries or []:
+            acb_id = str(acb_id)
+            if acb_id in seen:
+                continue
+            ref = ref or self.h._ref_for_child(acb_id)
+            if not ref:
+                self.h._drain_skipped.append(
+                    (acb_id, "cancel_missing_persisted_ref"))
+                continue
+            try:
+                data = self.h.checkpoints.load_strict(ref)
+            except Exception:  # noqa: BLE001
+                try:
+                    data = self.h.checkpoints.load(ref)
+                except Exception:  # noqa: BLE001
+                    self.h._drain_skipped.append(
+                        (acb_id, "cancel_unreadable_persisted_ref"))
+                    continue
+            if isinstance(data, dict):
+                loaded[acb_id] = (ref, data)
+        if not loaded:
+            return
+        parent_of = {aid: str((data.get("parent_id") or ""))
+                     for aid, (_ref, data) in loaded.items()}
+        roots = [aid for aid in loaded if parent_of.get(aid) not in loaded]
+        for aid in roots:
+            if aid in seen:
+                continue
+            ref, _data = loaded[aid]
+            self._cancel_from_ref(ref, seen, child_id=aid)
+        # 环/断链兜底：仍未被撤销的节点逐个处理（绝不静默漏掉）。
+        for aid, (ref, _data) in loaded.items():
+            if aid not in seen:
+                self._cancel_from_ref(ref, seen, child_id=aid)
 
     @staticmethod
     def _stub_from_payload(data: dict) -> ACB:
@@ -903,6 +1002,12 @@ class RunCoordinator:
             if isinstance(child, (list, tuple)) and child:
                 children.append((child[0], child[1] if len(child) > 1 else None))
         acb.children_ids = children
+        pending = data.get("children_pending")
+        if isinstance(pending, dict):
+            acb.children_pending = {
+                str(cid): dict(info) if isinstance(info, dict) else {}
+                for cid, info in pending.items()
+            }
         return acb
 
     def submit_command(self, cmd: dict) -> Status:

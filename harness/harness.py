@@ -50,6 +50,10 @@ from .rebase import DELETE
 _MAX_INLINE_DEPTH = 8
 
 
+class _SpawnAbort(Exception):
+    """C1：spawn ② 事务的「明确拒绝」信号（非崩溃），由回滚分支转成 failure。"""
+
+
 class ReceiptScanFailed(RuntimeError):
     """K-45：收据回扫失败（EventLog 不可用 / WAL 回扫失败）。
 
@@ -1660,18 +1664,30 @@ class Harness:
 
     # ---- S13c §2.4：spawn_child -------------------------------------
     def _spawn_depth_of(self, acb: ACB) -> int:
-        """父 ACB 的嵌套深度（根 = 0）；内存 `parent_id` 链，缺失则保守 +1。"""
+        """父 ACB 的嵌套深度（根 = 0）。
+
+        C8：spawn 时把 `depth` 写进子 payload（`spec["spawn"]["depth"]`），
+        恢复后**优先读持久化值**（不依赖内存父链）；内存链断掉（祖先缺失且
+        无持久化 depth）→ **fail-closed** 返回超过上限的值（绝不返回 1 让
+        great-grandchild 蒙混通过）。
+        """
+        info = acb.spec.get("spawn") if isinstance(acb.spec, dict) else None
+        if isinstance(info, dict):
+            depth = info.get("depth")
+            if isinstance(depth, int) and not isinstance(depth, bool) and depth >= 0:
+                return depth
         depth = 0
         cur = acb
         seen: set[str] = set()
         while getattr(cur, "parent_id", ""):
             if depth >= 64 or cur.id in seen:
-                return depth + 1
+                return self.spawn_depth + 1
             seen.add(cur.id)
             depth += 1
             parent = self.acbs.get(cur.parent_id)
             if parent is None:
-                return depth
+                # 父链断链：无法证明未越界 → 按上限拒绝（fail-closed）。
+                return self.spawn_depth + 1
             cur = parent
         return depth
 
@@ -1688,10 +1704,16 @@ class Harness:
         return acb
 
     def _spawn_rollback(self, child_id: str, node, resv, slot: bool) -> None:
-        """spawn 失败逆序回滚（预留 → 节点 → 槽位）；事件草稿由调用方丢弃。"""
+        """spawn 失败逆序回滚（预留 → 节点 → 槽位）。
+
+        C1：回滚链路与 `Dispatcher._rollback` 一致 —— 用 **`release`**（不是
+        `settle` + 手 pop），并放在 `budget.suppressed()` 内部（失败事务零事件
+        残留，由调用方 `discard_pending`）。非 `CrashInjected` 的异常不得中断
+        后续回滚（槽位/节点仍必须回收）。
+        """
         if resv is not None:
             try:
-                self.budget.settle(resv.reservation_id)
+                self.budget.release(resv.reservation_id)
                 self.budget._reservations.pop(resv.reservation_id, None)
                 if node is not None:
                     node.reservations.pop(resv.reservation_id, None)
@@ -1699,12 +1721,211 @@ class Harness:
                 pass
         if node is not None:
             try:
-                if not self.budget.remove_node(node.node_id):
+                if not self.budget.remove_node(node.node_id, owner=child_id):
                     self.budget.archive_node(node.node_id)
             except Exception:  # noqa: BLE001
                 pass
         if slot:
             self.slots.release(child_id)
+
+    def _save_strict(self, acb: ACB) -> str:
+        """C1：关键落盘（spawn 两阶段）**不得吞异常**。
+
+        `_safe_save` 的静默 `pass` 会让「崩溃可续做」失去保证；这里让普通
+        存储错误也冒泡，调用方据此回滚 / 由恢复路径按 `children_pending` 收口。
+        """
+        return self.checkpoints.save(acb)
+
+    def _parent_child_alloc(self, parent_acb: ACB) -> tuple[int, int]:
+        """C7：父的任务子预算配额与已用额（`child_alloc` / `child_alloc_used`）。
+
+        未显式声明（或缺省 0）→ 用 `max_fanout * min_budget_per_child` 推导；
+        已用额随父 ACB 持久化，spawn 成功时按 `slice` 记账、失败/孤儿回收回滚。
+        """
+        raw = parent_acb.spec.get("child_alloc")
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raw = max(self.max_fanout, 1) * self.min_budget_per_child
+        used = parent_acb.spec.get("child_alloc_used", 0)
+        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+            used = 0
+        return int(raw), int(used)
+
+    def _child_ids_for_cancel(self, acb: ACB) -> set[str]:
+        """该 ACB 已知的子 id（内存 + 持久化 + pending）。"""
+        ids: set[str] = set()
+        for child in list(getattr(acb, "children", []) or []):
+            if isinstance(child, ACB):
+                ids.add(child.id)
+        for entry in list(getattr(acb, "children_ids", []) or []):
+            try:
+                ids.add(str(entry[0]))
+            except (TypeError, IndexError):
+                continue
+        for cid in (getattr(acb, "children_pending", None) or {}):
+            ids.add(str(cid))
+        return ids
+
+    def _ref_for_child(self, child_id: str, info: dict | None = None):
+        """C1：按 `child_id` 找回子快照（ref=None 的崩溃窗口）。
+
+        先查 per-ACB 指针，再退到 `(run_id, task_id, logical_subgoal)` 指针。
+        """
+        getter = getattr(self.checkpoints, "latest_ref_for_acb", None)
+        if callable(getter):
+            try:
+                ref = getter(child_id)
+            except Exception:  # noqa: BLE001
+                ref = None
+            if ref:
+                return ref
+        info = info if isinstance(info, dict) else {}
+        getter = getattr(self.checkpoints, "latest_ref_for_task", None)
+        if callable(getter) and info.get("task_id"):
+            try:
+                return getter(info.get("run_id") or "",
+                              info.get("task_id") or "",
+                              info.get("logical_subgoal_id") or "")
+            except Exception:  # noqa: BLE001
+                return None
+        return None
+
+    def _settle_orphan_child(self, parent_acb: ACB, child_id: str,
+                             info: dict | None = None) -> bool:
+        """C1：spawn 崩溃窗口的孤儿结算（父预算节点上的 ACTIVE 预留）。
+
+        - 找到 `B-{child_id}` 节点（或 owner == child_id 的节点）→ 结算其子树
+          全部 ACTIVE 预留 → 归档 / 摘除；
+        - **必留痕**：写 `SPAWN_ORPHAN_RECLAIMED` 事件 + `_drain_skipped`，
+          绝不静默 `cancel_skip_missing_ref`；
+        - 回滚父的 `child_alloc_used`（该子从未成功产生）。
+        """
+        info = info if isinstance(info, dict) else {}
+        node = None
+        parent_node = getattr(parent_acb, "budget_node", None)
+        candidate_ids = [f"B-{child_id}"]
+        if parent_node is not None:
+            for child in list(getattr(parent_node, "children", []) or []):
+                if (getattr(child, "owner", "") == child_id
+                        or child.node_id in candidate_ids):
+                    node = child
+                    break
+        for node_id in candidate_ids:
+            if node is not None:
+                break
+            node = self.budget._nodes.get(node_id)
+        if node is None:
+            for candidate in list(self.budget._nodes.values()):
+                if getattr(candidate, "owner", "") == child_id:
+                    node = candidate
+                    break
+        reclaimed = False
+        if node is not None:
+            with self.budget.suppressed():
+                for sub in list(self.budget._subtree_nodes(node)):
+                    for rid, resv in list(sub.reservations.items()):
+                        if resv.state == "ACTIVE":
+                            self.budget.settle(rid)
+                if not self.budget.archive_node(node.node_id):
+                    self.budget.remove_node(node.node_id)
+            self.budget.flush_pending()
+            reclaimed = True
+        self.slots.release(child_id)
+        # 注：`child_alloc_used` 只在 phase ③ 成功后记账，孤儿从未计入 → 不回滚。
+        self.event_log.append(
+            EventKind.SPAWN_ORPHAN_RECLAIMED, parent_acb.id,
+            {"child_id": child_id,
+             "node_id": node.node_id if node is not None else None,
+             "task_id": info.get("task_id"),
+             "reason": "SPAWN_ORPHAN",
+             "reclaimed": reclaimed},
+            producer=parent_acb.id, run_id=parent_acb.run_id)
+        self._drain_skipped.append((child_id, "spawn_orphan_reclaimed"))
+        return reclaimed
+
+    def _reconcile_children_refs(self, acb: ACB) -> None:
+        """C1：`recover` 时补全 `children_ids` 里 ref=None 的持久化子。
+
+        能按 `child_id` 找回 → 回填 ref；完全找不到 → 孤儿结算（留痕后移除条目）。
+        """
+        pending_ids = set((getattr(acb, "children_pending", None) or {}))
+        new_entries: list = []
+        changed = False
+        for entry in list(getattr(acb, "children_ids", []) or []):
+            try:
+                cid = str(entry[0])
+                ref = entry[1] if len(entry) > 1 else None
+            except (TypeError, IndexError):
+                changed = True
+                continue
+            if cid in pending_ids:
+                new_entries.append((cid, ref))       # 交给 pending 对账
+                continue
+            if ref:
+                new_entries.append((cid, ref))
+                continue
+            found = self._ref_for_child(cid)
+            if found:
+                new_entries.append((cid, found))
+            else:
+                self._settle_orphan_child(acb, cid)
+            changed = True
+        if changed:
+            acb.children_ids = new_entries
+            self._safe_save(acb)
+
+    def _reconcile_children_pending(self, acb: ACB) -> None:
+        """C1：`recover` 时对账第一阶段登记（宁可留痕，绝不静默）。
+
+        找到子快照 → 升级为 `children_ids=(id, ref)`；找不到 → 孤儿结算。
+        """
+        pending = acb.children_pending
+        if not isinstance(pending, dict) or not pending:
+            return
+        changed = False
+        promoted_slices = 0
+        for child_id, info in list(pending.items()):
+            info = info if isinstance(info, dict) else {}
+            ref = self._ref_for_child(str(child_id), info)
+            promoted = False
+            if ref:
+                try:
+                    data = self.checkpoints.load_strict(ref)
+                except Exception:  # noqa: BLE001
+                    try:
+                        data = self.checkpoints.load(ref)
+                    except Exception:  # noqa: BLE001
+                        data = None
+                if isinstance(data, dict) and \
+                        (data.get("parent_id") or "") == acb.id:
+                    promoted = True
+                    replaced = False
+                    new_ids: list = []
+                    for entry in list(acb.children_ids):
+                        if isinstance(entry, (list, tuple)) and \
+                                str(entry[0]) == str(child_id):
+                            new_ids.append((str(child_id), ref))
+                            replaced = True
+                        else:
+                            new_ids.append(entry)
+                    if not replaced:
+                        new_ids.append((str(child_id), ref))
+                    acb.children_ids = new_ids
+            if not promoted:
+                self._settle_orphan_child(acb, str(child_id), info)
+            else:
+                slice_amt = info.get("slice")
+                if isinstance(slice_amt, int) and not isinstance(slice_amt, bool):
+                    promoted_slices += slice_amt
+            acb.children_pending.pop(child_id, None)
+            changed = True
+        if promoted_slices:
+            # phase ① 时未记账（只有 ③ 成功才记账）→ 恢复出的成功子补记。
+            used = acb.spec.get("child_alloc_used", 0)
+            if not isinstance(used, int) or isinstance(used, bool):
+                used = 0
+            acb.spec["child_alloc_used"] = used + promoted_slices
+        if changed:
+            self._safe_save(acb)
 
     def spawn_child(self, parent_acb: ACB, spec: dict,
                     plan: dict | None = None) -> ACB:
@@ -1715,9 +1936,10 @@ class Harness:
         `reserve(parent_node)`，否则父 `subtree_reserved` 2×）。父准入时
         `footprint.child_alloc` 已把子份额计入父 limits。
 
-        两阶段：① 先写父 `children_ids=(child_id, None)` 并落盘（崩溃可续做）
-        → ② 建子 → ③ 成功后回填 `checkpoint_ref` 再落盘（避免 `try_admit`
-        与 save 之间崩溃产生孤儿）。
+        两阶段：① 先写父 `children_pending={child_id: {...}}` 并**严格**落盘
+        （可重建；失败/崩溃后按 child_id 找回或孤儿结算）→ ② 建子（失败/异常
+        逆序回滚）→ ③ 成功后清 pending、按 `child_id` 精确回填
+        `children_ids=(id, ref)` 再落盘。
         """
         spec = dict(spec or {})
         run_id = spec.get("run_id") or parent_acb.run_id
@@ -1738,12 +1960,16 @@ class Harness:
                     str(e[0]) for e in parent_acb.children_ids if e}:
                 return self._spawn_reject(parent_acb, child_id, run_id, task_id,
                                           "SPAWN_DUPLICATE_CHILD")
-            if self._spawn_depth_of(parent_acb) + 1 > self.spawn_depth:
+            if child_id in (parent_acb.children_pending or {}):
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_DUPLICATE_CHILD")
+            parent_depth = self._spawn_depth_of(parent_acb)
+            if parent_depth + 1 > self.spawn_depth:
                 return self._spawn_reject(parent_acb, child_id, run_id, task_id,
                                           "SPAWN_DEPTH_EXCEEDED")
-            child_ids = {str(e[0]) for e in parent_acb.children_ids if e}
-            child_ids |= {c.id for c in parent_acb.children if isinstance(c, ACB)}
-            if len(child_ids) >= self.max_fanout:
+            # C8：fanout 只计**未终态**子（含 ref=None 的 pending），终态子不占名额。
+            live_ids = self._live_child_ids(parent_acb)
+            if len(live_ids) >= self.max_fanout:
                 return self._spawn_reject(parent_acb, child_id, run_id, task_id,
                                           "SPAWN_FANOUT_EXCEEDED")
             if min_budget < self.min_budget_per_child:
@@ -1776,6 +2002,7 @@ class Harness:
                                           "SPAWN_CAPABILITY_DENIED")
             # 追溯锚定到**父 ACB id**（生产 token 的 agent_id 即父 id；测试夹具的
             # 通配 token agent_id="*" 也统一到 id，否则网关 lineage 校验必红）。
+            # C6：父能力快照已在 `attenuate_token` 冻结，lineage 不依赖全局 dict。
             child_token.parent_id = parent_acb.id
             # 父 token 必须可被追溯（`_traceable` 按 `_tokens[parent_id]` 查）。
             if self.policy.token(parent_acb.id) is None and parent_token is not None:
@@ -1784,19 +2011,22 @@ class Harness:
             logical_subgoal = spec.get("logical_subgoal_id") or f"S-{task_id}"
             try:
                 retry_budget = int(spec.get("retry_budget", 3) or 3)
-                slice_limits = int(spec.get("budget")
-                                   or (min_budget + retry_budget + 1))
+                requested_slice = spec.get("budget")
+                if requested_slice is None:
+                    requested_slice = min_budget + retry_budget + 1
+                requested_slice = int(requested_slice)
             except (TypeError, ValueError):
                 return self._spawn_reject(parent_acb, child_id, run_id, task_id,
                                           "INVALID_INPUT")
+            # C7：slice 受父 `child_alloc_remaining` 约束（不写死、不超配）。
+            alloc, used = self._parent_child_alloc(parent_acb)
+            alloc_remaining = max(0, alloc - used)
+            slice_limits = min(requested_slice, alloc_remaining)
             if slice_limits < min_budget:
                 return self._spawn_reject(parent_acb, child_id, run_id, task_id,
-                                          "CHILD_BUDGET_TOO_SMALL")
-
-            # ① 两阶段落盘：先登记 pending（ref=None），崩溃后可据此续做/回收。
-            pending = (child_id, None)
-            parent_acb.children_ids.append(pending)
-            self._safe_save(parent_acb)
+                                          "CHILD_BUDGET_EXHAUSTED")
+            # 子的 child_alloc 由父剩余额推导（不写死 0，孙辈才有预算）。
+            child_alloc = max(0, slice_limits - min_budget)
 
             child = ACB(id=child_id, run_id=run_id, task_id=task_id,
                         logical_subgoal_id=logical_subgoal)
@@ -1806,37 +2036,62 @@ class Harness:
             child.spec["plan_version"] = int((plan or {}).get("version", 1) or 1)
             child.spec["spawn"] = {"parent_id": parent_acb.id,
                                    "min_budget": min_budget,
-                                   "slice": slice_limits}
+                                   "slice": slice_limits,
+                                   "depth": parent_depth + 1}
+            child.spec["child_alloc"] = child_alloc
+            child.spec["min_budget"] = min_budget
+            child.spec["parent_budget"] = parent_node.node_id
+            child.spec["child_alloc_used"] = 0
+
+            # ① 两阶段落盘第一阶段：登记可重建的 `children_pending`（ref 尚未产生）。
+            pending_info = {
+                "task_id": task_id,
+                "min_budget": min_budget,
+                "slice": slice_limits,
+                "run_id": run_id,
+                "logical_subgoal_id": logical_subgoal,
+                "depth": parent_depth + 1,
+                "parent_id": parent_acb.id,
+            }
+            parent_acb.children_pending[child_id] = pending_info
+            self._save_strict(parent_acb)
 
             node = None
             resv = None
             slot = False
             failure = None
-            with self.budget.suppressed():
-                # ② 建子：槽位（可回滚）→ 子预算节点（挂父节点）→ 预留
-                if not self.slots.try_acquire(child_id):
-                    failure = "SPAWN_NO_SLOT"
-                else:
-                    slot = True
-                    node = self.budget.create_node(
-                        f"B-{child_id}", slice_limits,
-                        parent_id=parent_node.node_id, run_id=run_id)
-                    if node is None:
-                        failure = "SPAWN_BUDGET_UNAVAILABLE"
+            # ② 建子（槽位 → 子预算节点 → 预留）。**任何**异常（含注入崩溃）
+            #    都必须回滚后重抛；普通拒绝则回滚并返回明确 failure。
+            try:
+                with self.budget.suppressed():
+                    if not self.slots.try_acquire(child_id):
+                        failure = "SPAWN_NO_SLOT"
                     else:
-                        node.owner = child_id
-                        resv = self.budget.reserve(node.node_id, min_budget)
-                        if resv is None:
-                            failure = "CHILD_BUDGET_EXHAUSTED"
-            if failure is not None:
-                self._spawn_rollback(child_id, node, resv, slot)
+                        slot = True
+                        node = self.budget.create_node(
+                            f"B-{child_id}", slice_limits,
+                            parent_id=parent_node.node_id, run_id=run_id)
+                        if node is None:
+                            failure = "SPAWN_BUDGET_UNAVAILABLE"
+                        else:
+                            node.owner = child_id
+                            resv = self.budget.reserve(node.node_id, min_budget)
+                            if resv is None:
+                                failure = "CHILD_BUDGET_EXHAUSTED"
+                    if failure is not None:
+                        raise _SpawnAbort(failure)
+                self.budget.flush_pending()
+            except BaseException as exc:  # noqa: BLE001  # CrashInjected 必须回滚后重抛
+                with self.budget.suppressed():
+                    self._spawn_rollback(child_id, node, resv, slot)
                 self.budget.discard_pending()
-                parent_acb.children_ids.pop()
+                parent_acb.children_pending.pop(child_id, None)
                 self._safe_save(parent_acb)
-                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
-                                          failure)
+                if isinstance(exc, _SpawnAbort):
+                    return self._spawn_reject(parent_acb, child_id, run_id,
+                                              task_id, str(exc))
+                raise
 
-            self.budget.flush_pending()
             child.reservation_ids = [resv.reservation_id]
             child.budget_node = node
             child.state = TaskState.ADMITTED
@@ -1848,82 +2103,196 @@ class Harness:
                     "task_id": task_id,
                     "logical_subgoal_id": logical_subgoal,
                     "footprint": {"min_budget": min_budget,
-                                  "child_alloc": 0,
+                                  "child_alloc": child_alloc,
                                   "parent_budget": parent_node.node_id},
                     "merge_policy": {},
                     "state": TaskState.ADMITTED,
                     "plan_version": child.spec["plan_version"],
                 }
             self._safe_save(child)
-            # ③ 回填 checkpoint_ref（内存版 `latest_ref_for_acb` 恒 None）
-            ref = None
-            getter = getattr(self.checkpoints, "latest_ref_for_acb", None)
-            if callable(getter):
-                try:
-                    ref = getter(child.id)
-                except Exception:  # noqa: BLE001
-                    ref = None
-            parent_acb.children_ids[-1] = (child.id, ref)
+            # ③ 成功后转正：清 pending、按 child_id 精确回填 ref，再落盘。
+            ref = self._ref_for_child(child.id, pending_info)
+            parent_acb.children_pending.pop(child_id, None)
+            # 精确移除同 id 的旧条目（绝不 `pop()` 末尾，避免并发/重复写错位）。
+            parent_acb.children_ids = [
+                e for e in parent_acb.children_ids if str(e[0]) != str(child.id)]
+            parent_acb.children_ids.append((child.id, ref))
             parent_acb.children.append(child)
-            self._safe_save(parent_acb)
+            parent_acb.spec["child_alloc_used"] = used + slice_limits
+            self._save_strict(parent_acb)
             return child
 
-    def result_envelope(self, parent_acb: ACB) -> ResultEnvelope:
-        """S13c §2.4：汇总直接子的结构化回传（含 `DONE_PARTIAL` 产生路径）。"""
-        seen: set[str] = set()
-        children: list[ACB] = []
+    def _live_child_ids(self, parent_acb: ACB) -> set[str]:
+        """C8：未终态子 id（内存 / 持久化 / pending）。
+
+        终态子不占 `max_fanout` 名额；内存缺失的持久化子一律按未终态计
+        （保守，宁可拒绝也不超界）。
+        """
+        live: set[str] = set()
         for child in list(getattr(parent_acb, "children", []) or []):
-            if isinstance(child, ACB) and child.id not in seen:
-                seen.add(child.id)
-                children.append(child)
+            if isinstance(child, ACB) and child.state not in TASK_TERMINAL:
+                live.add(child.id)
         for entry in list(getattr(parent_acb, "children_ids", []) or []):
             try:
                 cid = str(entry[0])
             except (TypeError, IndexError):
                 continue
             child = self.acbs.get(cid)
-            if child is not None and cid not in seen:
-                seen.add(cid)
+            if child is None or child.state not in TASK_TERMINAL:
+                live.add(cid)
+        for cid in (getattr(parent_acb, "children_pending", None) or {}):
+            live.add(str(cid))
+        return live
+
+    def _load_persisted_child(self, child_id: str, ref: str | None):
+        """C3：按 ref 加载子快照为 ACB；不可读 → `None`。"""
+        ref = ref or self._ref_for_child(child_id)
+        if not ref:
+            return None
+        try:
+            data = self.checkpoints.load_strict(ref)
+        except Exception:  # noqa: BLE001
+            try:
+                data = self.checkpoints.load(ref)
+            except Exception:  # noqa: BLE001
+                return None
+        if not isinstance(data, dict):
+            return None
+        acb = ACB(id=str(data.get("acb_id") or child_id),
+                  run_id=data.get("run_id", ""),
+                  task_id=data.get("task_id", ""),
+                  logical_subgoal_id=data.get("logical_subgoal_id", ""))
+        try:
+            acb.state = TaskState(data.get("state", TaskState.PLANNED.value))
+        except ValueError:
+            acb.state = TaskState.PLANNED
+        acb.parent_id = data.get("parent_id", "") or ""
+        acb.failure = data.get("failure")
+        acb.result_ref = ref
+        acb.budget_node = self.budget._nodes.get(data.get("budget_node_id"))
+        acb.reservation_ids = list(data.get("reservation_ids") or [])
+        acb.spec = dict(data.get("spec") or {})
+        return acb
+
+    def result_envelope(self, parent_acb: ACB) -> ResultEnvelope:
+        """S13c §2.4：汇总直接子的结构化回传（C3 修正状态归类）。
+
+        - `DONE_PARTIAL` 只在「children 非空 ∧ **全部子终态** ∧ ≥1 DONE ∧
+          ≥1 FAILED/CANCELLED」时产生；
+        - 仍有 pending 子 → `RUNNING`（**不 finalize**）；
+        - `CANCELLED` 单独归类（不再混进 pending；全取消 → CANCELLED）；
+        - `children_ids` 有而内存无 → 按 ref 加载；加载不到 → `NEEDS_RECONCILIATION`
+          （**绝不**当成 DONE）；
+        - 未完成的两阶段 spawn（`children_pending` 且找不回子）→
+          `NEEDS_RECONCILIATION`。
+        """
+        seen: set[str] = set()
+        children: list[ACB] = []
+        unresolved = False
+        for child in list(getattr(parent_acb, "children", []) or []):
+            if isinstance(child, ACB) and child.id not in seen:
+                seen.add(child.id)
                 children.append(child)
+        for entry in list(getattr(parent_acb, "children_ids", []) or []):
+            try:
+                cid, ref = str(entry[0]), (entry[1] if len(entry) > 1 else None)
+            except (TypeError, IndexError):
+                unresolved = True
+                continue
+            if cid in seen:
+                continue
+            child = self.acbs.get(cid)
+            if child is None:
+                child = self._load_persisted_child(cid, ref)
+            if child is None:
+                unresolved = True
+                continue
+            seen.add(cid)
+            children.append(child)
+        for cid, info in (getattr(parent_acb, "children_pending", None) or {}).items():
+            cid = str(cid)
+            if cid in seen:
+                continue
+            child = self._load_persisted_child(cid, None)
+            if child is None:
+                unresolved = True
+                continue
+            seen.add(cid)
+            children.append(child)
+
         coverage: dict = {}
         artifacts: list = []
         conflicts: list = []
         budget_usage = 0
-        done = failed = pending = 0
+        done = failed = cancelled = pending = 0
+        partial_child = False
         for child in children:
             coverage[child.task_id] = child.state.value
             node = child.budget_node
             if node is not None:
                 budget_usage += int(getattr(node, "consumed", 0) or 0)
+            else:
+                try:
+                    data = (self.checkpoints.load_strict(child.result_ref)
+                            if child.result_ref else {})
+                except Exception:  # noqa: BLE001
+                    data = {}
+                budget_usage += int(
+                    (data.get("budget_consumed") or 0)
+                    + (data.get("budget_folded_consumed") or 0))
             artifacts.append({"acb_id": child.id, "task_id": child.task_id,
                               "result_ref": child.result_ref})
-            if child.state in (TaskState.DONE, TaskState.DONE_PARTIAL):
+            if child.state is TaskState.DONE:
                 done += 1
-            elif child.state in TASK_TERMINAL and child.state is not TaskState.CANCELLED:
+            elif child.state is TaskState.DONE_PARTIAL:
+                done += 1
+                partial_child = True
+            elif child.state is TaskState.CANCELLED:
+                cancelled += 1
+            elif child.state in (TaskState.FAILED, TaskState.DEAD_LETTER,
+                                 TaskState.QUARANTINED):
                 failed += 1
                 conflicts.append({"acb_id": child.id,
                                   "reason": child.failure or child.state.value})
             else:
                 pending += 1
-        if not children or (done == len(children)):
-            status = "DONE"
+
+        total = len(children)
+        terminal = done + failed + cancelled
+        if unresolved:
+            status = "NEEDS_RECONCILIATION"
         elif pending:
+            status = "RUNNING"
+        elif total == 0:
+            status = "DONE"
+        elif terminal == total and done == total and not partial_child:
+            status = "DONE"
+        elif terminal == total and done > 0 and (failed or cancelled or partial_child):
             status = "DONE_PARTIAL"
-        elif done:
-            status = "DONE_PARTIAL"
-        elif failed:
+        elif terminal == total and failed:
             status = "FAILED"
-        else:
+        elif terminal == total and cancelled:
             status = "CANCELLED"
+        else:                                # 防御：不可达（非终态已在 pending 分支）
+            status = "RUNNING"
         return ResultEnvelope(status=status, coverage=coverage,
                               artifacts=artifacts, conflicts=conflicts,
                               budget_usage=budget_usage)
 
     def apply_result_envelope(self, parent_acb: ACB) -> ResultEnvelope:
-        """父汇总落状态：`DONE_PARTIAL` 是此前不存在的产生路径。"""
+        """父汇总落状态（C3：终态 guard + 幂等）。
+
+        - 父已是终态 → 直接返回当前 envelope（绝不覆盖 DONE_PARTIAL / 二次结算）；
+        - `DONE_PARTIAL` → 走状态机边（RUNNING→DONE_PARTIAL）或兼容赋值 + `_finalize`
+          （归档预算节点、释放槽位）；
+        - `RUNNING` / `NEEDS_RECONCILIATION` → **不 finalize**。
+        """
         env = self.result_envelope(parent_acb)
-        if env.status == "DONE_PARTIAL" and parent_acb.state not in TASK_TERMINAL:
-            parent_acb.state = TaskState.DONE_PARTIAL
+        if parent_acb.state in TASK_TERMINAL:
+            return env
+        if env.status == "DONE_PARTIAL":
+            if advance(parent_acb, "partial") != Status.OK:
+                parent_acb.state = TaskState.DONE_PARTIAL
             self._finalize(parent_acb)
         return env
 
@@ -2326,14 +2695,16 @@ class Harness:
         """R1/R5：绝不复用旧 ACB 的 token（身份绑定到旧 id 必然 DENIED）。
 
         以旧 token 的**scope**为新 id 重新签发内存 token（不是复用原 token 对象）；
-        已有可用 token（`acb.capability` / `policy._tokens[fresh.id]` / default）
-        时不重复签发。
+        已有可用 token（`acb.capability` / `policy._tokens[fresh.id]`）时不重复签发。
+
+        C6：新 ACB **继承父身份与父能力快照**（`parent_id` 不可变）；
+        `requeue`/`replan` 后的子仍是原子树的子，lineage 校验继续生效。
         """
         if src is None or fresh is None:
             return
         if getattr(fresh, "capability", None) is not None:
             return
-        if self._effective_token(fresh) is not None:
+        if self.policy.token(fresh.id) is not None:
             return
         token = self._effective_token(src)
         if token is None:
@@ -2344,6 +2715,91 @@ class Harness:
         fresh.capability = self.policy.issue(
             fresh.id, tools=set(resolved.tools), paths=set(resolved.paths),
             network=set(resolved.network), data_class=resolved.data_class)
+        # C6：lineage 继承（父 id + 冻结的父能力快照）。
+        if resolved.parent_id:
+            fresh.capability.parent_id = resolved.parent_id
+            if isinstance(getattr(resolved, "parent_scope", None), dict):
+                fresh.capability.parent_scope = copy.deepcopy(
+                    resolved.parent_scope)
+                fresh.capability.parent_scope_digest = (
+                    getattr(resolved, "parent_scope_digest", "") or "")
+            self._ensure_policy_token(resolved.parent_id)
+            if not fresh.parent_id:
+                fresh.parent_id = resolved.parent_id
+
+    def _register_token(self, acb: ACB, token) -> None:
+        """C5：恢复/签发的 token 必须注册进 `policy._tokens`（否则 `_traceable` 全红）。
+
+        以 **ACB id** 为键（`_traceable` 按 `parent_id` 查）；`agent_id="*"`
+        是测试夹具通配，不占用 `"*"` 键（避免覆盖 default_token）。
+        """
+        if token is None:
+            return
+        self.policy._tokens[acb.id] = token
+        agent_id = str(getattr(token, "agent_id", "") or "")
+        if agent_id and agent_id != "*" and agent_id != acb.id:
+            self.policy._tokens.setdefault(agent_id, token)
+
+    def _token_from_payload(self, cap, acb_id: str = ""):
+        """把 checkpoint 的 `capability` 重建为 `CapabilityToken`（不可解析 → None）。"""
+        if isinstance(cap, dict):
+            return CapabilityToken(
+                agent_id=str(cap.get("agent_id", "") or acb_id),
+                tools=set(cap.get("tools") or ()),
+                paths=set(cap.get("paths") or ()),
+                network=set(cap.get("network") or ()),
+                data_class=str(cap.get("data_class", "public")),
+                parent_id=str(cap.get("parent_id", "") or ""),
+                parent_scope=cap.get("parent_scope")
+                if isinstance(cap.get("parent_scope"), dict) else None,
+                parent_scope_digest=str(
+                    cap.get("parent_scope_digest", "") or ""),
+            )
+        if isinstance(cap, str):
+            resolved = self.policy._resolve_raw(cap)
+            return resolved
+        return None
+
+    def _ensure_policy_token(self, parent_id: str, depth: int = 0):
+        """C5：按需递归加载父链 token 并注册（不依赖恢复顺序）。
+
+        内存无该 ACB → 读 `latest_ref_for_acb(parent_id)` 快照重建 token；
+        祖先继续递归。任一环缺失 → 返回 None（`_traceable` fail-closed）。
+        """
+        if not parent_id or depth >= 16:
+            return None
+        cached = self.policy._tokens.get(parent_id)
+        if cached is not None:
+            return cached
+        token = None
+        src = self.acbs.get(parent_id)
+        if src is not None:
+            raw = getattr(src, "capability", None)
+            token = self._token_from_payload(raw, parent_id) \
+                if raw is not None else self.policy.token(parent_id)
+        if token is None:
+            ref = self._ref_for_child(parent_id)
+            if ref:
+                try:
+                    data = self.checkpoints.load_strict(ref)
+                except Exception:  # noqa: BLE001
+                    try:
+                        data = self.checkpoints.load(ref)
+                    except Exception:  # noqa: BLE001
+                        data = None
+                if isinstance(data, dict):
+                    token = self._token_from_payload(data.get("capability"),
+                                                     parent_id)
+        if token is None or not isinstance(token, CapabilityToken):
+            return None
+        self.policy._tokens[parent_id] = token
+        agent_id = str(getattr(token, "agent_id", "") or "")
+        if agent_id and agent_id != "*" and agent_id != parent_id:
+            self.policy._tokens.setdefault(agent_id, token)
+        ancestor = str(getattr(token, "parent_id", "") or "")
+        if ancestor:
+            self._ensure_policy_token(ancestor, depth + 1)
+        return token
 
     def _safe_save(self, acb: ACB) -> None:
         """落盘（**保证不抛**）：P1-5 —— 非法 staged 内容不得阻断结算/槽位释放。
@@ -2390,6 +2846,37 @@ class Harness:
                 self._admission_index.pop(key, None)
             if acb is not None:
                 self._admission_index.pop(self._admission_key_for(acb), None)
+
+    def _replace_child_ref(self, old: ACB, fresh: ACB) -> None:
+        """C6：replan/requeue 后把父树中的旧子 id 原位替换为新 id。
+
+        `parent_id` 不可变意味着新 ACB 仍是同一父的子；父的 `children` /
+        `children_ids` / `children_pending` 必须同步，否则取消/汇总会漏掉新身份。
+        """
+        parent_id = getattr(old, "parent_id", "") or ""
+        if not parent_id:
+            return
+        parent = self.acbs.get(parent_id)
+        if parent is None:
+            return
+        parent.children = [fresh if child is old else child
+                           for child in list(getattr(parent, "children", []) or [])]
+        new_ids: list = []
+        replaced = False
+        for entry in list(getattr(parent, "children_ids", []) or []):
+            if isinstance(entry, (list, tuple)) and str(entry[0]) == str(old.id):
+                ref = entry[1] if len(entry) > 1 else None
+                new_ids.append((fresh.id, ref))
+                replaced = True
+            else:
+                new_ids.append(entry)
+        if not replaced:
+            new_ids.append((fresh.id, None))
+        parent.children_ids = new_ids
+        pending = getattr(parent, "children_pending", None) or {}
+        if str(old.id) in pending:
+            parent.children_pending[str(fresh.id)] = pending.pop(str(old.id))
+        self._safe_save(parent)
 
     # ---- R7：每 ACB 一把 transition 锁 -------------------------------
     def _transition_lock(self, acb: ACB) -> threading.RLock:
@@ -2618,6 +3105,10 @@ class Harness:
         self.run_coordinator.register(acb)
         # R6：恢复出的活跃 ACB 也纳入准入登记（避免同 key 再次 try_admit 复制一份）
         self._register_admission(acb)
+        # C1：对账两阶段窗口留下的 `children_pending` / ref=None 子（找回 /
+        # 孤儿结算留痕）。
+        self._reconcile_children_refs(acb)
+        self._reconcile_children_pending(acb)
         # S13a P0-3：恢复结束即驱动一次超时结算（否则恢复出的过期审批永不结算）。
         self.tick()
         return acb
@@ -2771,6 +3262,11 @@ class Harness:
             return acb
         fresh.replan_count = acb.replan_count
         fresh.replan_attempts = acb.replan_attempts
+        # C6：replan 后的新 ACB 仍属于原子树 —— 继承父身份、子清单与父能力快照。
+        if acb.parent_id:
+            fresh.parent_id = acb.parent_id
+        fresh.children_ids = list(acb.children_ids)
+        fresh.children_pending = copy.deepcopy(acb.children_pending)
         self._adopt_capability(acb, fresh)
         # R7：同一临界区内标记 + 落盘 + 摘除（避免 `_finalize` 覆盖快照）
         acb.superseded = True
@@ -2781,6 +3277,7 @@ class Harness:
         self.acbs[fresh.id] = fresh
         self.run_coordinator.register(fresh)
         self._register_admission(fresh)
+        self._replace_child_ref(acb, fresh)
         self.checkpoints.save(fresh)          # §2.4：再准入成功落盘
         return fresh
 
@@ -2828,6 +3325,8 @@ class Harness:
                 self._safe_save(acb)
                 self.acbs.pop(acb.id, None)
                 self.acbs[fresh.id] = fresh
+                self.run_coordinator.register(fresh)
+                self._replace_child_ref(acb, fresh)
                 self.checkpoints.save(fresh)        # §2.4：requeue 成功落盘
                 return fresh
             self.slots.try_acquire(acb.id)
@@ -2887,6 +3386,13 @@ class Harness:
                     children.append((child[0],
                                      child[1] if len(child) > 1 else None))
             acb.children_ids = children
+            # C1：恢复第一阶段登记（spawn 崩溃窗口），由 recover 做对账。
+            pending_raw = data.get("children_pending")
+            if isinstance(pending_raw, dict):
+                acb.children_pending = {
+                    str(cid): dict(info) if isinstance(info, dict) else {}
+                    for cid, info in pending_raw.items()
+                }
             # F6：能力来源不可知 → fail-closed，不回退 `default_token`（后者会
             # 静默抹掉 attenuation）。空串是**哨兵**：`_effective_token` 只判
             # `is not None`，空串会原样返回并被 gateway 判为不可解析 → 拒绝；
@@ -2939,21 +3445,26 @@ class Harness:
         `acb.capability`，不会落到 `policy.default_token`（后者会抹掉 attenuation）。
         F6：字符串 token 在新进程里无法验签（换 secret / 无 signer）→
         `CAPABILITY_LOST` + `needs_readmit`（留告警，而非静默全 DENIED）。
+
+        C5：重建后**必须注册**进 `policy._tokens[acb.id]`，并按父链按需加载
+        祖先（`_ensure_policy_token`），否则跨进程恢复后 `_traceable` 全拒。
         """
         if isinstance(cap, dict):
-            acb.capability = CapabilityToken(
-                agent_id=str(cap.get("agent_id", "")),
-                tools=set(cap.get("tools") or ()),
-                paths=set(cap.get("paths") or ()),
-                network=set(cap.get("network") or ()),
-                data_class=str(cap.get("data_class", "public")),
-                parent_id=str(cap.get("parent_id", "") or ""),
-            )
+            token = self._token_from_payload(cap, acb.id)
+            acb.capability = token
+            self._register_token(acb, token)
+            if getattr(token, "parent_id", ""):
+                self._ensure_policy_token(token.parent_id)
         elif isinstance(cap, str):
             acb.capability = cap
-            if self.policy.resolve_token(cap) is None:
+            resolved = self.policy._resolve_raw(cap)
+            if resolved is None:
                 acb.needs_readmit = True
                 acb.failure = acb.failure or "CAPABILITY_LOST"
+            else:
+                self._register_token(acb, resolved)
+                if getattr(resolved, "parent_id", ""):
+                    self._ensure_policy_token(resolved.parent_id)
         # None → 不覆盖（旧格式 / 未签发）
 
     def _restore_budget(self, acb: ACB, data: dict) -> None:

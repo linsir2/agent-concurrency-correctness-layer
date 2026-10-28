@@ -122,7 +122,23 @@ def _capability_to_payload(token) -> Any:
         "data_class": str(getattr(token, "data_class", "public")),
         # S13c §2.4：派生 token 的父身份必须随快照落盘（否则恢复后追溯失败）。
         "parent_id": str(getattr(token, "parent_id", "") or ""),
+        # C6：父能力快照 + 摘要（lineage 不依赖全局 `_tokens`，恢复后仍可校验）。
+        "parent_scope": copy.deepcopy(getattr(token, "parent_scope", None)),
+        "parent_scope_digest": str(
+            getattr(token, "parent_scope_digest", "") or ""),
     }
+
+
+def _pending_to_payload(pending) -> dict:
+    """`children_pending` → codec 可序列化 dict（C1 第一阶段登记）。"""
+    out: dict = {}
+    if not isinstance(pending, dict):
+        return out
+    for child_id, info in pending.items():
+        entry = dict(info) if isinstance(info, dict) else {}
+        entry["child_id"] = str(child_id)
+        out[str(child_id)] = entry
+    return out
 
 
 def _children_to_payload(children) -> list:
@@ -147,6 +163,12 @@ class CheckpointStore:
         self.root = root             # 兼容签名；内存版不使用
         self._store: dict[str, dict] = {}
         self._counter = itertools.count(1)
+        # C2：run → acb 清单（撤销时枚举整棵持久化图，不靠会被后代覆盖的
+        # `latest_ref_for_run` 根指针）。
+        self._run_acbs: dict[str, dict[str, int]] = {}
+        self._latest: dict[str, str] = {}
+        self._latest_run: dict[str, str] = {}
+        self._latest_task: dict[str, str] = {}
         self.slots = None            # 由 Harness 注入，用于快照活跃槽位
         self.event_log = None        # 必存属性（Harness 无条件注入）
         self.applied_event_ids = None  # 由 Harness 注入，用于恢复去重持久化
@@ -161,6 +183,14 @@ class CheckpointStore:
         ref = f"CP{next(self._counter)}"
         self._store[ref] = self._build_payload(acb)
         acb.result_ref = ref
+        # C2/C5：维护指针与 run 清单（内存版也能按 acb_id / run 反查最新快照）。
+        self._latest[acb.id] = ref
+        if acb.run_id:
+            self._latest_run[acb.run_id] = ref
+            self._run_acbs.setdefault(acb.run_id, {})[acb.id] = (
+                int(ref[2:]) if ref[2:].isdigit() else 0)
+        key = f"{acb.run_id}\x00{acb.task_id}\x00{acb.logical_subgoal_id}"
+        self._latest_task[key] = ref
         return ref
 
     def load(self, ref: str) -> dict:
@@ -171,14 +201,28 @@ class CheckpointStore:
         return self.load(ref)
 
     def latest_ref_for_acb(self, acb_id: str) -> str | None:
-        return None
+        return self._latest.get(acb_id)
 
     def latest_ref_for_run(self, run_id: str) -> str | None:
-        return None
+        return self._latest_run.get(run_id)
 
     def latest_ref_for_task(self, run_id: str, task_id: str,
                             logical_subgoal_id: str) -> str | None:
-        return None
+        return self._latest_task.get(
+            f"{run_id}\x00{task_id}\x00{logical_subgoal_id}")
+
+    def refs_for_run(self, run_id: str) -> list[tuple[str, str | None]]:
+        """C2：该 run 的**全部** ACB（按 acb_id 去重，附各自最新 ref）。"""
+        if not run_id:
+            return []
+        ids = set((self._run_acbs.get(run_id) or {}).keys())
+        # 兜底：直接扫描快照（覆盖「已落盘但清单未更新」的崩溃窗口）
+        for ref, payload in self._store.items():
+            if isinstance(payload, dict) and payload.get("run_id") == run_id:
+                aid = payload.get("acb_id")
+                if aid:
+                    ids.add(str(aid))
+        return [(aid, self.latest_ref_for_acb(aid)) for aid in sorted(ids)]
 
     # ---- S10a §3.4：run 级 fencing epoch（同一 flock 内 read-modify-write）----
     def read_epoch(self) -> int:
@@ -317,6 +361,9 @@ class CheckpointStore:
             "parent_id": getattr(acb, "parent_id", "") or "",
             "children_ids": _children_to_payload(
                 getattr(acb, "children_ids", None)),
+            # C1：两阶段落盘的第一阶段登记（phase ① 可重建；② 成功后清空）。
+            "children_pending": _pending_to_payload(
+                getattr(acb, "children_pending", None)),
             # F6：存**有效 token**（`acb.capability` → `policy._tokens` →
             # `default_token`）；生产路径 token 常在 `policy._tokens`，
             # 只存 `acb.capability` 会把 None 落盘 → 跨进程恢复后能力全丢。
@@ -822,6 +869,9 @@ class FileCheckpointStore(CheckpointStore):
                                     ref, acb, seq, now_ms)
                 self._write_pointer(self._task_pointer_path(acb),
                                     ref, acb, seq, now_ms)
+                # C2：持久化 run → acb 清单（撤销时枚举整棵图；不靠会被后代
+                # 覆盖的 `latest_run` 根指针）。与 ref 写入同一 flock。
+                self._update_run_index(acb, seq)
 
                 # 先盘后缓存：全部落盘成功后才填只读镜像
                 self._store[ref] = copy.deepcopy(payload)
@@ -937,6 +987,64 @@ class FileCheckpointStore(CheckpointStore):
     def latest_ref_for_acb(self, acb_id: str) -> str | None:
         return self._read_pointer(self._latest_path("latest", acb_id),
                                   "latest", acb_id)
+
+    # ---- C2：run → acb 清单（撤销枚举的真相源）------------------------
+    def _run_index_path(self, run_id: str) -> Path:
+        return self.root / "run_acbs" / f"{_sha16(run_id)}.json"
+
+    def _update_run_index(self, acb, seq: int) -> None:
+        """在同一 flock 内合并写 `run_acbs/<sha16(run_id)>.json`（单调 seq）。"""
+        if not acb.run_id:
+            return
+        path = self._run_index_path(acb.run_id)
+        acbs: dict = {}
+        if path.exists():
+            try:
+                data = loads(path.read_bytes().decode("utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("acbs"), dict):
+                    acbs = {str(k): int(v or 0)
+                            for k, v in data["acbs"].items()}
+            except Exception:  # noqa: BLE001  # 损坏重建（ref 文件仍在，可扫描兜底）
+                acbs = {}
+        if int(acbs.get(acb.id, -1)) <= int(seq):
+            acbs[acb.id] = int(seq)
+        self._ensure_dir(path.parent)
+        atomic_write(path, dumps({"run_id": acb.run_id,
+                                  "acbs": acbs}).encode("utf-8"))
+
+    def refs_for_run(self, run_id: str) -> list[tuple[str, str | None]]:
+        """C2：枚举该 run 的全部 ACB（索引 + refs 扫描兜底）及其最新 ref。
+
+        root 指针 `latest_run` 会被任意同 run 的后代 `save` 覆盖成**后代**，
+        不能作为撤销根；这里按 `acb_id` 逐项取 `latest` 指针。
+        """
+        if not run_id:
+            return []
+        ids: set[str] = set()
+        path = self._run_index_path(run_id)
+        if path.exists():
+            try:
+                data = loads(path.read_bytes().decode("utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("acbs"), dict):
+                    ids.update(str(k) for k in data["acbs"])
+            except Exception:  # noqa: BLE001
+                pass
+        # 兜底：扫描 ref 文件（覆盖「ref 已落盘、索引未写」的崩溃窗口）
+        refs_root = self.root / "refs"
+        if refs_root.exists():
+            for ref_path in refs_root.rglob("*.json"):
+                if ref_path.name.endswith(".part") or \
+                        ref_path.name.endswith(".corrupt"):
+                    continue
+                try:
+                    doc = loads(ref_path.read_bytes().decode("utf-8"))
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(doc, dict) and doc.get("run_id") == run_id:
+                    aid = doc.get("acb_id")
+                    if aid:
+                        ids.add(str(aid))
+        return [(aid, self.latest_ref_for_acb(aid)) for aid in sorted(ids)]
 
     def latest_ref_for_run(self, run_id: str) -> str | None:
         return self._read_pointer(self._latest_path("latest_run", run_id),

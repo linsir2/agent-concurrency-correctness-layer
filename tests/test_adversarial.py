@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from conftest import (admit, commit, decision, finish, hitl, make_harness,
                       seed, stage, state_of, tool)
-from harness import Mode, Status, TaskState, Write, EventKind, TASK_TERMINAL
+from harness import Mode, Status, TaskState, Write, EventKind, TASK_TERMINAL, Harness
 from harness.runtime import CrashInjected
 from harness.storage.blob import canonical_bytes
 
@@ -126,20 +126,27 @@ def test_a4_budget_double_spend():
 
 # ---------------------------------------------------------------- A5
 def test_a5_deep_nested_cancellation_broadcast():
-    """A5：**真嵌套** A→B→C→D → 取消根 → RunCoordinator 广播，所有后代租约失效。"""
+    """A5：**真嵌套** A→B→C→D → 取消根 → RunCoordinator 广播，所有后代租约失效。
+
+    C10：父子关系必须同时写 `parent_id` / `children_ids`（旧夹具只有 `children`
+    + 同一 run_id → 取消时三者都是 roots，`_walk_children` 从未被调用，级联断言
+    恒真）。
+    """
     h = make_harness()
     plan = h.planner.plan("A5", [{"task_id": "A"}, {"task_id": "B"},
                                  {"task_id": "C"}, {"task_id": "D"}])
     h.plans["A5"] = plan
 
-    # 构造嵌套：A 的 children = [B]，B 的 children = [C]，C 的 children = [D]
+    # 构造嵌套：A.children=[B], B.children=[C], C.children=[D]（三源一致）
     acbs = {}
     parent = None
     for tid in ["A", "B", "C", "D"]:
         acb = admit(h, "A5", plan, tid)
         if parent is not None:
             parent.children.append(acb)
+            parent.children_ids.append((acb.id, None))
             acb.parent = parent
+            acb.parent_id = parent.id
         acbs[tid] = acb
         parent = acb
         h.run_coordinator.register(acb)
@@ -158,6 +165,50 @@ def test_a5_deep_nested_cancellation_broadcast():
     stale = [l for l in h.intents._leases.values() if l.agent_id in {a.id for a in acbs.values()}]
     assert len(stale) == 4
     assert all(not l.valid for l in stale)
+    # C10：级联确实走过父链（否则同 run 的 ACB 会被当作 roots 直接取消）
+    assert all(a.state is TaskState.CANCELLED for a in acbs.values())
+
+
+def test_a5_persisted_tree_cancelled_after_memory_loss(tmp_path):
+    """C10：A5 树 + 持久化（parent_id/children_ids）+ 清空内存 → 仍全撤。"""
+    h = Harness(run_limits=1000, checkpoint_root=str(tmp_path))
+    h.policy.default_token = h.policy.issue(
+        "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
+    plan = h.planner.plan("A5P", [{"task_id": "A"}, {"task_id": "B"},
+                                  {"task_id": "C"}, {"task_id": "D"}])
+    h.plans["A5P"] = plan
+
+    order = ["A", "B", "C", "D"]
+    acbs = {}
+    parent = None
+    for tid in order:
+        acb = admit(h, "A5P", plan, tid)
+        if parent is not None:
+            parent.children.append(acb)
+            acb.parent_id = parent.id
+        acbs[tid] = acb
+        parent = acb
+        h.run_coordinator.register(acb)
+    # 先存子，再回填父的 (child_id, ref) 并二次落盘（与 spawn 两阶段一致）
+    refs = {tid: h.checkpoints.save(acb) for tid, acb in acbs.items()}
+    for tid, acb in acbs.items():
+        acb.children_ids = [(c.id, refs[c.task_id])
+                            for c in acb.children]
+        h.checkpoints.save(acb)
+    for tid, acb in acbs.items():
+        h.intents.reserve("p-" + tid, acb.id, 0, 60_000)
+
+    h.acbs.clear()          # 进程内已无该 run
+
+    h.run_coordinator.cancel_run("A5P")
+
+    for tid, acb in acbs.items():
+        ref = h.checkpoints.latest_ref_for_acb(acb.id)
+        assert ref is not None
+        assert h.checkpoints.load_strict(ref)["state"] == "CANCELLED"
+    stale = [l for l in h.intents._leases.values()
+             if l.agent_id in {a.id for a in acbs.values()}]
+    assert len(stale) == 4 and all(not l.valid for l in stale)
 
 
 # ---------------------------------------------------------------- A6

@@ -85,8 +85,9 @@ def test_advance_cancel_after_terminal_is_rejected():
 
 
 def test_task_and_run_terminal_sets_are_separate():
-    # DONE_PARTIAL 属 Run 级（表 B），不是任务级终态
-    assert TaskState.DONE_PARTIAL not in TASK_TERMINAL
+    # S13c C3：父汇总的 DONE_PARTIAL 是**任务级终态**（否则预算永不归档、
+    # Run 永不 finalize）；表 B 的 RunState 仍独立。
+    assert TaskState.DONE_PARTIAL in TASK_TERMINAL
     assert RunState.DONE_PARTIAL in RUN_TERMINAL
     assert TaskState.DEAD_LETTER in TASK_TERMINAL
 
