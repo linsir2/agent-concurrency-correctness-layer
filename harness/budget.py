@@ -43,6 +43,7 @@ class Reservation:
     consumed: int = 0
     state: str = "ACTIVE"    # ACTIVE | SETTLED | RELEASED | EXPIRED | ARCHIVED
     expires_at: int = 0      # tombstone 过期时间（epoch s）；0 = 不过期
+    settled_at: int = 0      # 进入终态（RELEASED/SETTLED/ARCHIVED）的时刻
 
     @property
     def balance(self) -> int:
@@ -367,7 +368,8 @@ class BudgetManager:
             self._check_local(node)
             return resv
 
-    def release(self, reservation_id: str) -> int:
+    def release(self, reservation_id: str, *,
+                now: float | None = None) -> int:
         found0 = self._reservations.get(reservation_id)
         run_id = (getattr(found0[0], "run_id", "") or self._run_id) if found0 else self._run_id
         durable = self._durable_epoch(run_id)
@@ -386,13 +388,19 @@ class BudgetManager:
                     a.subtree_reserved -= freed
                 node.self_reserved -= freed
             resv.state = "RELEASED"
+            # S19 K-88：终结条目必须有**明确保留期**（原实现不设 → expires_at=0
+            # 永不过期 → `_reservations` 无上限增长）
+            stamp = int(time.time() if now is None else now)
+            resv.settled_at = stamp
+            resv.expires_at = stamp + int(self._tombstone_ttl_s)
             self._emit(EventKind.BUDGET_RELEASED, node.node_id,
                        _node_payload(node, reservation_id, resv.amount, resv.consumed,
                                      "RELEASED", self._epoch_for(run_id)))
             self._check_local(node)
             return freed
 
-    def settle(self, reservation_id: str) -> int:
+    def settle(self, reservation_id: str, *,
+               now: float | None = None) -> int:
         found0 = self._reservations.get(reservation_id)
         run_id = (getattr(found0[0], "run_id", "") or self._run_id) if found0 else self._run_id
         durable = self._durable_epoch(run_id)
@@ -411,6 +419,9 @@ class BudgetManager:
                     a.subtree_reserved -= freed
                 node.self_reserved -= freed
             resv.state = "SETTLED"
+            stamp = int(time.time() if now is None else now)
+            resv.settled_at = stamp
+            resv.expires_at = stamp + int(self._tombstone_ttl_s)
             self._emit(EventKind.BUDGET_SETTLED, node.node_id,
                        _node_payload(node, reservation_id, resv.amount, resv.consumed,
                                      "SETTLED", self._epoch_for(run_id)))
@@ -476,6 +487,16 @@ class BudgetManager:
                 r.state == "ACTIVE" and r.balance >= amount
                 for r in node.reservations.values()
             )
+
+    def remaining(self, node_id: str) -> int:
+        """该节点**剩余可用额度** = `limits - subtree_reserved`（S19 K-91）。
+
+        与 `check()` 的区别：`check()` 回答「**任一** ACTIVE 预留余额是否够付」，
+        `remaining()` 回答「这个节点还能再预留多少」。两者语义不同，别混用。
+        """
+        with self._lock:
+            node = self._nodes.get(node_id)
+            return 0 if node is None else max(0, node.limits - node.subtree_reserved)
 
     def check_reservations(self, reservation_ids, amount: int = 1) -> bool:
         """给定预留中是否存在**一笔** ACTIVE 且余额足够支付 amount 的。"""
@@ -590,10 +611,12 @@ class BudgetManager:
                 for rid in list(n.reservations):
                     resv = n.reservations[rid]
                     resv.state = "ARCHIVED"
+                    resv.settled_at = stamp
                     resv.expires_at = stamp + int(self._tombstone_ttl_s)
                 self._nodes.pop(n.node_id, None)
             self._emit(EventKind.BUDGET_ARCHIVED, node_id,
                        {"node_id": node_id, "folded_consumed": folded_consumed,
+                        "expires_at": stamp + int(self._tombstone_ttl_s),
                         "budget_epoch": self._epoch_for(node.run_id or None),
                         "run_id": node.run_id})
             return True
@@ -765,10 +788,15 @@ class BudgetManager:
             parent.folded_consumed += folded
             if node in parent.children:
                 parent.children.remove(node)
-        now = int(time.time())
+        # S19 K-90：优先用事件里携带的 `expires_at`（由 RSM 的 leader 决定），
+        # 只在旧事件缺该字段时回退 wall clock —— 否则「重放结果」与「RSM 结果」
+        # 的 tombstone 过期时刻不同，gc 时机发散。
+        stamp = p.get("expires_at")
+        now = int(stamp) if stamp is not None else int(time.time())
         for r in node.reservations.values():
             r.state = "ARCHIVED"
-            r.expires_at = now + int(self._tombstone_ttl_s)
+            r.expires_at = (int(stamp) if stamp is not None
+                            else now + int(self._tombstone_ttl_s))
         self._nodes.pop(nid, None)
         return True
 
@@ -900,6 +928,55 @@ class BudgetManager:
             raise InvariantError(
                 f"tree integrity broken: node {nid!r} declared by EventLog "
                 f"but not rebuilt")
+
+    def prune(self, now: float, live_rids=(), *,
+              max_age_s: float | None = None,
+              retention_s: float | None = None) -> int:
+        """剪掉「已终结 + 无人引用 + 超过保留期」的预留条目（S19 K-88）。
+
+        **三个栅栏全部满足才剪**（缺一不可）：
+
+        ① **状态栅栏**：只剪 `RELEASED` / `SETTLED`。
+           `ACTIVE` 永不剪（还在占额度）；`ARCHIVED` 由 `gc` 按 TTL 处理。
+        ② **引用栅栏**：`rid ∈ live_rids` 不剪 —— 活跃 ACB 仍可能在
+           `_finalize` 里 `settle`/`release`。这里用**精确集合**而不是序号水位
+           （单机 rid 是 uuid，没有单调 seq；精确集合更强）。
+        ③ **时间栅栏**：`expires_at` 未到不剪（Kafka tombstone retention 同构，
+           给「从头读的观察者」留足窗口）。`expires_at == 0`（旧数据）视为已过期。
+
+        **剪前必须折账**：`node.folded_consumed += resv.consumed`。否则
+        `Σ条目.consumed` 下降而 `node.consumed` 不变 → E2 / I5c 立刻被破坏
+        （见 `check_invariants` 的等式）。
+
+        返回删除条数。
+        """
+        live = set(live_rids or ())
+        ttl = float(self._tombstone_ttl_s)
+        # ③ 保留期：显式 `retention_s` 优先（**Raft 副本必须用它** —— 各副本的
+        # `_tombstone_ttl_s` 是本地配置，若被剪枝逻辑直接读取，配置漂移会让
+        # 状态机发散）；否则 min(全局 TTL, 调用方上限)，只能收紧不能放宽。
+        if retention_s is not None:
+            retention = float(retention_s)
+        else:
+            retention = ttl if max_age_s is None else min(ttl, float(max_age_s))
+        removed = 0
+        with self._lock:
+            for rid in list(self._reservations):
+                node, resv = self._reservations[rid]
+                if resv.state not in ("RELEASED", "SETTLED"):
+                    continue                      # ① 状态栅栏
+                if rid in live:
+                    continue                      # ② 引用栅栏
+                settled_at = int(getattr(resv, "settled_at", 0) or 0)
+                # 旧数据（settled_at=0）视为早已过期，可剪
+                if settled_at and float(now) - settled_at < retention:
+                    continue                      # ③ 时间栅栏
+                node.folded_consumed += int(resv.consumed)
+                node.reservations.pop(rid, None)
+                self._reservations.pop(rid, None)
+                self._check_local(node)
+                removed += 1
+        return removed
 
     def check_invariants(self, *, cross_process: bool = False) -> None:
         """O(N) 全树校验（只在 recover 后 / debug 调用）。不用 `assert`。

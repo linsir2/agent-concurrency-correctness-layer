@@ -162,6 +162,19 @@ class BudgetManager(Protocol):
         ...
 
     def check(self, node_id: str, amount: int = 0) -> bool:
+        """**ANY 语义**：该节点**任一** ACTIVE 预留的余额是否够付 `amount`。
+
+        注意：这不等于「剩余额度」；要问剩余额度请用 `remaining()`（S19 K-91）。
+        """
+        ...
+
+    def remaining(self, node_id: str) -> int:
+        """剩余可用额度 = `limits - subtree_reserved`。"""
+        ...
+
+    def prune(self, now: float, live_rids=(), *,
+              max_age_s: float | None = None) -> int:
+        """三栅栏剪枝（状态/引用/时间）；剪前折账（S19 K-88）。"""
         ...
 
     # ---- S15 C1：事件溯源 / 归档 / 不变量 ----

@@ -73,6 +73,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s17_raft_boundaries.py` | S17：K-81 确定性 rid（三副本一致 + 重启续号）/ K-82 require_leader / K-83 生产配置 / K-85 bump_epoch 抛错 / K-86 快照恢复 |
 | `tests/test_s17_ms10.py` | S17 MS10：`test_dlq` 毒任务 / `test_admin_pause_resume` / `test_ingress_idempotent` / drain / kill / purge / 可观测导出 |
 | `tests/test_s18_raft_rsm.py` | S18：K-87 预算树/归档折叠/不变量跨副本一致 + K-82 barrier 线性一致读 + K-83 from_addrs + 终审 4 P0 回归 |
+| `tests/test_s19_budget_gc.py` | S19：K-88 三栅栏修剪（三个负对照 + 有界性 + 「不修剪就增长」负对照）/ 剪后不变量 / K-89 claim 复制 / K-90 归档时间戳 / K-91 remaining / K-92 预检 / K-93 owner |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

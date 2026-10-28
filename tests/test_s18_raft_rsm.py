@@ -342,9 +342,13 @@ def test_review_create_node_conflicting_limits_returns_none():
 
 
 def test_review_consume_with_claim_fails_closed():
-    """审查 P0-2：未复制 claim fencing → 带 claim 的 consume **拒绝**（不静默）。"""
+    """claim fencing：**S18** 是 fail-closed 拒绝；**S19** 起改为复制 claims。
+
+    S19 语义（升级）：`claim_epoch` 作为命令参数参与复制，单调比较 ——
+    高 epoch 先写入后，**低 epoch 消费被拒**（旧 worker 被 fence），
+    而不是「带 claim 就一律拒绝」。这里锁定新语义。
+    """
     _require()
-    from harness.storage.raft import RaftUnavailable
     from harness.types import ACB
 
     bm = RaftBudgetManager(base_port=_base())
@@ -352,11 +356,16 @@ def test_review_consume_with_claim_fails_closed():
         bm.create_node("p", 20, "run")
         r = bm.reserve("p", 5)
         assert r is not None
-        acb = ACB(id="A-1", run_id="R", task_id="T1")
-        acb.claim_epoch = 3
-        with pytest.raises(RaftUnavailable):
-            bm.consume(r.reservation_id, 1, acb=acb)
-        # 不带 claim → 正常
+
+        hi = ACB(id="A-1", run_id="R", task_id="T1")
+        hi.claim_epoch = 3
+        assert bm.consume(r.reservation_id, 1, acb=hi) == 1   # 高 epoch 通过
+
+        stale = ACB(id="A-1", run_id="R", task_id="T1")
+        stale.claim_epoch = 2                                  # 旧 worker
+        assert bm.consume(r.reservation_id, 1, acb=stale) == 0, (
+            "低 epoch 必须被 fence（返回 0，不静默记账）")
+        # 不带 claim 仍可正常消费（向后兼容）
         assert bm.consume(r.reservation_id, 1) == 1
     finally:
         bm.close()

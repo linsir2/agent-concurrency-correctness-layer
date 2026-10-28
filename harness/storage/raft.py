@@ -86,7 +86,8 @@ def pick_free_base(base: int, count: int, *, max_shift: int = 500) -> int:
 
 
 def raft_conf(*, journal_file=None, full_dump_file=None,
-              compaction_min_entries: int = 2, **overrides):
+              compaction_min_entries: int = 2, password: str = "harness-raft",
+              **overrides):
     """一套满足 pysyncobj 校验的默认配置（本地 3 节点、低延迟）。
 
     实测约束：`raftMinTimeout > appendEntriesPeriod * 3`、
@@ -100,7 +101,7 @@ def raft_conf(*, journal_file=None, full_dump_file=None,
         "raftMinTimeout": 0.3,
         "raftMaxTimeout": 0.6,
         "connectionTimeout": 1.2,
-        "password": "harness-raft",  # 非空：pysyncobj 要求加密连接
+        "password": password,        # 非空：pysyncobj 要求加密连接（S19 K-92 可配）
     }
     # S17 K-86：日志压缩/快照（实测：写入 → compact → 重启可完整恢复）
     if journal_file is not None:
@@ -225,7 +226,10 @@ class RaftCluster:
     @classmethod
     def from_addrs(cls, node_factory, *, addrs: list[str],
                    data_dir: str | None = None,
-                   tick_interval: float = 0.002) -> RaftCluster:
+                   tick_interval: float = 0.002,
+                   password: str = "harness-raft",
+                   precheck: bool | str = "auto",
+                   precheck_timeout: float = 1.0) -> RaftCluster:
         """**外部地址集群**（S18 K-83）：部署时传入真实 `host:port` 列表。
 
         校验：≥3 个地址、无重复、形如 `host:port`（端口为整数）、`data_dir`
@@ -242,6 +246,33 @@ class RaftCluster:
             if not host or not port.isdigit() or not (0 < int(port) < 65536):
                 raise ValueError(f"地址格式应为 host:port：{addr!r}")
 
+        if precheck:
+            # S19 K-92：建簇前探测可达性。**为什么不是「全须可达」**：
+            # 首次启动时三节点都还没监听，全不可达是**正常**的；真正的配置错误
+            # 是「部分可达、部分不可达」（拼错某个地址/漏启动某台）——
+            # 那种情况会让 `wait_ready` 干等 20s 且报错无法定位。
+            #
+            # `precheck="auto"`：全不可达 → 视为首次启动（放行）
+            #                  部分可达 → 抛错并**列出不可达地址**
+            # `precheck=True` ：严格（加入既有集群时用）
+            # `precheck=False`：跳过
+            import socket as _sock
+            bad: list[str] = []
+            reachable = 0
+            for addr in addrs:
+                host, _, port_s = addr.rpartition(":")
+                try:
+                    with _sock.create_connection((host, int(port_s)),
+                                                 timeout=precheck_timeout):
+                        reachable += 1
+                except OSError as exc:
+                    bad.append(f"{addr}({exc.__class__.__name__})")
+            strict = precheck is True
+            if bad and (strict or reachable > 0):
+                raise RaftUnavailable(
+                    f"地址可达性不一致/不足：不可达 {bad}，可达 {reachable}/"
+                    f"{len(addrs)}；首次启动请传 precheck=False")
+
         cls_ = cls.__new__(cls)
         cls_._tick_interval = tick_interval
         cls_._stop = threading.Event()
@@ -252,9 +283,10 @@ class RaftCluster:
             if data_dir:
                 conf = raft_conf(
                     journal_file=f"{data_dir}/node{idx}.journal",
-                    full_dump_file=f"{data_dir}/node{idx}.dump")
+                    full_dump_file=f"{data_dir}/node{idx}.dump",
+                    password=password)
             else:
-                conf = raft_conf()
+                conf = raft_conf(password=password)
             cls_.nodes.append(node_factory(addr, partners, conf))
         cls_._thread = threading.Thread(target=cls_._run, daemon=True,
                                        name="raft-ticker")
@@ -536,6 +568,9 @@ if _HAS_PYSYNCOBJ:
             self._seq = 0
             self.last_rid = ""
             self.last_ok = False
+            # S19 K-89：每个 ACB 的**最大** claim_epoch（单调）；旧 worker 的低
+            # epoch 会被永久拒（fencing），无需额外 set_claim 调用。
+            self.claims = {}
 
         @replicated
         def create_node(self, node_id: str, limits: int,
@@ -555,18 +590,32 @@ if _HAS_PYSYNCOBJ:
             self.version += 1
 
         @replicated
-        def consume(self, rid: str, amount: int) -> None:
+        def consume(self, rid: str, amount: int, acb_id: str = "",
+                    claim_epoch: int = 0) -> None:
+            """消费 + **claim fencing**（S19 K-89）。
+
+            `claim_epoch` 作为命令参数参与复制 → 一次日志写入内完成
+            「校验 claim + 变更账本」，副本间确定。
+            单调：`claim_epoch < 已记录` → 拒绝（旧 worker 被 fence）。
+            """
+            if acb_id and int(claim_epoch) < int(self.claims.get(acb_id, 0)):
+                self.last_ok = False
+                self.version += 1
+                return
+            if acb_id:
+                self.claims[acb_id] = int(claim_epoch)
             self.bm.consume(rid, amount)
+            self.last_ok = True
             self.version += 1
 
         @replicated
-        def release(self, rid: str) -> None:
-            self.bm.release(rid)
+        def release(self, rid: str, now: float | None = None) -> None:
+            self.bm.release(rid, now=now)
             self.version += 1
 
         @replicated
-        def settle(self, rid: str) -> None:
-            self.bm.settle(rid)
+        def settle(self, rid: str, now: float | None = None) -> None:
+            self.bm.settle(rid, now=now)
             self.version += 1
 
         @replicated
@@ -578,13 +627,27 @@ if _HAS_PYSYNCOBJ:
             self.version += 1
 
         @replicated
-        def remove_node(self, node_id: str) -> None:
-            self.last_ok = bool(self.bm.remove_node(node_id))
+        def remove_node(self, node_id: str, owner: str = "") -> None:
+            # S19 K-93：owner 校验也走共识（原来只在本机判断）
+            self.last_ok = bool(self.bm.remove_node(node_id, owner=owner))
             self.version += 1
 
         @replicated
         def gc(self, now: float) -> None:
             self.removed = int(self.bm.gc(now))
+            self.version += 1
+
+        @replicated
+        def prune(self, now: float, live_rids: tuple,
+                  retention_s: float) -> None:
+            """S19 K-88：`now` / `live_rids` / **生效保留期**都随命令复制 → 确定。
+
+            **为什么传 `retention_s` 而不是让副本自己读 `_tombstone_ttl_s`**：
+            ttl 是本地配置，不是复制状态；若两副本配置不同，同一命令会得出
+            不同结果 → 状态机发散。由调用方算好再复制，才是确定性 RSM。
+            """
+            self.removed = int(self.bm.prune(
+                now, live_rids, retention_s=retention_s))
             self.version += 1
 else:                                                     # pragma: no cover
     class _ReplicatedBudget:                              # type: ignore[no-redef]
@@ -671,24 +734,27 @@ class RaftBudgetManager:
         `acb`，等于**悄悄丢掉 fencing**。这里选择 **fail-closed**：带 claim 的
         调用直接拒绝，而不是假装成功（K-89）。
         """
-        epoch = int(getattr(acb, "claim_epoch", 0) or 0) if acb is not None else 0
-        if epoch:
-            raise RaftUnavailable(
-                "RaftBudgetManager 尚未复制 claim fencing（K-89）：拒绝带 claim 的"
-                " consume，请改用单机 BudgetManager 或在 pool 模式下禁用本后端")
-        self._bump_and_wait(self._replica.consume, reservation_id, int(amount))
+        acb_id = str(getattr(acb, "id", "") or "") if acb is not None else ""
+        epoch = int(getattr(acb, "claim_epoch", 0) or 0)
+        self._bump_and_wait(self._replica.consume, reservation_id,
+                            int(amount), acb_id, epoch)
+        if not bool(getattr(self._replica, "last_ok", True)):
+            # S19 K-89：claim epoch 过旧（旧 worker）→ 拒绝，不静默记账
+            return 0
         return int(amount)
 
-    def release(self, reservation_id: str) -> int:
+    def release(self, reservation_id: str, *,
+                now: float | None = None) -> int:
         node = self._bm._reservations.get(reservation_id)
         before = int(getattr(node[1], "amount", 0)) if node else 0
-        self._bump_and_wait(self._replica.release, reservation_id)
+        self._bump_and_wait(self._replica.release, reservation_id, now)
         return before
 
-    def settle(self, reservation_id: str) -> int:
+    def settle(self, reservation_id: str, *,
+               now: float | None = None) -> int:
         node = self._bm._reservations.get(reservation_id)
         before = int(getattr(node[1], "amount", 0)) if node else 0
-        self._bump_and_wait(self._replica.settle, reservation_id)
+        self._bump_and_wait(self._replica.settle, reservation_id, now)
         return before
 
     def archive_node(self, node_id: str, *, now: float | None = None) -> bool:
@@ -698,12 +764,25 @@ class RaftBudgetManager:
         return bool(getattr(self._replica, "last_ok", False))
 
     def remove_node(self, node_id: str, *, owner: str = "") -> bool:
-        self._bump_and_wait(self._replica.remove_node, node_id)
+        self._bump_and_wait(self._replica.remove_node, node_id, owner)
         return bool(getattr(self._replica, "last_ok", False))
 
     def gc(self, now: float) -> int:
         self._bump_and_wait(self._replica.gc, float(now))
         return int(getattr(self._replica, "removed", 0) or 0)
+
+    def prune(self, now: float, live_rids=(), *,
+              max_age_s: float | None = None) -> int:
+        """S19 K-88：三栅栏剪枝（走共识；参数全部随命令复制）。"""
+        ttl = float(self._bm._tombstone_ttl_s)
+        retention = ttl if max_age_s is None else min(ttl, float(max_age_s))
+        self._bump_and_wait(self._replica.prune, float(now),
+                            tuple(sorted(str(r) for r in (live_rids or ()))),
+                            retention)
+        return int(getattr(self._replica, "removed", 0) or 0)
+
+    def remaining(self, node_id: str) -> int:
+        return self._bm.remaining(node_id)
 
     # ---- 读面（本地已应用副本的**真实**账本）-----------------------
     @property

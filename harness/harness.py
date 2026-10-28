@@ -2840,6 +2840,21 @@ class Harness:
         self.event_log.append(EventKind.RUN_PURGED, run_id, {}, run_id=run_id)
         return True
 
+    def prune_budget(self, *, max_age_s: float | None = None,
+                     now_ms: int | None = None) -> int:
+        """S19 K-88：剪掉「已终结 + 无人引用 + 超过保留期」的预算预留条目。
+
+        `live_rids` 由**活 ACB**（非终态）的 `reservation_ids` 精确算出 ——
+        这是比「按序号水位」更强的引用栅栏（单机 rid 是 uuid，没有单调 seq）。
+        """
+        now_s = (int(self.clock.now_ms()) if now_ms is None else int(now_ms)) / 1000.0
+        live: set[str] = set()
+        for acb in self.acbs.values():
+            if acb.state in TASK_TERMINAL:
+                continue
+            live.update(acb.reservation_ids or ())
+        return self.budget.prune(now_s, live, max_age_s=max_age_s)
+
     def export_observability(self, sink=None) -> int:
         """把事件流 + metrics 推给 `SpanSink`（默认 `MemorySpanSink`）。
 

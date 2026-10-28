@@ -20,6 +20,7 @@
 | [S7 方案 v1.2](docs/s7-benchmark-and-coverage.md) | 三条件（串行/worktree/共享层）× 四负载基准 + 外部差分度量（资源级 expected + 键级归因）+ 独立 oracle + 二级指标 + 覆盖率分模块阈值 |
 | [S9 方案 v1.2](docs/s9-persistence-and-receipts.md) | 持久化 checkpoint（信封/codec/双层锁/唯一 ref）+ 收据链（同帧 + `commit_key` 去重 + scope 锁 + head 锚点）+ `CrashInjected` 契约 + `retention` 安全语义 + 跨进程恢复与 SIGKILL |
 | [S10 方案 v1.2](docs/s10-cross-process-reconciliation.md) | 跨进程预算对账（事件溯源 + 全量重放 + 树完整性 + 单写者 lease）+ 跨进程 flock（`_FileLock` 下沉 + 三锁全序 + WAL seq fstat + fencing）+ `FinalitySink` 接口草案 |
+| [S19 方案 v1.1](docs/s19-budget-gc-and-hardening.md) | K-88 账本三栅栏精密修剪 + K-89 claim fencing 复制 + K-90 重放时间戳 + K-91 `remaining` + K-92 预检/可配密钥 + K-93 owner 共识 |
 | [S18 方案 v1.1](docs/s18-budget-rsm-and-linearizable-read.md) | K-87 预算树纳入共识（真 RSM）+ K-82 读穿日志线性一致读 + K-83 外部地址集群 |
 | [S17 方案 v1.1](docs/s17-boundaries-and-ms10.md) | K-81~K-86 收口（确定性 id / require_leader / 生产配置 / 快照恢复 / epoch 语义）+ MS10（可观测 / 优雅排空 / 毒任务 DLQ / kill·purge） |
 | [S16 方案 v1.1](docs/s16-ms9-raft.md) | MS9 分布式化：`RaftEventLog`（seq 由 leader 分配）+ `RaftCluster` + `RaftEpochSource`；三后端一致性（memory/wal/raft）；`pysyncobj` 可选依赖 |
