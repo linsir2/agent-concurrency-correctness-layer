@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .event_log import EventLog
-from .storage._lock import STORE_ORDER, _FileLock
+from .storage._lock import FencingRejected, STORE_ORDER, _FileLock
 from .storage.atomic import atomic_write, fsync_dir, write_all
 from .storage.codec import CodecError, decode, dumps, encode, loads
 from .types import Action, Event, EventKind
@@ -51,6 +51,18 @@ _REF_FILE_RE = re.compile(
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _fenced(store, acb) -> None:
+    """S13d §2.5 P0-10：checkpoint 落盘前的 claim fencing。
+
+    `claim_guard` 由 `Harness` 注入（pool 模式下比对 `acb.claim_epoch` 与当前
+    claim 的 `fence_epoch`）；未注入 / sync 模式 → 放行（既有语义）。
+    """
+    guard = getattr(store, "claim_guard", None)
+    if callable(guard) and guard(acb):
+        raise FencingRejected(
+            f"claim fenced: {getattr(acb, 'id', '')}")
 
 
 def _sha16(text: str) -> str:
@@ -143,6 +155,9 @@ class CheckpointStore:
         self._epoch = 0              # S10a：run 级 fencing epoch（内存版）
 
     def save(self, acb) -> str:
+        # S13d §2.5 P0-10：claim fencing —— 旧 worker 的快照不得覆盖新 claim。
+        # sync 模式无 claim → `claim_guard` 恒 False（既有语义不变）。
+        _fenced(self, acb)
         ref = f"CP{next(self._counter)}"
         self._store[ref] = self._build_payload(acb)
         acb.result_ref = ref
@@ -297,6 +312,8 @@ class CheckpointStore:
             # R4/R7：尝试计数（永不回滚）+ superseded（旧 ACB 已由 replan 取代）
             "replan_attempts": int(getattr(acb, "replan_attempts", 0) or 0),
             "superseded": bool(getattr(acb, "superseded", False)),
+            # S13d §2.5：累计 aging 超时次数（跨恢复保证「超 N 次 → DEAD_LETTER」）
+            "aging_count": int(getattr(acb, "aging_count", 0) or 0),
             "parent_id": getattr(acb, "parent_id", "") or "",
             "children_ids": _children_to_payload(
                 getattr(acb, "children_ids", None)),
@@ -764,6 +781,7 @@ class FileCheckpointStore(CheckpointStore):
 
     # ---- 写入 -------------------------------------------------------
     def save(self, acb) -> str:
+        _fenced(self, acb)                     # S13d P0-10：claim fencing
         # R7：`_build_payload` 读活跃 ACB / 预算节点的实时字段，必须与写入同临界区，
         # 否则并发 `_finalize`/`replan` 会把半更新快照落到盘上（恢复出矛盾状态）。
         with self._thread_lock:
@@ -947,6 +965,8 @@ class EffectJournal:
         self._counter = itertools.count(1)
         # 单写者临界区：begin/confirm/mark_unknown/probe_one 必须原子
         self._lock = threading.RLock()
+        # S13d §2.5 P0-10：claim fencing（由 Harness 注入；None = 不校验）
+        self.claim_guard = None
 
     # ---- 写入（§3.2：subject = acb.id，idem_key 入 payload）----------
     def begin(self, acb, action, *legacy) -> str:
@@ -954,10 +974,17 @@ class EffectJournal:
 
         **兼容垫片**：旧签名 `begin(acb, tool, args, key)` 仍可用
         （新签名 `begin(acb, action)` 是生产路径）。
+
+        S13d P0-10：claim fencing 命中 → 返回 `""` 且**不写事件**（旧 worker
+        不得产生新的 EFFECT_INTENT；调用方据此在 `_action_tool` 已先返回
+        `REJECT_STALE`）。
         """
         if isinstance(action, str):
             action = Action(kind="tool", tool=action,
                             args=(legacy[0] if legacy else {}) or {})
+        guard = self.claim_guard
+        if callable(guard) and guard(acb):
+            return ""
         with self._lock:
             idem_key = effect_idem_key(acb, action)
             existing = self._entries.get(idem_key)

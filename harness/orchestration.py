@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import itertools
 import threading
+from dataclasses import dataclass
 
 from .types import ACB, TASK_TERMINAL, EventKind, Status, TaskState, advance
 from .storage.blob import canonical_bytes
@@ -506,6 +507,9 @@ class Dispatcher:
                 self.h._clear_admission(key)
             self.h._register_admission(acb)
             self.h.budget.flush_pending()           # 成功 → 同帧 append_batch
+            # S13d §2.5 / B-4：aging 是**墙钟**语义 —— 准入成功即起算，
+            # `tick()` 扫描到期项（`aging_ms=0` 表示禁用，不改既有语义）。
+            self.h._arm_aging(acb)
         else:
             self.h.budget.discard_pending()         # 失败 → 丢弃草稿
         return acb
@@ -594,10 +598,40 @@ class Dispatcher:
         self.h.slots.release(acb.id)
 
 
+@dataclass
+class Claim:
+    """S13d §2.5 P0-10：ready 队列键的**所有权租约**（防双跑 = claim + lease + fencing）。
+
+    - `worker_id`：持有者身份（同一写者重入不视为他人）；
+    - `lease_until_ms`：租约到期（墙钟，来自注入时钟）；到期后另一 worker 可重 claim；
+    - `attempt`：重 claim 次数（首 claim = 1）；
+    - `fence_epoch`：重 claim 时**原子**推进的 epoch；写路径比对 `acb.claim_epoch`
+      —— 旧 worker 的写会被判 `REJECT_STALE`。
+    """
+    acb_id: str
+    worker_id: str
+    lease_until_ms: int
+    attempt: int = 1
+    fence_epoch: int = 0
+
+
 class Scheduler:
-    def __init__(self, harness) -> None:
+    """ready_queue + **单一 pop 所有者**（S13d §2.5）。
+
+    `mode="sync"`（默认）保持既有语义：`push` → 调用方内联 `_run_one` →
+    `finally` drain；`pop()` 只做队列出队，**不 claim**（36 个同步用例零破坏）。
+
+    `mode="pool"`：`pop_claimed()` 在**同一把锁内**完成「出队 + claim」；
+    只有拿到 claim 的 worker 才执行，重 claim 时原子 `supervisor_note_crash(old)`
+    （revoke + bump_epoch）后再写新 claim。
+    """
+
+    def __init__(self, harness, mode: str = "sync") -> None:
         self.h = harness
+        self.mode = mode if mode in ("sync", "pool") else "sync"
         self._ready: list[str] = []
+        self._claims: dict[str, Claim] = {}
+        self._claim_history: list[Claim] = []
         self._lock = threading.RLock()
 
     def push(self, task_id: str) -> None:
@@ -611,6 +645,90 @@ class Scheduler:
 
     def is_empty(self) -> bool:
         return not self._ready
+
+    # ---- claim / lease / fencing（P0-10）----------------------------
+    @property
+    def claims(self) -> dict[str, Claim]:
+        with self._lock:
+            return dict(self._claims)
+
+    @property
+    def claim_history(self) -> list[Claim]:
+        with self._lock:
+            return list(self._claim_history)
+
+    def claim_of(self, acb_id: str) -> Claim | None:
+        with self._lock:
+            return self._claims.get(acb_id)
+
+    def _epoch_now(self, run_id: str | None) -> int:
+        """当前 epoch（run 层优先，无 run 隔离则全局）；claim 的 fence 基准。"""
+        try:
+            return int(self.h.intents.get_epoch(run_id or None))
+        except Exception:  # noqa: BLE001  # 读失败不得阻断 claim
+            return 0
+
+    def _claim_locked(self, acb_id: str, worker_id: str | None,
+                      acb: ACB | None) -> Claim | None:
+        """临界区内的 claim（调用方已持 `_lock`）。
+
+        有效租约归**他人** → `None`（不得双持）；租约到期 → 原子
+        `supervisor_note_crash(old)` 后重 claim（epoch 单调递增）。
+        """
+        now = int(self.h.clock.now_ms())
+        cur = self._claims.get(acb_id)
+        if (cur is not None and cur.lease_until_ms > now
+                and cur.worker_id != (worker_id or "")):
+            return None
+        attempt = 1 if cur is None else cur.attempt + 1
+        if cur is not None and acb is not None:
+            try:
+                self.h.supervisor_note_crash(acb)   # revoke + bump_epoch + 落盘
+            except Exception:  # noqa: BLE001  # 回收失败不得阻断重新 claim
+                pass
+        run_id = getattr(acb, "run_id", "") if acb is not None else ""
+        fence = self._epoch_now(run_id)
+        if cur is not None and fence <= cur.fence_epoch:
+            # 兜底：epoch 必须严格单调（否则旧 worker 的写会通过 fence）
+            fence = cur.fence_epoch + 1
+            try:
+                fence = max(fence, int(self.h.bump_epoch(run_id=run_id or None)))
+            except Exception:  # noqa: BLE001
+                pass
+        claim = Claim(acb_id=acb_id, worker_id=worker_id or "",
+                      lease_until_ms=now + int(self.h.claim_lease_ms),
+                      attempt=attempt, fence_epoch=fence)
+        self._claims[acb_id] = claim
+        self._claim_history.append(claim)
+        if acb is not None:
+            acb.claim_epoch = fence
+            acb.claim_worker = claim.worker_id
+        return claim
+
+    def claim(self, acb_id: str, worker_id: str | None = None) -> Claim | None:
+        with self._lock:
+            return self._claim_locked(acb_id, worker_id, self.h.acbs.get(acb_id))
+
+    def pop_claimed(self, worker_id: str | None = None
+                    ) -> tuple[str, Claim | None] | None:
+        """同一锁内「出队 + claim」（pool 模式唯一 pop 所有者）。"""
+        with self._lock:
+            if not self._ready:
+                return None
+            key = self._ready.pop(0)
+            acb = self.h.acbs.get(key)
+            return key, self._claim_locked(key, worker_id, acb)
+
+    def release_claim(self, acb_id: str, worker_id: str | None = None) -> bool:
+        """释放 claim（仅持有者可释放）；幂等。"""
+        with self._lock:
+            cur = self._claims.get(acb_id)
+            if cur is None:
+                return False
+            if worker_id is not None and cur.worker_id != worker_id:
+                return False
+            self._claims.pop(acb_id, None)
+            return True
 
 
 class RunCoordinator:
@@ -837,6 +955,27 @@ class ReconcileLoop:
                 task["state"] = TaskState.DONE
                 fixed += 1
         return fixed
+
+    def scan_deadlines(self, now_ms: int) -> int:
+        """S13d §2.5：aging（**墙钟**）扫描 —— 唯一超时驱动面的调度侧入口。
+
+        `aging_ms` 与步数语义的 `aging_max` 是**两套**东西（B-4）：这里只看
+        `aging_deadline`（`try_admit` 成功后设 `now + aging_ms`），到点 →
+        `Harness._aging_timeout`（`ADMITTED → INADMISSIBLE` + 结算）。
+
+        返回本次处理的 ACB 数（供调用方观测；0 = 无到期项）。
+        """
+        now = int(now_ms)
+        acted = 0
+        for acb in list(self.h.acbs.values()):
+            if acb.state is not TaskState.ADMITTED:
+                continue
+            deadline = getattr(acb, "aging_deadline", None)
+            if deadline is None or now < int(deadline):
+                continue
+            self.h._aging_timeout(acb)
+            acted += 1
+        return acted
 
 
 _UNSET = object()          # S13a P0-1：三态哨兵（absent ≠ None）

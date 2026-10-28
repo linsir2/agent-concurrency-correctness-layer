@@ -267,6 +267,10 @@ class AgentRuntime:
         if not self.h.policy.check_capability(
                 acb.id, token, action.tool, action.resource or ""):
             return Result(Status.DENIED_CAPABILITY, {"tool": action.tool})
+        # S13d §2.5 P0-10：claim fencing —— 旧 worker 不得推进任何副作用。
+        if self.h._claim_fenced(acb):
+            return Result(Status.REJECT_STALE, {
+                "reason": "claim_fenced", "acb_id": acb.id})
         idem_key = self.h.idem_key(acb, action, i)
         st = self.h.effects.state(idem_key)
         if st == "CONFIRMED":
@@ -363,6 +367,13 @@ class AgentRuntime:
                      else None),
             lambda: "MAX_STEPS" if acb.step > self.h.max_steps else None,
             lambda: "NO_PROGRESS" if acb.no_progress_steps > self.h.aging_max else None,
+            # S13d §2.5：aging（墙钟）谓词 —— 必须以 `aging_deadline is not None`
+            # 为门，且放在既有谓词**之后**（否则 `test_guard_predicate_order_and_
+            # failure_reason` 的顺序断言会红）。
+            lambda: ("AGING_TIMEOUT"
+                     if acb.aging_deadline is not None
+                     and self.h.clock.now_ms() >= int(acb.aging_deadline)
+                     else None),
         ]
 
     def _renew_or_fail(self, acb: ACB) -> str | None:
@@ -395,7 +406,7 @@ class AgentRuntime:
         """
         exhausted = False
         for rid in list(acb.reservation_ids):
-            result = self.h.budget.consume(rid, amount)
+            result = self.h.budget.consume(rid, amount, acb=acb)
             if result.status == Status.OK:
                 return Status.OK
             if result.status == Status.BUDGET_EXHAUSTED:

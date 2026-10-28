@@ -82,7 +82,8 @@ class BudgetManager(Protocol):
     def reserve(self, node_id: str, amount: int) -> Optional[Reservation]:
         ...
 
-    def consume(self, reservation_id: str, amount: int = 1) -> Result:
+    def consume(self, reservation_id: str, amount: int = 1, *,
+                acb: Optional[ACB] = None) -> Result:
         ...
 
     def release(self, reservation_id: str) -> int:

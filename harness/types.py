@@ -187,6 +187,13 @@ TRANSITIONS: dict[tuple[TaskState, str], TaskState] = {
     (TaskState.REPLANNING, "replan_budget_exhausted"): TaskState.DEAD_LETTER,
     (TaskState.INADMISSIBLE, "escalate"): TaskState.REPLANNING,
     (TaskState.INADMISSIBLE, "give_up"): TaskState.FAILED,
+    # S13d §2.5：aging（墙钟）—— 准入后迟迟未被调度 → INADMISSIBLE（非终态）。
+    # P1-1：INADMISSIBLE 非终态 → Run 永不 finalize，故必须给两条出路：
+    #   ① 单次超时可 `readmit` 重新准入（→ PLANNED，重新 try_admit）；
+    #   ② 累计 N 次超时 → `aging_exhausted`（真终态 DEAD_LETTER）。
+    (TaskState.ADMITTED, "aging_timeout"): TaskState.INADMISSIBLE,
+    (TaskState.INADMISSIBLE, "readmit"): TaskState.PLANNED,
+    (TaskState.INADMISSIBLE, "aging_exhausted"): TaskState.DEAD_LETTER,
 }
 
 # 表 A 末行：除终态外，任何状态遇用户取消 → CANCELLED
@@ -348,3 +355,7 @@ class ACB:
     superseded: bool = False              # R7：已被 replan/requeue 取代的旧 ACB
     parent_id: str = ""                   # 父 ACB id（spawn_child 用，空 = 无父）
     children_ids: list = field(default_factory=list)  # [(acb_id, checkpoint_ref)]
+    # ---- S13d §2.5：Scheduler claim + fencing（P0-10）----
+    claim_epoch: int = 0                  # 本 worker 持有的 fence epoch（写路径比对）
+    claim_worker: str = ""                # 当前 claim 的 worker_id（可观测性）
+    aging_count: int = 0                  # 累计 aging 超时次数（>= N → DEAD_LETTER）

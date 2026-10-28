@@ -10,6 +10,7 @@ import hashlib
 import itertools
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 
 from .auth import Signer
@@ -42,6 +43,11 @@ from .types import (ACB, TASK_TERMINAL, EventKind, Mode, ReceiptConflict,
                     ResultEnvelope, Result, Status, TaskState, Write, advance)
 from .workspace import WorkspaceManager, WorkspaceVersionStore
 from .rebase import DELETE
+
+
+# S13d §2.5 P0-9：worker 内嵌套 `run_task` 一律内联；该上限只用于**防递归**
+# （不是 spawn 的父子层数 `spawn_depth`，两者语义不同）。
+_MAX_INLINE_DEPTH = 8
 
 
 class ReceiptScanFailed(RuntimeError):
@@ -157,7 +163,13 @@ class Harness:
                  replan_budget: int = 2,
                  spawn_depth: int = 1,
                  max_fanout: int = 6,
-                 min_budget_per_child: int = 1) -> None:
+                 min_budget_per_child: int = 1,
+                 scheduler_mode: str = "sync",
+                 pool_workers: int = 4,
+                 pool_timeout_s: float = 120.0,
+                 claim_lease_ms: int | None = None,
+                 aging_ms: int = 0,
+                 aging_max_attempts: int = 3) -> None:
         if epoch_scope not in ("run", "global"):
             raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
         if isinstance(replan_budget, bool) or not isinstance(replan_budget, int) \
@@ -181,6 +193,37 @@ class Harness:
         self.max_fanout = max_fanout
         self.min_budget_per_child = min_budget_per_child
         self._spawn_counter = itertools.count(1)
+        # ---- S13d §2.5：Scheduler 模式 + claim 租约 + aging（墙钟）----
+        if scheduler_mode not in ("sync", "pool"):
+            raise ValueError(f"未知 scheduler_mode：{scheduler_mode!r}（sync|pool）")
+        if isinstance(pool_workers, bool) or not isinstance(pool_workers, int) \
+                or pool_workers < 1:
+            raise ValueError(f"非法 pool_workers：{pool_workers!r}（>=1 的整数）")
+        if isinstance(aging_ms, bool) or not isinstance(aging_ms, int) or aging_ms < 0:
+            raise ValueError(f"非法 aging_ms：{aging_ms!r}（>=0 的整数，0=禁用）")
+        if (isinstance(aging_max_attempts, bool)
+                or not isinstance(aging_max_attempts, int)
+                or aging_max_attempts < 1):
+            raise ValueError(
+                f"非法 aging_max_attempts：{aging_max_attempts!r}（>=1 的整数）")
+        self.scheduler_mode = scheduler_mode
+        self.aging_ms = int(aging_ms)
+        self.aging_max_attempts = int(aging_max_attempts)
+        # claim 租约 TTL 必须覆盖「单 action 上界」：至少 >= 资源租约 `lease_ms`，
+        # 否则一个慢 action 期间 claim 就会过期 → 第二个 worker 合法重 claim。
+        claim_ttl = lease_ms if claim_lease_ms is None else int(claim_lease_ms)
+        if claim_ttl < int(lease_ms):
+            raise ValueError(
+                f"claim_lease_ms({claim_ttl}) 必须 >= lease_ms({lease_ms})"
+                "（否则单 action 未完成即可被重 claim）")
+        self.claim_lease_ms = claim_ttl
+        self.pool_workers = int(pool_workers)
+        self.pool_timeout_s = float(pool_timeout_s)
+        self._tls = threading.local()             # in_worker / depth / worker_id
+        self._worker_ids = itertools.count(1)
+        self._pool = (ThreadPoolExecutor(max_workers=self.pool_workers,
+                                         thread_name_prefix="harness-worker")
+                      if scheduler_mode == "pool" else None)
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -295,10 +338,16 @@ class Harness:
         self.checkpoints.token_provider = self._effective_token
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)
-        self.scheduler = Scheduler(self)
+        self.scheduler = Scheduler(self, mode=scheduler_mode)
         self.run_coordinator = RunCoordinator(self)
         self.reconcile = ReconcileLoop(self)
         self.hitl = HITL()
+        # S13d §2.5 P0-10：claim 的 fence epoch 接入**写路径**（commit_batch /
+        # budget.consume / effects.begin / checkpoints.save）。sync 模式无 claim
+        # → 守卫恒为 False（保持既有语义，36 个同步用例零破坏）。
+        self.budget.claim_guard = self._claim_fenced
+        self.effects.claim_guard = self._claim_fenced
+        self.checkpoints.claim_guard = self._claim_fenced
 
         self.runtime = AgentRuntime(self)
         self.plans: dict[str, dict] = {}
@@ -916,6 +965,13 @@ class Harness:
             return Result(Status.UPSTREAM_FAILED, {
                 "reason": "writer_lease_held", "writer": self._writer_id,
             })
+        # S13d §2.5 P0-10：claim fencing —— 旧 worker（fence_epoch 落后）的写一律拒绝
+        # （sync 模式无 claim → 守卫恒 False，既有语义不变）。
+        if self._claim_fenced(acb):
+            return Result(Status.REJECT_STALE, {
+                "reason": "claim_fenced", "acb_id": acb.id,
+                "claim_epoch": int(getattr(acb, "claim_epoch", 0) or 0),
+            })
         resources = {w.resource for w in writes}
         if len(resources) != len(writes):                          # ① 同批重复 resource
             return Result(Status.INVALID_INPUT,
@@ -1488,7 +1544,16 @@ class Harness:
         return acb
 
     def run_task(self, acb: ACB, decisions, crash_at=None) -> Status | Result:
-        """外部直接调用入口：注册 + push 到调度器 + 执行 + 消费调度器。"""
+        """外部直接调用入口：注册 + push 到调度器 + 执行 + 消费调度器。
+
+        S13d §2.5：
+        - `scheduler_mode="sync"`（默认）保持原路径：push → **内联 `_run_one`**
+          → `finally drain`（不改动，36 个同步用例零破坏）；
+        - `scheduler_mode="pool"`：push → 提交 worker（claim + `_run_one` + drain），
+          本线程等待 `_await_completion`（`CrashInjected` 必须重抛）；
+        - **worker 内嵌套 `run_task`** → 一律内联（P0-9：池满时父等子会永久死锁），
+          并由 `_tls.depth` 防递归。
+        """
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
         # S13a P0-3：唯一超时驱动面（每轮调用）；recover 结束也调一次。
@@ -1500,11 +1565,98 @@ class Harness:
             return gate                     # 不 push、不 finalize（槽位已在等待态释放）
         if acb.state in TASK_TERMINAL:
             return self._terminal_status(acb)   # tick 已在本次调用中结算过期审批
+        if acb.state is TaskState.INADMISSIBLE and acb.failure == "AGING_TIMEOUT":
+            # aging 已判「超时未调度」→ 不得再借 `runtime.run` 无条件置 RUNNING 执行。
+            return Result(Status.DEADLINE_EXCEEDED, {"reason": "AGING_TIMEOUT"})
+        if self._in_worker():
+            # P0-9：worker 内嵌套 → 内联（不入队），否则池满时无 worker 可 pop。
+            return self._run_one_inline(acb, decisions, crash_at=crash_at)
         self.scheduler.push(acb.id)            # D10：调度器存 acb.id（不再存 task_id）
+        if self.scheduler_mode == "pool":
+            return self._run_task_pooled(acb, decisions, crash_at=crash_at)
         try:
             return self._run_one(acb, decisions, crash_at=crash_at)
         finally:
             self._drain_scheduler()            # D12：异常路径（含 CrashInjected）也消费队列
+
+    # ---- S13d §2.5：pool 调度（单一 pop 所有者 + claim/fencing）--------
+    def _in_worker(self) -> bool:
+        return bool(getattr(self._tls, "in_worker", False))
+
+    def _current_worker_id(self) -> str:
+        wid = getattr(self._tls, "worker_id", "")
+        return wid or f"local-{threading.get_ident()}"
+
+    def _run_one_inline(self, acb: ACB, decisions=None, crash_at=None):
+        """worker 内的嵌套执行（**不入队**）；`_tls.depth` 防递归。"""
+        depth = int(getattr(self._tls, "depth", 0) or 0)
+        if depth >= _MAX_INLINE_DEPTH:
+            self._drain_skipped.append((acb.id, "inline_depth_exceeded"))
+            return Result(Status.INVALID_INPUT, {"reason": "inline_depth_exceeded"})
+        self._tls.depth = depth + 1
+        try:
+            return self._run_one(acb, decisions, crash_at=crash_at)
+        finally:
+            self._tls.depth = depth
+
+    def _run_task_pooled(self, acb: ACB, decisions, crash_at):
+        """提交一个 worker 并等待；**不在本线程 drain**（单一 pop 所有者 = worker）。"""
+        if self._pool is None:                 # 防御：mode=pool 必有池
+            return self._run_one(acb, decisions, crash_at=crash_at)
+        worker_id = f"W{next(self._worker_ids)}-{acb.id}"
+        future = self._pool.submit(self._worker_main, acb, decisions,
+                                   crash_at, worker_id)
+        return self._await_completion(future)
+
+    def _worker_main(self, acb: ACB, decisions, crash_at, worker_id: str):
+        """worker 入口：claim → `_run_one` → drain（异常时不 drain，防双跑）。"""
+        self._tls.in_worker = True
+        self._tls.worker_id = worker_id
+        self._tls.depth = 0
+        crashed = False
+        try:
+            claim = self.scheduler.claim(acb.id, worker_id)
+            if claim is None:
+                # 同一 ACB 的有效租约归其他 worker → 绝不双跑。
+                self._drain_skipped.append((acb.id, "claim_held"))
+                return Status.DEADLINE_EXCEEDED
+            try:
+                return self._run_one(acb, decisions, crash_at=crash_at)
+            finally:
+                self.scheduler.release_claim(acb.id, worker_id)
+        except BaseException:
+            # CrashInjected（BaseException）必须穿透到等待侧；且**不得再 drain**
+            # （否则重复 ready 键会在崩溃后被再次消费 → 双跑）。
+            crashed = True
+            raise
+        finally:
+            try:
+                if not crashed:
+                    # 单一 pop 所有者：worker 自己消费队列（`in_worker` 仍为 True，
+                    # 期间嵌套 run_task 继续内联 → 无池满死锁）。
+                    self._drain_scheduler()
+            finally:
+                self._tls.in_worker = False
+                self._tls.depth = 0
+                self._tls.worker_id = ""
+
+    def _await_completion(self, future, *, timeout_s: float | None = None):
+        """等待 worker 完成：超时可取消、异常（含 `BaseException`）在等待侧重抛。
+
+        `ThreadPoolExecutor` 会把 `BaseException` 收进 `Future`；不调 `result()`
+        则既不抛也不结束。这里统一 `result(timeout)`，并保证 `CrashInjected`
+        不被吞掉（S13d §2.5 / B-3）。
+        """
+        timeout = self.pool_timeout_s if timeout_s is None else timeout_s
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError:
+            future.cancel()                    # 可取消（已运行则为 best-effort）
+            self._drain_skipped.append(("", "worker_timeout"))
+            raise
+        finally:
+            if not future.done():
+                future.cancel()
 
     # ---- S13c §2.4：spawn_child -------------------------------------
     def _spawn_depth_of(self, acb: ACB) -> int:
@@ -1929,6 +2081,92 @@ class Harness:
                     self._record_approval(acb, "timeout", "APPROVAL_TIMEOUT")
             self.intents.revoke_all(acb.id)  # 释放租约
             self._finalize(acb)              # 结算预算 / 释放槽位
+        # S13d §2.5 / B-4：aging（墙钟）与 HITL 超时共用**唯一**驱动面；
+        # 扫描入口在 ReconcileLoop（`scan_deadlines`），便于观测/替换。
+        self.reconcile.scan_deadlines(now)
+
+    # ---- S13d §2.5：aging（墙钟 deadline）+ claim fencing --------------
+    def _arm_aging(self, acb: ACB) -> None:
+        """准入成功后起算 aging（`aging_ms=0` = 禁用，不改既有语义）。"""
+        if self.aging_ms <= 0:
+            return
+        acb.aging_deadline = int(self.clock.now_ms()) + int(self.aging_ms)
+
+    def _aging_timeout(self, acb: ACB) -> None:
+        """到期未调度：单次 → INADMISSIBLE（可 readmit）+ 结算；累计 N → DEAD_LETTER。
+
+        P1-1：`INADMISSIBLE` 是**非终态**，若不给出路 Run 永不 finalize。故
+        ① 每次超时都结算租约/预算/槽位（`fail-closed`，不占资源）；
+        ② 超过 `aging_max_attempts` → `aging_exhausted` 走真终态并传播 failure。
+        """
+        with self._transition_lock(acb):
+            if acb.state is not TaskState.ADMITTED:
+                return
+            count = int(getattr(acb, "aging_count", 0) or 0) + 1
+            acb.aging_count = count
+            if count >= self.aging_max_attempts:
+                # 先走 `aging_timeout`（ADMITTED → INADMISSIBLE）再 `aging_exhausted`
+                # （INADMISSIBLE → DEAD_LETTER）：只用**已声明**的边，状态机不留暗门。
+                if advance(acb, "aging_timeout") != Status.OK:
+                    return
+                if advance(acb, "aging_exhausted") != Status.OK:
+                    return
+                acb.failure = "AGING_EXHAUSTED"
+                acb.aging_deadline = None
+                self.intents.revoke_all(acb.id)
+                self._dead_letter_after_replan(acb)      # settle+归档+传播+落盘
+                plan = self.plans.get(acb.run_id)
+                if plan and acb.task_id in plan.get("tasks", {}):
+                    plan["tasks"][acb.task_id]["state"] = acb.state
+                return
+            if advance(acb, "aging_timeout") != Status.OK:
+                return
+            acb.failure = "AGING_TIMEOUT"
+            acb.aging_deadline = None
+            self.intents.revoke_all(acb.id)
+            for rid in list(acb.reservation_ids):
+                self.budget.settle(rid)
+            acb.reservation_ids = []
+            self.slots.release(acb.id)
+            if acb.budget_node is not None:
+                node_id = acb.budget_node.node_id
+                if not self.budget.archive_node(node_id):
+                    self.budget.remove_node(node_id)
+                acb.budget_node = None
+            self._clear_admission(acb=acb)
+            self._safe_save(acb)
+
+    def readmit_after_aging(self, acb: ACB) -> ACB:
+        """S13d P1-1：单次 aging 超时后重新准入（`INADMISSIBLE --readmit--> PLANNED`）。
+
+        复用 `requeue_readmit` 的清理序列；`aging_count` 随新 ACB 继承，
+        累计到 `aging_max_attempts` 由 `tick` 判 `DEAD_LETTER`（真终态）。
+        """
+        with self._transition_lock(acb):
+            if acb.state is not TaskState.INADMISSIBLE:
+                return acb
+            if advance(acb, "readmit") != Status.OK:
+                return acb
+            count = int(getattr(acb, "aging_count", 0) or 0)
+            acb.needs_readmit = True
+            fresh = self.requeue_readmit(acb)
+            if fresh is not None and fresh is not acb:
+                fresh.aging_count = count
+                self._safe_save(fresh)
+            return fresh if fresh is not None else acb
+
+    def _claim_fenced(self, acb: ACB) -> bool:
+        """P0-10：写路径 fencing —— `acb.claim_epoch` 必须等于当前 claim 的 `fence_epoch`。
+
+        仅 `pool` 模式且存在**活跃 claim** 时生效；sync 模式无 claim → 恒 `False`
+        （保持既有写路径语义，36 个同步用例零破坏）。
+        """
+        if self.scheduler_mode != "pool":
+            return False
+        claim = self.scheduler.claim_of(acb.id)
+        if claim is None:
+            return False
+        return int(getattr(acb, "claim_epoch", 0) or 0) != int(claim.fence_epoch)
 
     def _run_one(self, acb: ACB, decisions=None, crash_at=None) -> Status:
         """执行体（§2.6）：`runtime.run` + `_finalize`；**不 push、不 drain**（防递归）。"""
@@ -1947,27 +2185,57 @@ class Harness:
           跑错代际 ACB / 双跑；
         - 另按 `(run_id, task_id, plan_version)` 过滤陈旧代际（旧 ACB 即使仍
           ADMITTED 也不跑）；
-        - D11：被跳过的键记录原因到 `_drain_skipped`（不再静默 continue）。
+        - D11：被跳过的键记录原因到 `_drain_skipped`（不再静默 continue）；
+        - **S13d §2.5**：`pool` 模式在同一把 scheduler 锁内「pop + claim」——
+          只有拿到 claim 的 worker 执行（单一 pop 所有者）。
         """
+        if self.scheduler_mode == "pool":
+            self._drain_scheduler_claimed()
+            return
         while True:
             key = self.scheduler.pop()
             if key is None:
                 break
-            acb = self.acbs.get(key)
-            if acb is None:
-                self._drain_skipped.append((key, "unknown_acb"))
+            reason = self._drain_skip_reason(key)
+            if reason is not None:
+                self._drain_skipped.append((key, reason))
                 continue
-            if acb.needs_readmit:
-                self._drain_skipped.append((key, "needs_readmit"))
+            self._run_one(self.acbs[key])
+
+    def _drain_scheduler_claimed(self) -> None:
+        """pool 模式的 drain：pop+claim → 校验 → 执行 → 释放 claim。"""
+        worker_id = self._current_worker_id()
+        while True:
+            got = self.scheduler.pop_claimed(worker_id)
+            if got is None:
+                break
+            key, claim = got
+            if claim is None:
+                # 有效租约归其他 worker（同 id 的重复 ready 键）→ 绝不双跑。
+                self._drain_skipped.append((key, "claim_held"))
                 continue
-            if acb.state is not TaskState.ADMITTED:
-                # PLANNED / 已终态等：按设计不调度，但记录原因（D11）
-                self._drain_skipped.append((key, f"state={acb.state.value}"))
-                continue
-            if not self._is_current_plan_version(acb):
-                self._drain_skipped.append((key, "stale_plan_version"))
-                continue
-            self._run_one(acb)
+            try:
+                reason = self._drain_skip_reason(key)
+                if reason is not None:
+                    self._drain_skipped.append((key, reason))
+                    continue
+                self._run_one(self.acbs[key])
+            finally:
+                self.scheduler.release_claim(key, worker_id)
+
+    def _drain_skip_reason(self, key: str) -> str | None:
+        """`None` = 可调度；否则为 `_drain_skipped` 的原因（D11，不静默）。"""
+        acb = self.acbs.get(key)
+        if acb is None:
+            return "unknown_acb"
+        if acb.needs_readmit:
+            return "needs_readmit"
+        if acb.state is not TaskState.ADMITTED:
+            # PLANNED / 已终态等：按设计不调度，但记录原因（D11）
+            return f"state={acb.state.value}"
+        if not self._is_current_plan_version(acb):
+            return "stale_plan_version"
+        return None
 
     def _is_current_plan_version(self, acb: ACB) -> bool:
         """D10：同 `(run_id, task_id)` 存在**更新代际** ADMITTED ACB 时，旧代际不调度。
@@ -2604,6 +2872,8 @@ class Harness:
             acb.hitl_outcome = dict(ho) if isinstance(ho, dict) else None
             acb.replan_count = int(data.get("replan_count", 0) or 0)
             acb.replan_attempts = int(data.get("replan_attempts", 0) or 0)
+            # S13d §2.5：aging 计数跨恢复继承（否则重规划/重准入会无限超时）
+            acb.aging_count = int(data.get("aging_count", 0) or 0)
             # R7：被 replan/requeue 取代的旧 ACB 即使被旧 ref 恢复，也不得变成
             # 「QUARANTINED + needs_readmit」的僵尸与新 ACB 并存 → 直接终态。
             acb.superseded = bool(data.get("superseded", False))

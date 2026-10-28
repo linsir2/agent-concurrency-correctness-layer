@@ -386,9 +386,20 @@ class BudgetManager:
             self._check_local(node)
             return freed
 
-    def consume(self, reservation_id: str, amount: int = 1) -> Result:
+    def consume(self, reservation_id: str, amount: int = 1, *,
+                acb=None) -> Result:
+        """按预留消费预算。
+
+        S13d §2.5 P0-10：传入 `acb` 时先过 claim fencing（旧 worker 的
+        `claim_epoch` 落后 → `REJECT_STALE`，不消费、不写事件）。
+        """
         if not self._valid_amount(amount):
             return Result(Status.INVALID_INPUT, {"reason": "bad_amount", "amount": amount})
+        guard = getattr(self, "claim_guard", None)
+        if acb is not None and callable(guard) and guard(acb):
+            return Result(Status.REJECT_STALE, {
+                "reason": "claim_fenced", "acb_id": getattr(acb, "id", ""),
+                "reservation": reservation_id})
         found0 = self._reservations.get(reservation_id)
         run_id = (getattr(found0[0], "run_id", "") or self._run_id) if found0 else self._run_id
         durable = self._durable_epoch(run_id)
