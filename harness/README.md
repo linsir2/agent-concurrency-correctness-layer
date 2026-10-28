@@ -32,6 +32,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `harness/worktree.py` | L1 | S22（Z3 私有工作区） |
 | `harness/facade.py` | L5 | S22/S24（`RscSession` 门面；S24 增加 `verify` 提交前验证 + `semantic` 静态门禁） |
 | `harness/semantic.py` | L2 | S24-3（符号级语义冲突：零依赖 `ast`，仅 Python） |
+| `harness/merge_queue.py` | 适配 | S24-4（单写者 FIFO merge queue，验证与提交串行） |
 | `harness/integrations/` | 适配 | S22/S23（LangGraph / MCP / CrewAI / OpenAI Agents / AG2 / HTTP sidecar，可选依赖） |
 
 ## 测试
@@ -93,6 +94,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s24_verify.py` | S24 Verifier：合并视图拦住语义冲突、红/超时/无工作区拒绝、收据 `verified`、副本不污染 |
 | `tests/test_s24_experiment.py` | S24 实验冒烟：git 合并干净但检查红、无 verify 放行、有 verify 拒绝、修正后放行 |
 | `tests/test_s24_semantic.py` | S24-3 静态语义：改名/删模块检出、别名/星号/动态/注解/条件定义抑制、三态门禁、性能上界 |
+| `tests/test_s24_queue.py` | S24-4 队列：FIFO、容量满、超时、取消、队首重验拦住语义冲突、关闭清理 |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

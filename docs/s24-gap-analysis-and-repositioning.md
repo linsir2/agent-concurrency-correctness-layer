@@ -138,7 +138,7 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 | S24-1 | `session.verify(token, cmd, timeout)`：在「候选副本 + 账本合并视图 + 本次 pending」上跑命令；红/超时/无工作区 → 拒绝提交；结果写进 `spec["rsc_verify"]`，收据带 `verified` | ✅ 已实现（`harness/facade.py`），11 个用例 |
 | S24-2 | 适配器接入：`RscSession(verify_cmd=...)` 后 `apply` 自动先跑验证（无需改适配器代码） | ✅ 已生效；sidecar/MCP 响应新增 `verified` |
 | S24-3 | 符号级语义冲突检测：删除/改名符号仍被引用 → `Deny(semantic_conflict)`（不执行代码、零依赖、仅 Python） | ✅ 已实现（`harness/semantic.py` + `semantic=off|warn|block`），22 个用例 |
-| S24-4 | merge queue 集成：`apply` 成功后 rebase 到队首再验证 | ⬜ 未做 |
+| S24-4 | 进程内 merge queue：单写者 FIFO，「出队 → 最新账本重验 → 提交」串成一步 | ✅ 已实现（`harness/merge_queue.py` + `apply_queued`），9 个用例 |
 
 ### 5.1 S24-1 实现要点
 
@@ -163,6 +163,22 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 [3] 有 verify A=Receipt  B=Deny code=verify_failed   ← 拦住
 [4] B 改对     B=Receipt  verified=True         ← 放行
 ```
+
+### 5.5 S24-4 merge queue 要点
+
+- **关闭的窗口**：原来 `verify` 与 `commit` 之间存在 TOCTOU —— 两个 agent 各自在
+  「提交前视图」验证通过，然后先后提交，后者的验证没看见前者。队列让
+  「出队 → 在最新账本视图重验 → 提交」串成一步。
+- **API**：`RscSession(merge_queue={"capacity": 64, "max_wait_ms": 30_000})`；
+  `apply_queued()`（阻塞）/ `enqueue_queued()` + `wait_queued()` / `queue_depth()` /
+  `queue_status()` / `queue_cancel()`；默认 `merge_queue=None` 时原 `apply` 路径不变。
+- **失败语义**：容量满 → `Wait(QUEUE_FULL)`；超时 → `Wait(QUEUE_TIMEOUT)`；取消未开始票
+  → `Wait(QUEUE_CANCELLED)`；队首验证失败 → 该票 `Deny` 并被剔除，不连带他人。
+- **锁**：出队线程自己拿 `_op_lock(token)` 再走原提交路径 —— 调用方等待时不持锁，
+  所以不会与 `finish/abort` 互锁。
+- **v1 不做**：batch / speculation / 持久化队列 / 多节点；超时后已在执行的票不撤销，
+  若仍提交成功，宿主用同一幂等键重试会命中 `dedup`（诚实边界）。
+- **不是吞吐优化**：串行队列的吞吐 = 1/(verify+commit)；收益是「验证与提交同视图」。
 
 ### 5.4 S24-3 静态语义检测要点
 

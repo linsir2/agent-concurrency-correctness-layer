@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .harness import _EXT_KEY_CONFLICT
+from .merge_queue import QUEUE_FULL, MergeQueue
 from .rebase import DELETE
 from .semantic import detect as _detect_semantics
 from .storage.atomic import atomic_write
@@ -156,7 +157,8 @@ class RscSession:
                  verify_cmd=None, verify_required: bool = False,
                  verify_timeout_s: float = 120.0,
                  semantic: str = "off",
-                 semantic_ignore: tuple[str, ...] = ()) -> None:
+                 semantic_ignore: tuple[str, ...] = (),
+                 merge_queue: dict | None = None) -> None:
         self.h = harness
         self.tenant = str(tenant or "")
         self.token_ttl_ms = max(1, int(token_ttl_ms))
@@ -172,6 +174,14 @@ class RscSession:
         if self.semantic not in ("off", "warn", "block"):
             raise ValueError(f"semantic 必须是 off|warn|block，得到 {semantic!r}")
         self.semantic_ignore = tuple(str(x) for x in semantic_ignore)
+        # S24-4：可选单写者队列（默认关闭 → `apply` 路径字节不变）。
+        self._queue: MergeQueue | None = None
+        if merge_queue is not None:
+            cfg = dict(merge_queue)
+            self._queue = MergeQueue(
+                self._run_queued_ticket,
+                capacity=int(cfg.get("capacity", 64)),
+                max_wait_ms=int(cfg.get("max_wait_ms", 30_000)))
         self._lock = threading.RLock()
         self._op_locks: dict[str, threading.RLock] = {}
         self._index: dict[str, dict] = {}
@@ -370,6 +380,65 @@ class RscSession:
                 return Deny(f"stale_view:{resource}", code="stale_view")
         return Allow()
 
+
+
+    # ------------------------------------------------------------ merge queue
+    def _run_queued_ticket(self, ticket):
+        """出队线程入口：**自己拿 token 锁**再走原提交路径（避免与调用方互锁）。"""
+        with self._op_lock(ticket.token):
+            return self._apply_locked(ticket.token, ticket.writes,
+                                      ticket.idempotency_key, ticket.cost,
+                                      ticket.agent_id)
+
+    def enqueue_queued(self, token: str, writes: list, *,
+                       idempotency_key: str, cost: int = 1,
+                       agent_id: str = ""):
+        """入队（不阻塞）；队列满 → `Wait(QUEUE_FULL)`，未启用 → 直接 `apply` 结果。"""
+        if self._queue is None:
+            return self.apply(token, writes, idempotency_key=idempotency_key,
+                              cost=cost, agent_id=agent_id)
+        writes = list(writes)
+        if not writes:
+            return Deny("empty_writes")
+        if isinstance(cost, bool) or not isinstance(cost, int) or cost <= 0:
+            return Deny("bad_cost")
+        if cost > self.min_budget:
+            return Deny("cost_exceeds_reservation")
+        ticket = self._queue.enqueue(token, writes,
+                                     idempotency_key=idempotency_key,
+                                     cost=int(cost), agent_id=str(agent_id))
+        if ticket is None:
+            return Wait(QUEUE_FULL)
+        return ticket
+
+    def wait_queued(self, ticket, timeout_ms: int | None = None):
+        """等待出队结果；`ticket` 不是票（如已被拒）→ 原样返回。"""
+        if self._queue is None or not hasattr(ticket, "event"):
+            return ticket
+        return self._queue.wait(ticket, timeout_ms)
+
+    def apply_queued(self, token: str, writes: list, *,
+                     idempotency_key: str, cost: int = 1,
+                     agent_id: str = "", timeout_ms: int | None = None):
+        """入队并等待：串行「重验 + 提交」，关闭 verify→commit 的 TOCTOU 窗口。"""
+        ticket = self.enqueue_queued(token, writes,
+                                     idempotency_key=idempotency_key,
+                                     cost=cost, agent_id=agent_id)
+        return self.wait_queued(ticket, timeout_ms)
+
+    def queue_depth(self) -> int:
+        return 0 if self._queue is None else self._queue.depth()
+
+    def queue_status(self, ticket_id: str) -> dict | None:
+        return None if self._queue is None else self._queue.status(ticket_id)
+
+    def queue_cancel(self, ticket_id: str, reason: str = "") -> bool:
+        return False if self._queue is None else self._queue.cancel(ticket_id, reason)
+
+    def close(self) -> None:
+        """停止队列 worker（测试/退出）；未开始的票置为 `Wait(QUEUE_CANCELLED)`。"""
+        if self._queue is not None:
+            self._queue.close()
 
     # ------------------------------------------------------------ 静态语义
     def _semantic_view(self, worktree: str, pending=None):

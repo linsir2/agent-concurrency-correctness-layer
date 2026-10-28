@@ -107,6 +107,25 @@ chk("运行期兼容改动不报", detect(
     {"app/core.py": b"def f(x):\n    return x\n"},
     {"app/core.py": b"def f(x):\n    return x\ndef g():\n    return 1\n"}).ok)
 
+# ---------------------------------------------------------------- S24-4 merge queue
+chk("merge_queue 模块存在", (_ROOT / "harness/merge_queue.py").exists())
+_mq = _src("harness/merge_queue.py")
+chk("单写者 worker", "def _loop" in _mq and "popleft" in _mq)
+chk("FIFO 队列", "deque(" in _mq)
+chk("容量满信号", "QUEUE_FULL" in _mq)
+chk("超时信号", "QUEUE_TIMEOUT" in _mq)
+chk("取消未开始票", "def cancel" in _mq)
+_facade3 = _src("harness/facade.py")
+chk("默认关闭", "merge_queue: dict | None = None" in _facade3)
+chk("apply_queued 存在", "def apply_queued" in _facade3)
+chk("出队自持 token 锁", "with self._op_lock(ticket.token)" in _facade3)
+_qt = _src("tests/test_s24_queue.py")
+chk("用例覆盖队首重验", "test_head_reverify_blocks_semantic_conflict" in _qt)
+chk("用例覆盖容量/超时/取消",
+    "test_queue_capacity_returns_wait" in _qt
+    and "test_timeout_returns_wait" in _qt
+    and "test_cancel_pending_ticket" in _qt)
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)
@@ -129,6 +148,18 @@ with tempfile.TemporaryDirectory() as tmp:
         chk("非法 cmd 类型拒绝", False)
     except TypeError:
         chk("非法 cmd 类型拒绝", True)
+
+
+    # merge queue 运行期：入队→出队→提交
+    qs = RscSession(h, tenant="t", min_budget=1, worktrees=None,
+                    state_dir=str(pathlib.Path(tmp) / "q"),
+                    merge_queue={"capacity": 4})
+    qtok = qs.begin("q1", "qi", writes=["q.md"])
+    qr = qs.apply_queued(qtok.token, [("q.md", "qv")],
+                         idempotency_key="qk", agent_id="q1")
+    chk("队列提交成功", isinstance(qr, Receipt))
+    chk("队列深度归零", qs.queue_depth() == 0)
+    qs.close()
 
     # 显式失败记录 → apply 必须拒绝（即使没配 verify_cmd）
     import subprocess
