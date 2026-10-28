@@ -25,6 +25,7 @@ import hashlib
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -109,6 +110,22 @@ def _norm_cmd(cmd) -> list[str] | None:
     if not argv:
         raise ValueError("verify_cmd 不能为空")
     return argv
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """超时后杀**整个进程组**（S24-P0）。
+
+    `subprocess.run(timeout=...)` 只杀直接子进程：验证命令若自己再起子进程
+    （测试运行器/构建工具很常见），孙进程会继续跑并可能写文件、占端口。
+    `start_new_session=True` 让子进程成为组长，超时时 `killpg` 一次清干净。
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _safe_rel(root: str, rel: str) -> str | None:
@@ -543,12 +560,20 @@ class RscSession:
         started = time.monotonic()
         tree = self._verification_tree(str(worktree), pending=pending)
         try:
-            proc = subprocess.run(argv, cwd=tree, capture_output=True,
-                                  text=True, timeout=timeout, check=False)
-            code = proc.returncode
-            out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-        except subprocess.TimeoutExpired:
-            code, out = -1, f"verify_timeout after {timeout}s"
+            proc = subprocess.Popen(argv, cwd=tree, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True,
+                                    start_new_session=True)
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+                code = proc.returncode
+                out = ((stdout or "") + (stderr or "")).strip()
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
+                try:
+                    stdout, stderr = proc.communicate(timeout=5.0)
+                except subprocess.TimeoutExpired:   # 极端：组内仍有顽固进程
+                    stdout, stderr = "", ""
+                code, out = -1, f"verify_timeout after {timeout}s"
         except OSError as exc:
             code, out = -1, f"verify_spawn_failed: {exc}"
         finally:
