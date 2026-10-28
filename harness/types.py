@@ -367,6 +367,9 @@ class ACB:
     # `children_ids`，崩溃窗口内取消/恢复按此找回子或做孤儿结算。
     children_pending: dict = field(default_factory=dict)
     # ---- S13d §2.5：Scheduler claim + fencing（P0-10）----
-    claim_epoch: int = 0                  # 本 worker 持有的 fence epoch（写路径比对）
-    claim_worker: str = ""                # 当前 claim 的 worker_id（可观测性）
+    # X1：**仅作恢复后的可观测性**（来自快照 claim 字段），**绝不**作为写路径
+    # fencing 依据 —— fence 比较用「执行上下文 epoch」，不写回共享 ACB。
+    claim_epoch: int = 0                  # 快照中记录的 fence epoch（观测用）
+    claim_worker: str = ""                # 快照中记录的 worker_id（观测用）
+    claim_lease_until_ms: int = 0         # 快照中记录的 claim 租约到期（X7）
     aging_count: int = 0                  # 累计 aging 超时次数（>= N → DEAD_LETTER）

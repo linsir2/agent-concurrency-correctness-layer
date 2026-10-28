@@ -24,6 +24,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .event_log import EventLog
@@ -175,6 +176,9 @@ class CheckpointStore:
         self.budget = None           # S10a：由 Harness 注入（聚合值 + 游标同临界区读取）
         self.run_limits = None       # S10a：配置的 run 级上限（漂移检测基准）
         self._epoch = 0              # S10a：run 级 fencing epoch（内存版）
+        # X7：claim 快照来源（Harness 注入；返回 dict 或 None）。**无锁**读取，
+        # 避免 `store.lock → scheduler._lock` 与 claim 路径形成 AB-BA 环。
+        self.claim_provider = None
 
     def save(self, acb) -> str:
         # S13d §2.5 P0-10：claim fencing —— 旧 worker 的快照不得覆盖新 claim。
@@ -223,6 +227,39 @@ class CheckpointStore:
                 if aid:
                     ids.add(str(aid))
         return [(aid, self.latest_ref_for_acb(aid)) for aid in sorted(ids)]
+
+    def refs_all(self) -> list[tuple[str, str | None]]:
+        """X6：**全部** ACB（跨 run 反扫 `parent_id` 索引用）。"""
+        return [(aid, self._latest.get(aid)) for aid in sorted(self._latest)]
+
+    def update_children(self, acb_id: str, mutate) -> str | None:
+        """X3：在**最新快照**上原地改 `children_ids` 并写新快照（父不在内存时用）。
+
+        `mutate(children) -> children`，`children` 为 `[(acb_id, ref)]`。
+        返回新 ref；父快照缺失 → `None`。**绝不**用部分重建的 ACB 覆写整份
+        payload（那会丢掉 staged / 预算 / 能力等字段）。
+        """
+        ref = self._latest.get(acb_id)
+        payload = self._store.get(ref) if ref else None
+        if not isinstance(payload, dict):
+            return None
+        new_payload = copy.deepcopy(payload)
+        children = [(c[0], c[1] if len(c) > 1 else None)
+                    for c in (new_payload.get("children_ids") or [])
+                    if isinstance(c, (list, tuple)) and c]
+        new_payload["children_ids"] = _children_to_payload(mutate(children))
+        new_ref = f"CP{next(self._counter)}"
+        self._store[new_ref] = new_payload
+        self._latest[acb_id] = new_ref
+        run_id = str(new_payload.get("run_id") or "")
+        if run_id:
+            self._latest_run[run_id] = new_ref
+            self._run_acbs.setdefault(run_id, {})[acb_id] = (
+                int(new_ref[2:]) if new_ref[2:].isdigit() else 0)
+        key = (f"{run_id}\x00{new_payload.get('task_id', '')}"
+               f"\x00{new_payload.get('logical_subgoal_id', '')}")
+        self._latest_task[key] = new_ref
+        return new_ref
 
     # ---- S10a §3.4：run 级 fencing epoch（同一 flock 内 read-modify-write）----
     def read_epoch(self) -> int:
@@ -292,10 +329,22 @@ class CheckpointStore:
             }
         return out
 
+    def _claim_fields(self, acb) -> dict:
+        """X7：claim 快照（provider 无锁只读；缺失 → 三字段为 0/空）。"""
+        provider = getattr(self, "claim_provider", None)
+        if not callable(provider):
+            return {}
+        try:
+            data = provider(acb)
+        except Exception:  # noqa: BLE001  # 观测数据不得打挂落盘
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def _build_payload(self, acb) -> dict:
         """构造扁平 payload（内存 / 文件两版共用）。"""
         node = acb.budget_node
         view = self._budget_view(node)
+        claim = self._claim_fields(acb)
         return {
             "acb_id": acb.id,
             "run_id": acb.run_id,
@@ -358,6 +407,12 @@ class CheckpointStore:
             "superseded": bool(getattr(acb, "superseded", False)),
             # S13d §2.5：累计 aging 超时次数（跨恢复保证「超 N 次 → DEAD_LETTER」）
             "aging_count": int(getattr(acb, "aging_count", 0) or 0),
+            # X7：claim 三字段随快照落盘 —— 恢复后能判断「是否有在途 worker」，
+            # lease 已过期则立即释放并允许重 claim（见 `Harness._restore_acb`）。
+            "claim_epoch": int(claim.get("claim_epoch", 0) or 0),
+            "claim_worker": str(claim.get("claim_worker", "") or ""),
+            "claim_lease_until_ms": int(
+                claim.get("claim_lease_until_ms", 0) or 0),
             "parent_id": getattr(acb, "parent_id", "") or "",
             "children_ids": _children_to_payload(
                 getattr(acb, "children_ids", None)),
@@ -1055,6 +1110,83 @@ class FileCheckpointStore(CheckpointStore):
         key = f"{run_id}\x00{task_id}\x00{logical_subgoal_id}"
         return self._read_pointer(self._latest_path("latest_task", key),
                                   "latest_task", key)
+
+    def refs_all(self) -> list[tuple[str, str | None]]:
+        """X6：全部 ACB（读 `latest/` 指针目录；跨 run 反扫 `parent_id` 索引）。"""
+        ids: set[str] = set()
+        directory = self.root / "latest"
+        if directory.exists():
+            for path in directory.glob("*.json"):
+                data = self._read_pointer_doc(path)
+                if isinstance(data, dict) and data.get("acb_id"):
+                    ids.add(str(data["acb_id"]))
+        return [(aid, self.latest_ref_for_acb(aid)) for aid in sorted(ids)]
+
+    def update_children(self, acb_id: str, mutate) -> str | None:
+        """X3：在最新快照上原地改 `children_ids` 并写新快照（父不在内存时用）。"""
+        ref = self.latest_ref_for_acb(acb_id)
+        if not ref:
+            return None
+        try:
+            payload = self.load(ref)
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(payload, dict):
+            return None
+        children = [(c[0], c[1] if len(c) > 1 else None)
+                    for c in (payload.get("children_ids") or [])
+                    if isinstance(c, (list, tuple)) and c]
+        payload["children_ids"] = _children_to_payload(mutate(children))
+        return self._save_payload(payload)
+
+    def _save_payload(self, payload: dict) -> str:
+        """按 `save` 的信封/指针语义写一份**已有 payload**（不重建 ACB）。"""
+        h = SimpleNamespace(
+            id=str(payload.get("acb_id") or ""),
+            run_id=str(payload.get("run_id") or ""),
+            task_id=str(payload.get("task_id") or ""),
+            logical_subgoal_id=str(payload.get("logical_subgoal_id") or ""),
+            generation=int(payload.get("generation", 1) or 1),
+        )
+        with self._thread_lock:
+            with self._flock():
+                meta = self._read_meta_locked()
+                seq = int(meta.get("next_seq", 0) or 0)
+                meta["next_seq"] = seq + 1
+                atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
+                ref = (f"CP-{str(meta['store_uuid'])[:8]}-{seq:020d}-"
+                       f"{uuid.uuid4().hex[:12]}")
+                now_ms = int(time.time() * 1000)
+                header = {
+                    "format_version": _FORMAT_VERSION,
+                    "schema_version": _SCHEMA_VERSION,
+                    "ref": ref,
+                    "acb_id": h.id,
+                    "run_id": h.run_id,
+                    "task_id": h.task_id,
+                    "generation": h.generation,
+                    "save_seq": seq,
+                    "created_at_ms": now_ms,
+                    "event_cursor": int(payload.get("event_cursor") or 0),
+                }
+                encoded_payload = encode(payload)
+                payload_bytes = dumps(encoded_payload).encode("utf-8")
+                envelope = dict(header)
+                envelope["header_checksum"] = _sha256(dumps(header).encode("utf-8"))
+                envelope["payload_checksum"] = _sha256(payload_bytes)
+                envelope["payload"] = encoded_payload
+                ref_path = self._ref_path(ref)
+                self._ensure_dir(ref_path.parent)
+                self._write_new(ref_path, dumps(envelope).encode("utf-8"))
+                self._write_pointer(self._latest_path("latest", h.id),
+                                    ref, h, seq, now_ms)
+                self._write_pointer(self._latest_path("latest_run", h.run_id),
+                                    ref, h, seq, now_ms)
+                self._write_pointer(self._task_pointer_path(h), ref, h, seq, now_ms)
+                self._update_run_index(h, seq)
+                self._store[ref] = copy.deepcopy(payload)
+                self._meta = meta
+        return ref
 
 
 class EffectJournal:

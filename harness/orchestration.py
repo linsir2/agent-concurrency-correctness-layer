@@ -41,7 +41,12 @@ def _edge_endpoints(edge) -> tuple:
 # R3：**CANCELLED 不算前驱满足**。取消/失败代表依赖分支已死；若把 CANCELLED
 # 当「满足」，`_finalize` 会把后继推起来真跑（拿到了从未产出的输入）。
 # 取消必须由 `propagate_failure` 级联到后继，而不是放行。
-PREDECESSOR_SATISFIED = frozenset({TaskState.DONE})
+#
+# X2（S13 跨波次终审）：`DONE_PARTIAL` 是「有产出、未全覆盖」的**任务级终态**，
+# 必须算前驱满足（方案 a）。否则父汇总为 DONE_PARTIAL 后下游永久 PLANNED、
+# ready 集为空、Run 永不 finalize。更严的「输出不完整」约束应由 plan 的
+# `required_coverage` 表达，而不是把整条下游分支静默吊死。
+PREDECESSOR_SATISFIED = frozenset({TaskState.DONE, TaskState.DONE_PARTIAL})
 
 
 def _has_cycle(edges) -> bool:
@@ -629,8 +634,8 @@ class Claim:
     - `worker_id`：持有者身份（同一写者重入不视为他人）；
     - `lease_until_ms`：租约到期（墙钟，来自注入时钟）；到期后另一 worker 可重 claim；
     - `attempt`：重 claim 次数（首 claim = 1）；
-    - `fence_epoch`：重 claim 时**原子**推进的 epoch；写路径比对 `acb.claim_epoch`
-      —— 旧 worker 的写会被判 `REJECT_STALE`。
+    - `fence_epoch`：重 claim 时**原子**推进的 epoch；写路径比对「执行上下文
+      epoch」（X1：绝不写回共享 ACB）—— 旧 worker 的写会被判 `REJECT_STALE`。
     """
     acb_id: str
     worker_id: str
@@ -656,6 +661,10 @@ class Scheduler:
         self._ready: list[str] = []
         self._claims: dict[str, Claim] = {}
         self._claim_history: list[Claim] = []
+        # X1：被**撤销**的 claim 的 epoch 水位（acb_id → 最小有效 epoch）。
+        # claim 释放后仍要 fence 旧 worker，故不能只看 `_claims`（否则一释放
+        # `_claim_fenced` 就恒 False，审批超时被在途 worker 抹掉）。
+        self._revoked: dict[str, int] = {}
         self._lock = threading.RLock()
 
     def push(self, task_id: str) -> None:
@@ -684,6 +693,19 @@ class Scheduler:
     def claim_of(self, acb_id: str) -> Claim | None:
         with self._lock:
             return self._claims.get(acb_id)
+
+    def peek_claim(self, acb_id: str) -> Claim | None:
+        """**无锁**只读（供 `checkpoint._build_payload` 构造 claim 快照）。
+
+        走锁会形成 `scheduler._lock → store.lock`（claim_kernel → save）与
+        `store.lock → scheduler._lock`（payload）之间的 AB-BA 环；dict 单键读
+        在 CPython 下原子，这里只用于观测量，故可无锁。
+        """
+        return self._claims.get(acb_id)
+
+    def revoked_epoch(self, acb_id: str) -> int | None:
+        """被撤销 claim 的 epoch 水位（无锁只读；旧上下文 `<` 水位 → fenced）。"""
+        return self._revoked.get(acb_id)
 
     def _epoch_now(self, run_id: str | None) -> int:
         """当前 epoch（run 层优先，无 run 隔离则全局）；claim 的 fence 基准。"""
@@ -724,9 +746,9 @@ class Scheduler:
                       attempt=attempt, fence_epoch=fence)
         self._claims[acb_id] = claim
         self._claim_history.append(claim)
-        if acb is not None:
-            acb.claim_epoch = fence
-            acb.claim_worker = claim.worker_id
+        # X1：**绝不**把 fence 写回共享 ACB —— 旧 worker 与主线程持同一对象，
+        # 写回会让双方 epoch 恒等 → `_claim_fenced` 永远 False（审批门被绕过）。
+        # 执行上下文（线程本地）由 worker 入口绑定，见 `Harness.claim_scope`。
         return claim
 
     def claim(self, acb_id: str, worker_id: str | None = None) -> Claim | None:
@@ -744,7 +766,11 @@ class Scheduler:
             return key, self._claim_locked(key, worker_id, acb)
 
     def release_claim(self, acb_id: str, worker_id: str | None = None) -> bool:
-        """释放 claim（仅持有者可释放）；幂等。"""
+        """正常释放 claim（仅持有者可释放）；幂等。
+
+        **不**记录撤销水位 —— 正常完成/交接后同一 epoch 的后续 claim 合法
+        （`test_s13_11` 的重复 ready 键依赖此语义）。
+        """
         with self._lock:
             cur = self._claims.get(acb_id)
             if cur is None:
@@ -753,6 +779,32 @@ class Scheduler:
                 return False
             self._claims.pop(acb_id, None)
             return True
+
+    def revoke_claim(self, acb_id: str, worker_id: str | None = None,
+                     watermark: int | None = None) -> Claim | None:
+        """**撤销** claim（X1）：释放并记录 epoch 水位；旧上下文低于水位 → fenced。
+
+        与 `release_claim` 分离：撤销（tick 超时 / supervisor 崩溃回收）后，
+        旧 worker 即使已经没有 claim 可比对，也必须被判 stale，否则解锁后继续
+        执行会把审批超时覆盖成 DONE。水位取 `max(原 fence, watermark)`，调用方
+        传入 bump 之后的 epoch。
+        """
+        with self._lock:
+            cur = self._claims.pop(acb_id, None)
+            if cur is None:
+                # 没有活跃 claim 时也要推进水位（如 tick 在 claim 已释放后判超时）
+                if watermark is not None:
+                    self._revoked[acb_id] = max(
+                        int(self._revoked.get(acb_id, 0)), int(watermark))
+                return None
+            if worker_id is not None and cur.worker_id != worker_id:
+                self._claims[acb_id] = cur          # 归还（非持有者不得撤销）
+                return None
+            mark = cur.fence_epoch
+            if watermark is not None:
+                mark = max(mark, int(watermark))
+            self._revoked[acb_id] = max(int(self._revoked.get(acb_id, 0)), mark)
+            return cur
 
 
 class RunCoordinator:
@@ -881,6 +933,15 @@ class RunCoordinator:
             # 保留 info 供孤儿结算使用
             if not isinstance(info, dict):
                 pending[cid] = {}
+        # X6：跨 run 子（`spec.spawn.parent_id`）反向索引 —— 老 checkpoint 的
+        # `children_ids` 缺失时，子可能既不在父 run 枚举、也不在上面的三源里。
+        # 不补这一步 → 取消**静默漏掉**跨 run 子。
+        self.h._ensure_children_index()
+        known = {str(cid) for _child, _ref, cid in entries}
+        for cid in sorted(self.h._children_index.get(acb.id, ())):
+            if cid in seen or cid in known:
+                continue
+            entries.append((self.h.acbs.get(cid), None, cid))
         for child, ref, cid in entries:
             if child is not None:
                 self._cancel_one(child, seen, cascade=True)

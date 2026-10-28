@@ -68,6 +68,10 @@ class AgentRuntime:
             return self.h._terminal_status(acb)
         acb.state = TaskState.RUNNING
         for decision in decisions:
+            # X1：主线程 `tick` 可能在上一 turn 之后把本 ACB 判为终态（审批超时）。
+            # 终态一旦成立就不再推进（不跑下一个 action、不 append TASK_COMPLETED）。
+            if acb.state in TASK_TERMINAL:
+                return self.h._terminal_status(acb)
             acb.turn_seq = decision.turn_seq
             acb.cursor = self.h.event_log.tail()          # §2.3：save 前对齐全局水位
             acb.heartbeat_at = self.h.clock.now_ms()      # D13b：心跳推进（不再只恢复）
@@ -82,6 +86,9 @@ class AgentRuntime:
 
             progressed = False
             for i, action in enumerate(decision.actions):
+                # X1：每个 action 前复查终态（tick 可能在上一个动作执行期间判超时）。
+                if acb.state in TASK_TERMINAL:
+                    return self.h._terminal_status(acb)
                 if crash_at and crash_at == (acb.turn_seq, i):
                     # 模拟「工具已调用但副作用未确认」→ effect 停在 UNKNOWN（文档 §5.8⑤）
                     if action.kind == "tool":
@@ -103,6 +110,14 @@ class AgentRuntime:
                 if acb.state is TaskState.QUARANTINED:
                     # P0-3：收据冲突等已隔离 → 直接返回，不改状态、不覆盖 failure
                     return st
+                # X1：动作执行期间被外部（tick 超时 / 取消）判终态 → 立即收手，
+                # 绝不覆盖 failure、绝不继续后续 action。仅当**本动作自身**把
+                # ACB 置为终态且 failure 与返回值一致（BUDGET_EXHAUSTED /
+                # HITL 拒绝）时沿用 st，避免把自身终态误报成 SEMANTIC_REJECTED。
+                if acb.state in TASK_TERMINAL:
+                    if not (isinstance(st, (Status, Result))
+                            and acb.failure in (st.value,)):
+                        return self.h._terminal_status(acb)
                 if st in (Status.OK, Status.VALID):      # D13b：本 turn 有进展
                     progressed = True
                 if st in (Status.CANCELLED, Status.APPROVAL_TIMEOUT, Status.DENIED):
@@ -136,6 +151,10 @@ class AgentRuntime:
                 st = self.handle_commit_result(acb, st)
             if acb.state is TaskState.QUARANTINED:
                 return st
+            # X1：turn 末结算期间被外部判终态（审批超时/取消）→ 不覆盖、不置 DONE。
+            if acb.state in TASK_TERMINAL:
+                return (self.h._terminal_status(acb)
+                        if st in (Status.OK, Status.VALID) else st)
             if st != Status.OK:
                 acb.state = TaskState.FAILED
                 acb.failure = st.value
@@ -150,6 +169,10 @@ class AgentRuntime:
                 if acb.no_progress_steps >= self.h.aging_max:
                     acb.aging_deadline = self.h.clock.now_ms()   # D13b：到达 aging_max 设定期限
 
+        # X1：置 DONE 之前**最后复查**终态 —— 若 tick 已判 FAILED(APPROVAL_TIMEOUT)，
+        # 绝不 append TASK_COMPLETED、绝不把终态改回 DONE（审批超时不可被抹掉）。
+        if acb.state in TASK_TERMINAL:
+            return self.h._terminal_status(acb)
         acb.state = TaskState.DONE
         # S9 §2.3.7：TASK_COMPLETED 作 head 锚点（run_id/receipt_head/receipt_count）
         scope = (acb.run_id, acb.logical_subgoal_id)
@@ -292,7 +315,12 @@ class AgentRuntime:
                 acb.state = TaskState.FAILED
                 acb.failure = "BUDGET_EXHAUSTED"
             return Result(st)
-        self.h.effects.begin(acb, action)
+        # X8：`effects.begin` 被 claim fencing 拒时返回 `""` —— 视为 stale，
+        # 绝不 confirm、绝不 append TOOL_COMPLETED（否则旧 worker 仍写副作用）。
+        effect_id = self.h.effects.begin(acb, action)
+        if effect_id == "":
+            return Result(Status.REJECT_STALE, {
+                "reason": "claim_fenced", "acb_id": acb.id})
         self.h.effects.confirm(idem_key, acb.id)
         self.h.event_log.append(EventKind.TOOL_COMPLETED, idem_key,
                                 {"tool": action.tool}, producer=acb.id,

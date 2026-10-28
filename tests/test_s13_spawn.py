@@ -935,6 +935,125 @@ def test_result_envelope_produces_done_partial_and_is_idempotent():
     assert _tool_completed(h, "read") == []
 
 
+# ============================================================ X3 子 ref 复用
+def test_s13_x3_replan_child_updates_parent_ref_to_fresh_child():
+    """X3：子 replan 后父 `children_ids` 的 ref 必须指向**新子**.
+
+    旧实现复用旧子的 ref（且在 save(fresh) 之前写父），重启后
+    `result_envelope` 按该 ref 载回旧子 → 永远 pending、父不 finalize；
+    `_walk_children` 也漏掉新身份。这里同时覆盖「父在内存」与「父不在内存
+    （load→改→save）」两条路径。
+    """
+    h = _bare_with_token(run_limits=100)
+    plan, parent = _parent_plan(h, "RX3", min_budget=2, child_alloc=20)
+    child = h.spawn_child(parent, {"task_id": "C1", "min_budget": 2}, plan)
+    old_id = child.id
+    old_ref = next(r for cid, r in parent.children_ids if cid == old_id)
+    assert old_ref is not None
+
+    child.state = TaskState.QUARANTINED
+    child.failure = "X3"
+    plan2 = h.replan(child, plan, diagnosis={"failing_subgoals": ["S-C1"]})
+    assert isinstance(plan2, dict)
+    fresh = next(a for a in h.acbs.values() if a.task_id == "C1'")
+
+    entries = dict(parent.children_ids)
+    assert old_id not in entries
+    ref = entries[fresh.id]
+    assert ref is not None and ref != old_ref
+    data = h.checkpoints.load(ref)
+    assert data["acb_id"] == fresh.id          # 载到的是**新子**，不是旧子
+    assert data["state"] == TaskState.ADMITTED.value
+    assert data["superseded"] is False
+
+    # 父不在内存 → 必须 load→改→save（不能直接 return 静默丢弃）
+    h.acbs.pop(parent.id, None)
+    fresh.state = TaskState.QUARANTINED
+    fresh.failure = "X3-2"
+    plan3 = h.replan(fresh, plan2, diagnosis={"failing_subgoals": ["S-C1"]})
+    assert isinstance(plan3, dict)
+    fresh2 = next(a for a in h.acbs.values() if a.task_id == "C1''")
+
+    parent_ref = h.checkpoints.latest_ref_for_acb(parent.id)
+    assert parent_ref is not None
+    persisted = h.checkpoints.load(parent_ref)
+    peach = {str(cid): cref for cid, cref in persisted["children_ids"]}
+    assert fresh.id not in peach
+    assert fresh2.id in peach and peach[fresh2.id] is not None
+    assert h.checkpoints.load(peach[fresh2.id])["acb_id"] == fresh2.id
+    h.budget.check_invariants()
+
+
+# ============================================================ X6 跨 run 子
+def test_s13_x6_cross_run_child_cancelled_via_parent_id_index():
+    """X6：跨 run 子 + 父 `children_ids` 缺失（老 checkpoint）→ 取消不得静默漏掉。
+
+    恢复时按 `spec.spawn.parent_id` / `parent_id` 反扫建立 `parent → [child]`
+    索引，`_walk_children` 据此找回跨 run 子。
+    """
+    h = _bare_with_token(run_limits=100)
+    plan, parent = _parent_plan(h, "R6P", min_budget=2, child_alloc=20)
+    child = h.spawn_child(parent, {
+        "task_id": "C1", "min_budget": 2, "run_id": "R6C"}, plan)
+    assert child.run_id == "R6C"
+    assert child.state is TaskState.ADMITTED
+
+    # 模拟老 checkpoint：父没有任何 children_ids/children 记录；清空内存索引，
+    # 强制走「反扫快照」重建。
+    parent.children_ids = []
+    parent.children = []
+    h._children_index = {}
+    h._children_index_built = False
+
+    h.run_coordinator.cancel_run("R6P")
+    assert child.state is TaskState.CANCELLED      # 跨 run 子仍被级联取消
+    assert (child.id, "cancel_skip_missing_ref") not in h._drain_skipped
+    h.budget.check_invariants()
+
+
+# ============================================================ X2 前驱语义
+def test_s13_x2_done_partial_satisfies_predecessor_and_successor_runs():
+    """X2：T1 → T2，T1 汇总为 `DONE_PARTIAL` 后 T2 必须可调度并执行。
+
+    旧实现 `PREDECESSOR_SATISFIED={DONE}` → T2 永久 PLANNED、ready 为空、
+    Run 永不 finalize（同波评审看不到的跨波缺陷）。
+    """
+    h = _bare_with_token(run_limits=100)
+    plan = h.planner.plan("RDP", [
+        {"task_id": "T1", "logical_subgoal_id": "S1",
+         "min_budget": 2, "child_alloc": 20},
+        {"task_id": "T2", "logical_subgoal_id": "S2", "min_budget": 2}])
+    h.planner.add_logical_edge(plan, "T1", "T2")
+    h.plans["RDP"] = plan
+    parent = h.dispatcher.try_admit(plan["tasks"]["T1"], "RDP", plan=plan)
+    h.acbs[parent.id] = parent
+    h.run_coordinator.register(parent)
+    assert parent.state is TaskState.ADMITTED
+
+    done_child = h.spawn_child(parent, {"task_id": "C1", "min_budget": 2}, plan)
+    failed_child = h.spawn_child(parent, {"task_id": "C2", "min_budget": 2}, plan)
+    h.run_task(done_child, [decision(1, finish())])
+    assert done_child.state is TaskState.DONE
+    failed_child.state = TaskState.FAILED
+    failed_child.failure = "BOOM"
+    h._finalize(failed_child)
+
+    env = h.apply_result_envelope(parent)
+    assert env.status == "DONE_PARTIAL"
+    assert parent.state is TaskState.DONE_PARTIAL
+
+    # X2：T1 的 DONE_PARTIAL 必须满足前驱 → T2 已准入并进入 ready 队列
+    t2 = next((a for a in h.acbs.values()
+               if a.run_id == "RDP" and a.task_id == "T2"), None)
+    assert t2 is not None and t2.state is TaskState.ADMITTED
+
+    # 真被调度并执行（不是只 push 了队列）
+    h._drain_scheduler()
+    assert t2.state is TaskState.DONE
+    assert plan["tasks"]["T2"]["state"] is TaskState.DONE
+    h.budget.check_invariants()
+
+
 # ================================================= C5 跨进程恢复后的能力链
 def test_s13_c5_restored_child_keeps_lineage_and_can_spawn_grandchild(tmp_path):
     """C5：恢复后子 token 可追溯（父链按需加载）→ 能 DONE 且能 spawn 孙辈。"""

@@ -10,7 +10,6 @@ P0-9（pool 嵌套死锁）、P0-10（claim + fencing）、P1-1（INADMISSIBLE �
 
 from __future__ import annotations
 
-import copy
 import threading
 
 import pytest
@@ -18,7 +17,8 @@ import pytest
 import harness.runtime as runtime_module
 from conftest import admit, commit, decision, finish, stage, tool
 
-from harness import ACB, Action, Harness, ManualClock, Status, TaskState, Write
+from harness import (ACB, Action, EventKind, Harness, ManualClock, Result,
+                     Status, TaskState, Write, advance)
 from harness.runtime import CrashInjected
 from harness.storage._lock import FencingRejected
 from harness.types import TASK_TERMINAL
@@ -287,6 +287,41 @@ def test_s13_13_worker_nested_run_task_inlines_no_pool_deadlock(monkeypatch):
     assert parent.state is TaskState.DONE
 
 
+def test_s13_x4_inline_child_is_claimed_by_parent_worker(monkeypatch):
+    """X4：内联子必须 claim（以父 worker 身份）——否则队列可重 claim → 双跑。"""
+    h = _pool_harness(run_limits=100, pool_workers=1)
+    plan = h.planner.plan("RX4", [
+        {"task_id": "P", "logical_subgoal_id": "SP", "min_budget": 10},
+        {"task_id": "C", "logical_subgoal_id": "SC", "min_budget": 10}])
+    h.plans["RX4"] = plan
+    parent = _admitted(h, "RX4", plan, "P")
+    child = _admitted(h, "RX4", plan, "C")
+
+    def nested(rt, acb_, action, i):
+        return rt.h.run_task(child, [decision(1, finish())])
+
+    monkeypatch.setitem(runtime_module._HANDLERS, "nested_child_x4", nested)
+
+    results: list = []
+
+    def outer():
+        results.append(h.run_task(
+            parent, [decision(1, Action(kind="nested_child_x4"), finish())]))
+
+    thread = threading.Thread(target=outer, daemon=True)
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert results and results[0] == Status.OK
+    assert child.state is TaskState.DONE
+
+    child_claims = [c for c in h.scheduler.claim_history if c.acb_id == child.id]
+    assert child_claims, "内联子必须持有 claim（否则可被队列重 claim → 双跑）"
+    assert child_claims[-1].worker_id.startswith("W")
+    assert child.spec.get("inline_parent") == parent.id
+    assert h.scheduler.claim_of(child.id) is None     # 内联结束即释放
+
+
 # ============================================================ S13-14 重 claim
 def test_s13_14_expired_claim_reclaim_fences_old_writer_and_keeps_one_effect():
     """P0-10：claim 过期 → 第二 worker 可重 claim；旧 worker 的写被 fencing 拒；
@@ -305,11 +340,13 @@ def test_s13_14_expired_claim_reclaim_fences_old_writer_and_keeps_one_effect():
     assert c1 is not None and c1.worker_id == "w1" and c1.attempt == 1
     # 租约有效 → 第二个 worker 不得抢（防双持）
     assert h.scheduler.claim(acb.id, "w2") is None
-    stale = copy.copy(acb)                        # 旧 worker 的本地视图（旧 fence）
-    assert stale.claim_epoch == c1.fence_epoch
 
-    # 旧 worker 的副作用已完成（模拟「工具已确认」后崩溃）
-    st = h.runtime._do_action(acb, action, 0)
+    # 旧 worker 的副作用已完成（模拟「工具已确认」后崩溃）。
+    # X1：fence epoch 绑在**执行上下文**（此处用 `claim_scope` 模拟 worker
+    # 线程），不再写回共享 ACB（旧用例的 `copy.copy(acb)` 已删除 —— 那会掩盖
+    # 「旧 worker 与主线程持同一对象」的共享缺陷）。
+    with h.claim_scope(acb, c1):
+        st = h.runtime._do_action(acb, action, 0)
     assert st == Status.OK
     assert len(_tool_events(h)) == 1
 
@@ -318,16 +355,18 @@ def test_s13_14_expired_claim_reclaim_fences_old_writer_and_keeps_one_effect():
     assert c2 is not None and c2.worker_id == "w2"
     assert c2.attempt == 2
     assert c2.fence_epoch > c1.fence_epoch
-    assert stale.claim_epoch < c2.fence_epoch
 
-    # 旧 worker 的写一律 REJECT_STALE（commit / budget.consume / effects.begin）
-    stale.staged = {"r": "old"}
-    assert h.commit_batch(stale, [Write(resource="r")]) == Status.REJECT_STALE
-    assert h.budget.consume(acb.reservation_ids[0], 1,
-                            acb=stale) == Status.REJECT_STALE
-    assert h.effects.begin(stale, action) == ""
-    with pytest.raises(FencingRejected):
-        h.checkpoints.save(stale)
+    # 旧 worker（旧 epoch 上下文）的写一律 REJECT_STALE
+    # （commit / budget.consume / effects.begin / checkpoints.save）
+    with h.claim_scope(acb, c1.fence_epoch):
+        acb.staged = {"r": "old"}
+        assert h.commit_batch(acb, [Write(resource="r")]) == Status.REJECT_STALE
+        assert h.budget.consume(acb.reservation_ids[0], 1,
+                                acb=acb) == Status.REJECT_STALE
+        assert h.effects.begin(acb, action) == ""
+        with pytest.raises(FencingRejected):
+            h.checkpoints.save(acb)
+    acb.staged = {}
 
     # 新 worker 接手执行 → idem 短路：TOOL_COMPLETED 仍只 1 次
     h.scheduler.release_claim(acb.id, "w2")
@@ -336,3 +375,124 @@ def test_s13_14_expired_claim_reclaim_fences_old_writer_and_keeps_one_effect():
     assert acb.state is TaskState.DONE
     assert len(_tool_events(h)) == 1
     assert h.budget._reservations[acb.reservation_ids[0]][1].consumed == 1
+
+
+# ============================================================ X5 / X7 / X8
+def test_s13_x5_replan_write_ahead_fenced_rolls_back_memory_count():
+    """X5：replan 的 write-ahead `save` 被 fence → 内存 `replan_count` 必须回滚，
+    且不产生 `PLAN_PATCHED`；`replan_attempts` 仍永不回滚（熔断风暴）。"""
+    clock = ManualClock()
+    h = _pool_harness(run_limits=100, clock=clock, lease_ms=400,
+                      claim_lease_ms=500)
+    plan = h.planner.plan("RX5", [{
+        "task_id": "T1", "logical_subgoal_id": "S1", "min_budget": 10}])
+    h.plans["RX5"] = plan
+    acb = _admitted(h, "RX5", plan, "T1")
+
+    c1 = h.scheduler.claim(acb.id, "w1")
+    acb.state = TaskState.QUARANTINED       # replan 允许的入口态
+    clock.advance(501)
+    c2 = h.scheduler.claim(acb.id, "w2")
+    assert c2 is not None and c2.fence_epoch > c1.fence_epoch
+
+    patched_before = [e for e in h.event_log.all()
+                      if e.kind is EventKind.PLAN_PATCHED]
+    with h.claim_scope(acb, c1.fence_epoch):
+        with pytest.raises(FencingRejected):
+            h.replan(acb, plan, diagnosis={"failing_subgoals": ["S1"]})
+
+    assert acb.replan_count == 0                       # 内存回滚
+    assert acb.replan_attempts == 1                    # 尝试数永不回滚
+    assert [e for e in h.event_log.all()
+            if e.kind is EventKind.PLAN_PATCHED] == patched_before
+    assert (acb.id, "save_fenced") in h._drain_skipped
+
+
+def test_s13_x7_claim_fields_persisted_and_expired_lease_released_on_restore():
+    """X7：claim 三字段随快照落盘；租约过期 → 恢复即释放、允许重 claim。"""
+    clock = ManualClock()
+    h = _pool_harness(run_limits=100, clock=clock, lease_ms=400,
+                      claim_lease_ms=500)
+    plan = h.planner.plan("RX7", [{
+        "task_id": "T1", "logical_subgoal_id": "S1", "min_budget": 10}])
+    h.plans["RX7"] = plan
+    acb = _admitted(h, "RX7", plan, "T1")
+
+    c1 = h.scheduler.claim(acb.id, "w1")
+    with h.claim_scope(acb, c1):
+        ref = h.checkpoints.save(acb)
+    data = h.checkpoints.load(ref)
+    assert data["claim_epoch"] == c1.fence_epoch
+    assert data["claim_worker"] == "w1"
+    assert data["claim_lease_until_ms"] == c1.lease_until_ms
+
+    clock.advance(501)                                 # 越过 claim 租约
+    restored = h._restore_acb(h.checkpoints.load(ref))
+    assert restored.claim_epoch == 0
+    assert restored.claim_worker == ""
+    assert restored.claim_lease_until_ms == 0
+    assert (restored.id, "claim_lease_expired_released") in h._drain_skipped
+
+
+# ============================================================ X1 跨波次（终审）
+def test_s13_x1_tick_timeout_on_inflight_worker_stays_failed_not_done(monkeypatch):
+    """X1：pool + 在途 worker + 主线程 `tick` 判审批超时。
+
+    终态必须是 `FAILED(APPROVAL_TIMEOUT)` —— 不得被解锁后的 worker 改回 DONE、
+    不得 append `TASK_COMPLETED`；旧 worker 解锁后的写一律 `REJECT_STALE`
+    （commit / effects.begin）。
+    """
+    clock = ManualClock()
+    h = _pool_harness(run_limits=100, clock=clock, hitl_timeout_ms=100)
+    plan = h.planner.plan("R15", [{
+        "task_id": "T1", "logical_subgoal_id": "S1", "min_budget": 10}])
+    h.plans["R15"] = plan
+    acb = _admitted(h, "R15", plan, "T1")
+
+    entered = threading.Event()
+    release = threading.Event()
+    observed: dict = {}
+
+    def blocked_hitl(rt, acb_, action, i):
+        # 模拟生产 HITL：进入等待审批后**阻塞**，期间主线程 tick 判超时。
+        assert advance(acb_, "request_approval") == Status.OK
+        acb_.hitl_pending = {"approval_id": "ap-x1",
+                             "deadline_ms": clock.now_ms() + 100,
+                             "plan_version": 1}
+        rt.h.checkpoints.save(acb_)
+        entered.set()
+        assert release.wait(10), "tick 未在超时内放行"
+        # 解锁后：旧 worker 的写必须被 fence（绝不写副作用/事件）。
+        acb_.staged = {"r": "old"}
+        observed["commit"] = rt.h.commit_batch(acb_, [Write(resource="r")])
+        observed["begin"] = rt.h.effects.begin(acb_, tool("t", {"p": "/x"}))
+        observed["state_after_resume"] = acb_.state
+        return Result(Status.OK)
+
+    monkeypatch.setitem(runtime_module._HANDLERS, "blocked_hitl_x1", blocked_hitl)
+
+    results: list = []
+
+    def outer():
+        results.append(h.run_task(acb, [decision(1, Action(kind="blocked_hitl_x1"))]))
+
+    thread = threading.Thread(target=outer, daemon=True)
+    thread.start()
+    assert entered.wait(10)
+    clock.advance(200)                            # 越过 hitl_timeout_ms
+    h.tick()                                      # 主线程判超时（与 worker 并发）
+    assert acb.state is TaskState.FAILED
+    assert acb.failure == "APPROVAL_TIMEOUT"
+    assert (acb.hitl_outcome or {}).get("decision") == "timeout"
+
+    release.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert results == [Status.APPROVAL_TIMEOUT]   # worker 返回终态语义，不是 OK/DONE
+    assert acb.state is TaskState.FAILED
+    assert acb.failure == "APPROVAL_TIMEOUT"
+    assert observed["state_after_resume"] is TaskState.FAILED
+    assert observed["commit"] == Status.REJECT_STALE
+    assert observed["begin"] == ""
+    assert [e for e in h.event_log.all()
+            if e.kind is EventKind.TASK_COMPLETED] == []

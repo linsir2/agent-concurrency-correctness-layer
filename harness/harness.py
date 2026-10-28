@@ -352,6 +352,8 @@ class Harness:
         self.budget.claim_guard = self._claim_fenced
         self.effects.claim_guard = self._claim_fenced
         self.checkpoints.claim_guard = self._claim_fenced
+        # X7：claim 三字段随快照落盘（无锁只读，仅作恢复后的观测/租约判定）。
+        self.checkpoints.claim_provider = self._claim_snapshot
 
         self.runtime = AgentRuntime(self)
         self.plans: dict[str, dict] = {}
@@ -362,6 +364,11 @@ class Harness:
         self._admission_index: dict[tuple[str, str, int], ACB] = {}
         # R7：每 ACB 一把 transition 锁（replan / _finalize / requeue_readmit 共用）
         self._transition_locks: dict[str, threading.RLock] = {}
+        # X6：`parent_id → {child_acb_id}` 反向索引（跨 run 子；父 `children_ids`
+        # 缺失的老 checkpoint 也能被取消级联找回）。恢复时按 `spec.spawn.parent_id`
+        # 反扫建立；spawn 成功与恢复子时增量更新。
+        self._children_index: dict[str, set[str]] = {}
+        self._children_index_built = False
         # S9 §2.3：收据链（每 scope 一把 RLock；head/id 由 EventLog 重建）
         self.receipts_enabled = receipts_enabled
         # 锁序写死：resource → scope → eventlog（docs s9 §2.3.5）。
@@ -1358,12 +1365,27 @@ class Harness:
 
     # ---- Supervisor 辅助 ------------------------------------------
     def supervisor_note_crash(self, acb: ACB) -> None:
-        """Supervisor 心跳超时回收（文档 §5.8③）。"""
+        """Supervisor 心跳超时回收（文档 §5.8③）。
+
+        X1：**先 revoke claim（记录 epoch 水位）再落盘**。否则 save 走
+        `_claim_fenced` 时会因「claim 存在但主线程无执行上下文」被拒；而撤销
+        水位保证旧 worker（线程本地 epoch 落后）此后所有写一律 `REJECT_STALE`。
+        """
         self.intents.revoke_all(acb.id)
         self.bump_epoch()
-        # §2.4：落盘（duck-typed 探针无 budget_node 时跳过，保持向后兼容）
+        run_id = getattr(acb, "run_id", "") or ""
+        mark = self.scheduler._epoch_now(run_id or None)
+        self.scheduler.revoke_claim(acb.id, watermark=mark)
+        # §2.4：落盘（duck-typed 探针无 budget_node 时跳过，保持向后兼容）。
+        # 这次快照是**监督者**的权威写入：以撤销水位作为执行上下文 epoch，
+        # 使得「本监督者」不被自己刚推进的水位 fence 掉（旧 worker 的后续写
+        # 仍会因上下文 epoch 落后而被拒）。
         if hasattr(acb, "budget_node"):
-            self.checkpoints.save(acb)
+            prev = self._bind_claim_epoch(acb.id, mark)
+            try:
+                self.checkpoints.save(acb)
+            finally:
+                self._unbind_claim_epoch(acb.id, prev)
 
     # ---- 单写者租约 + fencing epoch（S10a §2.5 / §3.4）------------------
     def _lease_path(self):
@@ -1592,16 +1614,37 @@ class Harness:
         return wid or f"local-{threading.get_ident()}"
 
     def _run_one_inline(self, acb: ACB, decisions=None, crash_at=None):
-        """worker 内的嵌套执行（**不入队**）；`_tls.depth` 防递归。"""
+        """worker 内的嵌套执行（**不入队**）；`_tls.depth` 防递归。
+
+        X4：内联子**必须 claim**（以父 worker 身份）。否则内联执行期间若队列
+        中有该子的 ready 键（`_finalize` 的后继 push），另一 worker 可重 claim
+        并双跑。claim 不可得（已被他人持有）→ 不内联、记 `inline_claim_held`。
+        """
         depth = int(getattr(self._tls, "depth", 0) or 0)
         if depth >= _MAX_INLINE_DEPTH:
             self._drain_skipped.append((acb.id, "inline_depth_exceeded"))
             return Result(Status.INVALID_INPUT, {"reason": "inline_depth_exceeded"})
         self._tls.depth = depth + 1
+        parent = getattr(self._tls, "running_acb", None)
+        claim = None
+        if self.scheduler_mode == "pool":
+            claim = self.scheduler.claim(acb.id, self._current_worker_id())
+            if claim is None:
+                self._drain_skipped.append((acb.id, "inline_claim_held"))
+                self._tls.depth = depth
+                return Result(Status.REJECT_STALE, {"reason": "inline_claim_held"})
+            # 审计：内联子记录父 ACB（不参与 fence 判定）。
+            if parent is not None and parent is not acb:
+                acb.spec["inline_parent"] = parent.id
         try:
+            if claim is not None:
+                with self.claim_scope(acb, claim):
+                    return self._run_one(acb, decisions, crash_at=crash_at)
             return self._run_one(acb, decisions, crash_at=crash_at)
         finally:
             self._tls.depth = depth
+            if claim is not None:
+                self.scheduler.release_claim(acb.id, self._current_worker_id())
 
     def _run_task_pooled(self, acb: ACB, decisions, crash_at):
         """提交一个 worker 并等待；**不在本线程 drain**（单一 pop 所有者 = worker）。"""
@@ -1625,7 +1668,9 @@ class Harness:
                 self._drain_skipped.append((acb.id, "claim_held"))
                 return Status.DEADLINE_EXCEEDED
             try:
-                return self._run_one(acb, decisions, crash_at=crash_at)
+                # X1：fence 的 epoch 绑在**本线程执行上下文**，不写共享 ACB。
+                with self.claim_scope(acb, claim):
+                    return self._run_one(acb, decisions, crash_at=crash_at)
             finally:
                 self.scheduler.release_claim(acb.id, worker_id)
         except BaseException:
@@ -2098,6 +2143,7 @@ class Harness:
             self.acbs[child.id] = child
             self.run_coordinator.register(child)
             self._register_admission(child)
+            self._index_child(child.id, parent_acb.id)   # X6：跨 run 子反扫索引
             if plan is not None:
                 plan.setdefault("tasks", {})[task_id] = {
                     "task_id": task_id,
@@ -2435,6 +2481,9 @@ class Harness:
                     continue
                 approval_id, deadline = self._approval_slot(acb)
                 if approval_id is None or deadline is None:
+                    # X1：判终态前先 revoke 租约 + bump epoch + 撤销 claim，
+                    # 旧 worker 解锁后的写才会被 fence（否则终态被改回 DONE）。
+                    self.supervisor_note_crash(acb)
                     if advance(acb, "timeout") != Status.OK:
                         continue
                     acb.failure = "APPROVAL_STATE_LOST"
@@ -2444,6 +2493,7 @@ class Harness:
                         continue
                     if self.hitl.peek(acb) is not _UNSET:
                         continue            # 已有决策 → 不判超时
+                    self.supervisor_note_crash(acb)
                     if advance(acb, "timeout") != Status.OK:
                         continue
                     acb.failure = "APPROVAL_TIMEOUT"
@@ -2524,25 +2574,130 @@ class Harness:
                 self._safe_save(fresh)
             return fresh if fresh is not None else acb
 
-    def _claim_fenced(self, acb: ACB) -> bool:
-        """P0-10：写路径 fencing —— `acb.claim_epoch` 必须等于当前 claim 的 `fence_epoch`。
+    def _exec_claim_epoch(self, acb_id: str) -> int | None:
+        """当前线程**执行上下文**里的 claim epoch（X1：不读共享 ACB 字段）。"""
+        ctx = getattr(self._tls, "claim_epochs", None)
+        if not ctx:
+            return None
+        return ctx.get(acb_id)
 
-        仅 `pool` 模式且存在**活跃 claim** 时生效；sync 模式无 claim → 恒 `False`
-        （保持既有写路径语义，36 个同步用例零破坏）。
+    def _bind_claim_epoch(self, acb_id: str, epoch: int) -> int | None:
+        ctx = getattr(self._tls, "claim_epochs", None)
+        if ctx is None:
+            ctx = {}
+            self._tls.claim_epochs = ctx
+        prev = ctx.get(acb_id)
+        ctx[acb_id] = int(epoch)
+        return prev
+
+    def _unbind_claim_epoch(self, acb_id: str, prev: int | None) -> None:
+        ctx = getattr(self._tls, "claim_epochs", None)
+        if not ctx:
+            return
+        if prev is None:
+            ctx.pop(acb_id, None)
+        else:
+            ctx[acb_id] = prev
+
+    def claim_scope(self, acb: ACB, epoch):
+        """把 claim epoch 绑定到**当前线程**的执行上下文（worker / 内联 / 测试）。
+
+        `epoch` 可以是 `Claim`（取 `fence_epoch`）或整数。返回上下文管理器；
+        退出时恢复原值（内联嵌套继承父 epoch 也用同一机制）。
+        """
+        value = int(getattr(epoch, "fence_epoch", epoch))
+        h = self
+
+        class _Scope:
+            def __enter__(self_inner):
+                self_inner._prev = h._bind_claim_epoch(acb.id, value)
+                self_inner._acb_id = acb.id
+                return acb
+
+            def __exit__(self_inner, *_exc):
+                h._unbind_claim_epoch(self_inner._acb_id, self_inner._prev)
+                return False
+
+        return _Scope()
+
+    def _claim_fenced(self, acb: ACB) -> bool:
+        """P0-10：写路径 fencing —— 比较**执行上下文 epoch**，不读共享 ACB。
+
+        - 活跃 claim 存在：上下文没有 epoch（外部线程）或 epoch 不等 → fenced；
+        - claim 已撤销（tick/supervisor 回收）：上下文 epoch **低于撤销水位** → fenced
+          （否则审批超时被在途 worker 解锁后的写覆盖）；
+        - sync 模式 / 从未 claim → 恒 `False`（36 个同步用例零破坏）。
         """
         if self.scheduler_mode != "pool":
             return False
+        ctx = self._exec_claim_epoch(acb.id)
         claim = self.scheduler.claim_of(acb.id)
+        if claim is not None:
+            if ctx is None:
+                return True
+            return int(ctx) != int(claim.fence_epoch)
+        watermark = self.scheduler.revoked_epoch(acb.id)
+        if watermark is not None and ctx is not None:
+            return int(ctx) < int(watermark)
+        return False
+
+    def _claim_snapshot(self, acb: ACB) -> dict:
+        """X7：快照用的 claim 三字段（无锁只读，避免 store ↔ scheduler AB-BA）。"""
+        claim = self.scheduler.peek_claim(acb.id)
         if claim is None:
-            return False
-        return int(getattr(acb, "claim_epoch", 0) or 0) != int(claim.fence_epoch)
+            return {}
+        return {"claim_epoch": int(claim.fence_epoch),
+                "claim_worker": str(claim.worker_id),
+                "claim_lease_until_ms": int(claim.lease_until_ms)}
+
+    # ---- X6：跨 run 子索引 -----------------------------------------
+    def _index_child(self, child_id: str, parent_id: str) -> None:
+        if parent_id and str(child_id) != str(parent_id):
+            self._children_index.setdefault(str(parent_id), set()).add(str(child_id))
+
+    def _ensure_children_index(self) -> None:
+        """按 `parent_id` / `spec.spawn.parent_id` 反扫全部快照，建父→子索引。
+
+        只在第一次取消级联/恢复子时构建一次；`spawn_child` 与 `_restore_acb`
+        会增量更新，所以构建后仍能覆盖本进程新产生的子。构建失败不抛（尽力）。
+        """
+        if self._children_index_built:
+            return
+        self._children_index_built = True
+        getter = getattr(self.checkpoints, "refs_all", None)
+        if not callable(getter):
+            return
+        try:
+            entries = getter()
+        except Exception:  # noqa: BLE001
+            return
+        for acb_id, ref in entries or []:
+            if not ref:
+                continue
+            try:
+                data = self.checkpoints.load(ref)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(data, dict):
+                continue
+            parent = data.get("parent_id") or ""
+            if not parent:
+                spec = data.get("spec")
+                spawn = spec.get("spawn") if isinstance(spec, dict) else None
+                if isinstance(spawn, dict):
+                    parent = spawn.get("parent_id") or ""
+            if parent:
+                self._index_child(str(data.get("acb_id") or acb_id), str(parent))
 
     def _run_one(self, acb: ACB, decisions=None, crash_at=None) -> Status:
         """执行体（§2.6）：`runtime.run` + `_finalize`；**不 push、不 drain**（防递归）。"""
+        prev_running = getattr(self._tls, "running_acb", None)
+        self._tls.running_acb = acb          # X4：内联子记录 `inline_parent`
         try:
             return self.runtime.run(acb, decisions or [], crash_at=crash_at)
         finally:
             self._finalize(acb)
+            self._tls.running_acb = prev_running
 
     def _drain_scheduler(self) -> None:
         """真消费 ready_queue（§2.6）：`pop → 找 ACB → 只启动 ADMITTED`。
@@ -2588,7 +2743,8 @@ class Harness:
                 if reason is not None:
                     self._drain_skipped.append((key, reason))
                     continue
-                self._run_one(self.acbs[key])
+                with self.claim_scope(self.acbs[key], claim):
+                    self._run_one(self.acbs[key])
             finally:
                 self.scheduler.release_claim(key, worker_id)
 
@@ -2801,15 +2957,22 @@ class Harness:
             self._ensure_policy_token(ancestor, depth + 1)
         return token
 
-    def _safe_save(self, acb: ACB) -> None:
-        """落盘（**保证不抛**）：P1-5 —— 非法 staged 内容不得阻断结算/槽位释放。
+    def _safe_save(self, acb: ACB) -> bool:
+        """落盘（**保证不抛普通异常**）：P1-5 —— 非法 staged 内容不得阻断结算。
 
-        `CrashInjected`（BaseException）仍穿透；普通编码异常只记录，不冒泡。
+        X8：**不再吞 `FencingRejected`** —— 被 fence 的快照写不进盘（旧 worker
+        不得覆盖新 claim），这里显式记录到 `_drain_skipped` 并返回 `False`，
+        由 `_finalize` 中止结算（交给新持有者）。普通编码错误仍按 P1-5 放行
+        （返回 `True`，不阻断结算/槽位释放）。`CrashInjected`（BaseException）穿透。
         """
         try:
             self.checkpoints.save(acb)
+            return True
+        except FencingRejected:
+            self._drain_skipped.append((acb.id, "save_fenced"))
+            return False
         except Exception:  # noqa: BLE001  # 契约：落盘失败不得跳过后续结算
-            pass
+            return True
 
     # ---- R6：准入唯一性登记 -----------------------------------------
     @staticmethod
@@ -2852,27 +3015,41 @@ class Harness:
 
         `parent_id` 不可变意味着新 ACB 仍是同一父的子；父的 `children` /
         `children_ids` / `children_pending` 必须同步，否则取消/汇总会漏掉新身份。
+
+        X3：**ref 必须是 fresh 自己的**（调用方须先 `save(fresh)`）。复用旧子
+        的 ref 会让重启后的 `result_envelope` 按该 ref 载回**旧子**（永远
+        pending → 父不 finalize），`_walk_children` 也会漏掉新身份。
         """
         parent_id = getattr(old, "parent_id", "") or ""
         if not parent_id:
             return
+        self._index_child(fresh.id, parent_id)   # X6：替换后的新身份也进反扫索引
+        fresh_ref = fresh.result_ref or self._ref_for_child(fresh.id)
+
+        def _patch(entries):
+            out: list = []
+            replaced = False
+            for entry in list(entries or []):
+                if isinstance(entry, (list, tuple)) and str(entry[0]) == str(old.id):
+                    out.append((fresh.id, fresh_ref))
+                    replaced = True
+                else:
+                    out.append(entry)
+            if not replaced:
+                out.append((fresh.id, fresh_ref))
+            return out
+
         parent = self.acbs.get(parent_id)
         if parent is None:
+            # 父不在内存 → 在**最新快照**上原地改 children_ids（不重建 ACB，
+            # 否则会丢掉 staged / 预算 / 能力等字段）。
+            updater = getattr(self.checkpoints, "update_children", None)
+            if callable(updater):
+                updater(parent_id, _patch)
             return
         parent.children = [fresh if child is old else child
                            for child in list(getattr(parent, "children", []) or [])]
-        new_ids: list = []
-        replaced = False
-        for entry in list(getattr(parent, "children_ids", []) or []):
-            if isinstance(entry, (list, tuple)) and str(entry[0]) == str(old.id):
-                ref = entry[1] if len(entry) > 1 else None
-                new_ids.append((fresh.id, ref))
-                replaced = True
-            else:
-                new_ids.append(entry)
-        if not replaced:
-            new_ids.append((fresh.id, None))
-        parent.children_ids = new_ids
+        parent.children_ids = _patch(parent.children_ids)
         pending = getattr(parent, "children_pending", None) or {}
         if str(old.id) in pending:
             parent.children_pending[str(fresh.id)] = pending.pop(str(old.id))
@@ -2896,12 +3073,18 @@ class Harness:
             self._finalize_locked(acb)
 
     def _finalize_locked(self, acb: ACB) -> None:
+        # X1：结算前先释放活跃 claim（幂等）。否则 finalize→release 的顺序会让
+        # 「已终态但 claim 未释放」窗口里的另一 worker 误以为仍被持有。
+        self.scheduler.release_claim(acb.id)
         plan = self.plans.get(acb.run_id)
         if plan and acb.task_id in plan["tasks"]:
             plan["tasks"][acb.task_id]["state"] = acb.state
         # §2.4：_finalize 落盘（K-3：在结算/归档**之前**，保留活跃预留供 recover 恢复）；
         # P1-5：保存失败**不得**阻断下面的结算/归档/槽位释放（否则槽位泄漏）。
-        self._safe_save(acb)
+        # X8：唯一例外是 claim fencing —— 旧 worker 的快照不得覆盖新 claim，
+        # 且结算由新持有者完成，这里直接中止（留痕在 `_drain_skipped`）。
+        if not self._safe_save(acb):
+            return
         # S10a §2.1：结算 + 归档的预算事件**同帧 append_batch**（一次临界区，
         # 避免逐笔 append 放大事件日志锁竞争 → 基准时序抖动）
         with self.budget.suppressed():
@@ -3151,20 +3334,23 @@ class Harness:
                     self._safe_save(acb)
                 return None
             prev = acb.replan_count                    # ② 计数（成功预算）
-            prev_attempts = acb.replan_attempts
             acb.replan_count = prev + 1
-            acb.replan_attempts = prev_attempts + 1    # 尝试数（永不回滚）
-            self.checkpoints.save(acb)                 # ③ write-ahead 落盘
+            acb.replan_attempts = acb.replan_attempts + 1   # 尝试数（永不回滚）
             try:
+                # ③ write-ahead 落盘 —— X5：必须**在 try 内**。pool 模式下
+                # `FencingRejected` 会在这里抛出；放在 try 外则内存已 +1 而
+                # 磁盘仍是旧值且无法回滚（池化旧 worker 的写被 fence）。
+                self.checkpoints.save(acb)
                 new_plan, event_draft = self.planner.patch(   # ④ 纯函数 patch
                     plan, diagnosis or {})
                 # ⑤ 同帧提交：新 plan 事件 + 计数（已落盘）原子可见
                 self.event_log.append_batch([event_draft])
             except Exception:                          # 不捕获 BaseException
                 acb.replan_count = prev                # 补偿：只回滚成功计数
+                # `replan_attempts` 仍**永不回滚**（熔断 replan 风暴，R4）。
                 if acb.state is TaskState.REPLANNING:
                     acb.state = TaskState.QUARANTINED  # 非终态不得卡死
-                self._safe_save(acb)
+                self._safe_save(acb)                   # 磁盘回滚（可能已被 fence）
                 raise
             self.plans[acb.run_id] = new_plan
             # ⑥ 清理旧节点 + 再准入（P0-6，复用 requeue_readmit 序列）；
@@ -3277,8 +3463,9 @@ class Harness:
         self.acbs[fresh.id] = fresh
         self.run_coordinator.register(fresh)
         self._register_admission(fresh)
-        self._replace_child_ref(acb, fresh)
+        # X3：先 save 拿到 **fresh 自己的 ref**，再回填父的 children_ids。
         self.checkpoints.save(fresh)          # §2.4：再准入成功落盘
+        self._replace_child_ref(acb, fresh)
         return fresh
 
     def requeue_readmit(self, acb: ACB) -> ACB:
@@ -3326,8 +3513,9 @@ class Harness:
                 self.acbs.pop(acb.id, None)
                 self.acbs[fresh.id] = fresh
                 self.run_coordinator.register(fresh)
-                self._replace_child_ref(acb, fresh)
+                # X3：先 save 拿到 fresh 的 ref，再回填父的 children_ids。
                 self.checkpoints.save(fresh)        # §2.4：requeue 成功落盘
+                self._replace_child_ref(acb, fresh)
                 return fresh
             self.slots.try_acquire(acb.id)
             acb.needs_readmit = True
@@ -3373,6 +3561,18 @@ class Harness:
             acb.replan_attempts = int(data.get("replan_attempts", 0) or 0)
             # S13d §2.5：aging 计数跨恢复继承（否则重规划/重准入会无限超时）
             acb.aging_count = int(data.get("aging_count", 0) or 0)
+            # X7：恢复 claim 三字段（观测用）；租约已过期 → 立即视为已释放，
+            # 允许重新 claim（本进程的 scheduler 本就没有该 claim）。
+            acb.claim_epoch = int(data.get("claim_epoch", 0) or 0)
+            acb.claim_worker = str(data.get("claim_worker", "") or "")
+            acb.claim_lease_until_ms = int(
+                data.get("claim_lease_until_ms", 0) or 0)
+            if (acb.claim_lease_until_ms
+                    and int(self.clock.now_ms()) >= acb.claim_lease_until_ms):
+                self._drain_skipped.append((acb.id, "claim_lease_expired_released"))
+                acb.claim_epoch = 0
+                acb.claim_worker = ""
+                acb.claim_lease_until_ms = 0
             # R7：被 replan/requeue 取代的旧 ACB 即使被旧 ref 恢复，也不得变成
             # 「QUARANTINED + needs_readmit」的僵尸与新 ACB 并存 → 直接终态。
             acb.superseded = bool(data.get("superseded", False))
@@ -3380,6 +3580,11 @@ class Harness:
                 acb.state = TaskState.CANCELLED
                 acb.needs_readmit = False
             acb.parent_id = data.get("parent_id", "") or ""
+            if not acb.parent_id:
+                spawn = acb.spec.get("spawn") if isinstance(acb.spec, dict) else None
+                if isinstance(spawn, dict):
+                    acb.parent_id = str(spawn.get("parent_id") or "")
+            self._index_child(acb.id, acb.parent_id)   # X6：恢复即登记反扫索引
             children: list = []
             for child in data.get("children_ids") or []:
                 if isinstance(child, (list, tuple)) and child:

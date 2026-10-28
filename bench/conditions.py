@@ -86,7 +86,11 @@ def _pre_stage(h: Harness, acbs, decisions) -> None:
 
 
 class _NoopScheduler:
-    """B3 用：避免跨线程调度器把他人 ADMITTED 的 ACB 二次拉起。"""
+    """B3 用：避免跨线程调度器把他人 ADMITTED 的 ACB 二次拉起。
+
+    `_finalize` / `_claim_snapshot` / `supervisor_note_crash` 会调用调度器的
+    claim 接口（X1/X7）；B3 无 claim 语义 → 全部 no-op，不引入 fencing。
+    """
 
     def push(self, task_id):  # noqa: D401
         return None
@@ -96,6 +100,24 @@ class _NoopScheduler:
 
     def is_empty(self) -> bool:
         return True
+
+    def claim_of(self, acb_id):
+        return None
+
+    def peek_claim(self, acb_id):
+        return None
+
+    def revoked_epoch(self, acb_id):
+        return None
+
+    def release_claim(self, acb_id, worker_id=None) -> bool:
+        return False
+
+    def revoke_claim(self, acb_id, worker_id=None, watermark=None):
+        return None
+
+    def claim(self, acb_id, worker_id=None):
+        return None
 
 
 class _Instrument:
