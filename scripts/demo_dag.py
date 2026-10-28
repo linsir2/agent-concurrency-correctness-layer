@@ -20,6 +20,7 @@ DAG（两条边）：
 用法：
     DASHSCOPE_API_KEY=xxx python3 scripts/demo_dag.py
     # 或写进 /workspace/.env（已在 .gitignore 中）
+    python3 scripts/demo_dag.py --via-proxy   # 受限沙箱：只能经代理出站
 """
 
 from __future__ import annotations
@@ -29,10 +30,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness import Harness, ManualClock, RscSession
+from harness.egress.resolver import NoRedirect
 from harness.facade import Conflict, Receipt, Token
 from harness.llm import LLMClient, LLMConfig, load_env_file
 from harness.worktree import WorktreeManager
@@ -102,8 +105,27 @@ class _OfflineLLM:
         return f"[offline] {text[:60]}"
 
 
+def _proxy_opener() -> urllib.request.OpenerDirector:
+    """`--via-proxy` 专用：沿用环境变量里的代理出站（仍禁重定向）。
+
+    **诚实说明**：代理会把请求转给第三方，等于绕过 `build_opener()` 的 DNS
+    钉住与凭证隔离（`harness/egress/resolver.py` 的默认语义）。本函数只用于
+    「本沙箱无直连出口」的演示，**不得**用于生产。
+    """
+    proxies = urllib.request.getproxies()
+    opener = urllib.request.OpenerDirector()
+    for handler in (urllib.request.ProxyHandler(proxies),
+                    urllib.request.HTTPHandler(),
+                    urllib.request.HTTPSHandler(),
+                    urllib.request.HTTPErrorProcessor(),
+                    NoRedirect()):
+        opener.add_handler(handler)
+    return opener
+
+
 def main() -> int:
     fake = "--fake" in sys.argv
+    via_proxy = "--via-proxy" in sys.argv
     if fake:
         cfg = None
         print("mode=offline（--fake，不调用模型）")
@@ -115,6 +137,8 @@ def main() -> int:
             print(f"[FAIL] 未配置模型：{exc}")
             return 2
         print(f"model={cfg.model} base_url={cfg.base_url} api_key=***")
+        if via_proxy:
+            print("mode=via-proxy（代理出站；绕过 DNS 钉住，仅演示用）")
 
     workdir = tempfile.mkdtemp(prefix="rsc-demo-")
     repo = _make_repo(workdir)
@@ -126,7 +150,8 @@ def main() -> int:
         h, tenant="demo", min_budget=20, token_ttl_ms=60_000,
         worktrees=WorktreeManager(repo, os.path.join(workdir, "wt")),
         state_dir=os.path.join(workdir, "state"))
-    llm = _OfflineLLM() if fake else LLMClient(cfg, egress=h.egress)
+    llm = _OfflineLLM() if fake else LLMClient(
+        cfg, egress=h.egress, opener=_proxy_opener() if via_proxy else None)
 
     print(f"repo={repo}")
     contents: dict[str, str] = {}
@@ -197,6 +222,10 @@ def main() -> int:
     print(f"{'task':<10}{'receipt_id':<26}{'version':<9}{'bytes':<7}dedup")
     for name, rid, ver, n, dd in rows:
         print(f"{name:<10}{rid:<26}{ver:<9}{n:<7}{dd}")
+
+    print("\n=== 模型产出（前 60 字） ===")
+    for rel, text in contents.items():
+        print(f"{rel:<16} {text[:60]}")
 
     ok = True
     print("\n=== 三条保证 ===")

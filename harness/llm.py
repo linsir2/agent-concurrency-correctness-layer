@@ -113,7 +113,8 @@ class LLMConfig:
 
 
 def _post(url: str, payload: dict, headers: dict, timeout_s: float, *,
-          egress: Optional[EgressGuard] = None) -> dict:
+          egress: Optional[EgressGuard] = None,
+          opener: Optional[urllib.request.OpenerDirector] = None) -> dict:
     """真实网络分支：**必须**先过 egress 强制点，再走钉住 + 禁重定向的 opener。
 
     - `ensure()` 在入口调用：无强制点 → `EgressUnavailable`（拒绝出站，fail-closed）；
@@ -124,8 +125,11 @@ def _post(url: str, payload: dict, headers: dict, timeout_s: float, *,
     guard.ensure()
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    # `opener` 仅供受限环境（必须经代理才能出站）显式注入：默认 None →
+    # 钉住 + 禁代理的 `build_opener()`（生产语义，不被本参数改变）。
+    active = opener if opener is not None else build_opener()
     try:
-        with build_opener().open(req, timeout=timeout_s) as resp:
+        with active.open(req, timeout=timeout_s) as resp:
             return json.loads(resp.read().decode("utf-8"))  # pragma: no cover
     except urllib.error.HTTPError as exc:
         if 300 <= int(exc.code) < 400:
@@ -155,9 +159,12 @@ class LLMClient:
     """把 egress guard 与配置绑在一起的客户端（`Harness.llm` 使用）。"""
 
     def __init__(self, config: Optional[LLMConfig] = None, *,
-                 egress: Optional[EgressGuard] = None) -> None:
+                 egress: Optional[EgressGuard] = None,
+                 opener: Optional[urllib.request.OpenerDirector] = None) -> None:
         self.config = config
         self.egress = egress if egress is not None else _default_egress()
+        # 见 `_post`：默认 None = 钉住 + 禁代理；仅受限环境显式覆盖。
+        self.opener = opener
 
     def chat(self, messages: Iterable[Mapping[str, str]], *,
              temperature: float = 0.0,
@@ -181,7 +188,7 @@ class LLMClient:
         for attempt in range(cfg.max_retries + 1):
             try:
                 data = _post(url, payload, headers, cfg.timeout_s,
-                             egress=self.egress)
+                             egress=self.egress, opener=self.opener)
                 return data["choices"][0]["message"]["content"]
             except EgressDenied:
                 raise                       # 出站被策略拒绝：不得重试、不得降级
@@ -200,10 +207,11 @@ def chat(messages: Iterable[Mapping[str, str]], *,
          config: Optional[LLMConfig] = None,
          temperature: float = 0.0,
          max_tokens: Optional[int] = None,
-         egress: Optional[EgressGuard] = None) -> str:
+         egress: Optional[EgressGuard] = None,
+         opener: Optional[urllib.request.OpenerDirector] = None) -> str:
     """调用 chat/completions，返回首条回复文本。
 
     仅用于阶段二的真实模型接入；阶段一 demo 默认走 scripted fake。
     """
-    return LLMClient(config, egress=egress).chat(
+    return LLMClient(config, egress=egress, opener=opener).chat(
         messages, temperature=temperature, max_tokens=max_tokens)
