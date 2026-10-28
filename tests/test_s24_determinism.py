@@ -14,10 +14,13 @@ import pathlib
 
 import pytest
 
+from conftest import decision, hitl
+
 from harness import RscSession
 from harness.entropy import Deterministic
 from harness.event_log import WalEventLog
 from harness.harness import Harness
+from harness.types import TaskState
 
 
 def _run(root: pathlib.Path, seed: str | None):
@@ -102,6 +105,35 @@ def test_default_mode_is_still_random(tmp_path):
 def test_event_ids_are_deterministic_hex(tmp_path):
     got = _run(tmp_path / "a", "s")
     assert got["event_ids"] and all(len(x) == 32 for x in got["event_ids"])
+
+
+# ---------------------------------------------------------------- HITL
+def _hitl_run(root: pathlib.Path, seed: str) -> bytes:
+    root.mkdir(parents=True)
+    ent = Deterministic(seed)
+    wal = WalEventLog(str(root / "wal.log"), fsync=False, clock=ent, entropy=ent)
+    h = Harness(event_log=wal, checkpoint_root=str(root), entropy=ent,
+                run_limits=10)
+    h.policy.default_token = h.policy.issue(
+        "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
+    plan = h.planner.plan("run-1", [{
+        "task_id": "t", "logical_subgoal_id": "g", "min_budget": 1}])
+    acb = h._admit_and_register(plan, "t")
+    h.run_task(acb, [decision(1, hitl())])
+    assert acb.state is TaskState.WAITING_APPROVAL
+    wal.close()
+    return (root / "wal.log").read_bytes()
+
+
+def test_hitl_same_seed_replays_identical_wal(tmp_path):
+    """`approval_id` 曾是 uuid4 → HITL 场景不可重放（S24-P0 回归）。"""
+    a = _hitl_run(tmp_path / "a", "hitl-seed")
+    b = _hitl_run(tmp_path / "b", "hitl-seed")
+    assert a == b
+
+
+def test_hitl_different_seed_differs(tmp_path):
+    assert _hitl_run(tmp_path / "a", "seed-a") != _hitl_run(tmp_path / "b", "seed-b")
 
 
 # ---------------------------------------------------------------- 边界

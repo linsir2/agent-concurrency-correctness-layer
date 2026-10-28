@@ -336,7 +336,10 @@ class AgentRuntime:
         if moved != Status.OK:
             return moved
         # approval_id 随 hitl_pending 落盘（P0-2：不用 generation 做键）
-        approval_id = uuid.uuid4().hex
+        # S24-P0：确定性模式下必须可重放（进入 APPROVAL_RAISED payload）
+        entropy = getattr(self.h, "entropy", None)
+        approval_id = (entropy.uuid("approval_id") if entropy is not None
+                       else uuid.uuid4().hex)
         now_ms = self.h.clock.now_ms()
         plan = self.h.plans.get(acb.run_id)
         task = plan.get("tasks", {}).get(acb.task_id) if plan else None
