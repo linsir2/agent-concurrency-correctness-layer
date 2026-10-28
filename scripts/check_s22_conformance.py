@@ -137,6 +137,131 @@ for f, names in (
         chk(f"用例存在 {n}", f"def {n}(" in txt)
 chk("方案文档存在", (_ROOT / "docs/s22-implementation-plan.md").exists())
 
+# ---------------------------------------------------- C7 facade
+from harness.facade import RscSession as _RscSession
+
+for name in ("begin", "apply", "gate", "finish", "abort", "snapshot"):
+    chk(f"C7 RscSession.{name} 存在",
+        callable(getattr(_RscSession, name, None)))
+chk("C7 token 索引落盘", "_save_index" in
+    inspect.getsource(_RscSession))
+chk("C7 resolve 走 checkpoint + bump_epoch=False",
+    "_restore_acb" in inspect.getsource(_RscSession.resolve)
+    and "bump_epoch=False" in inspect.getsource(_RscSession.resolve))
+chk("C7 apply 先按外部键重放",
+    "_replay_by_key" in inspect.getsource(_RscSession._apply_locked))
+chk("C7 外部键带 tenant|agent 命名空间",
+    "ns_key" in inspect.getsource(_RscSession._apply_locked))
+chk("C7 apply 后刷新快照（latest_ref）",
+    "_resave" in inspect.getsource(_RscSession._apply_locked))
+chk("C7 resolve 用 latest_ref_for_acb",
+    "latest_ref_for_acb" in inspect.getsource(_RscSession.resolve))
+chk("C7 resolve 校验 TTL", "deadline_ms" in
+    inspect.getsource(_RscSession.resolve))
+chk("C7 准入失败不留僵尸（_discard）", "_discard" in
+    inspect.getsource(_RscSession.begin))
+chk("C7 Deny 带 code（类型化 stale_view）",
+    'code: str = ""' in
+    (_ROOT / "harness/facade.py").read_text(encoding="utf-8"))
+chk("C7 gate 的 stale_view 用 code", 'code="stale_view"' in
+    inspect.getsource(_RscSession.gate))
+chk("C7 cost 校验", "bad_cost" in
+    inspect.getsource(_RscSession.apply))
+chk("C7 只消费一笔预留（不重复扣费）", "[:1]" in
+    inspect.getsource(_RscSession._consume))
+chk("C7 注册 token 清理钩子", "_token_cleanup" in
+    inspect.getsource(_RscSession.__init__))
+_harness_all = (_ROOT / "harness/__init__.py").read_text(encoding="utf-8")
+chk("C7 RscSession 从 harness 包导出", '"RscSession"' in _harness_all)
+
+# ---------------------------------------------------- C8 LangGraph
+from harness.integrations import langgraph as _lg
+
+chk("C8 rsc_writes 装饰器存在", callable(getattr(_lg, "rsc_writes", None)))
+chk("C8 RscMiddleware 存在", hasattr(_lg, "RscMiddleware"))
+_lgm = inspect.getsource(_lg.RscMiddleware)
+chk("C8 实现 wrap_tool_call", "def wrap_tool_call" in _lgm)
+chk("C8 实现 awrap_tool_call（异步必须）", "def awrap_tool_call" in _lgm)
+chk("C8 before_agent/after_agent 生命周期", "def before_agent" in _lgm
+    and "def after_agent" in _lgm)
+chk("C8 会话级 writes 声明", "writes=self._writes" in _lgm)
+chk("C8 用 override 注入 root（不可变替换）", "override(" in _lgm)
+chk("C8 stale_view 用 code 判定（不靠字符串前缀）",
+    'gate.code == "stale_view"' in _lgm)
+chk("C8 worktree 缺失 fail-closed（不判删除）", "_worktree_ok" in _lgm)
+chk("C8 不懒建 token（no_session 拒绝）",
+    "_lazy" not in _lgm and "no_session" in _lgm)
+chk("C8 root_arg 签名校验（不接则 passthrough）",
+    "_accepts_root" in _lgm)
+chk("C8 构造期要求 worktrees", "session.worktrees is None" in _lgm)
+
+# ---------------------------------------------------- C9 MCP
+from harness.integrations import mcp_server as _mcp
+
+_mcp_tools = inspect.getsource(_mcp)
+for name in ("rsc_apply", "rsc_write", "rsc_begin", "rsc_finish",
+             "rsc_gate", "rsc_snapshot"):
+    chk(f"C9 工具 {name}", f"def {name}" in _mcp_tools)
+_chk_src = inspect.getsource(_mcp.make_tools)
+chk("C9 agent_id 只由 server 配置（不接收调用方声明）",
+    "agent_id_" not in _chk_src and 'agent_id: str = "mcp-agent"' in _chk_src)
+chk("C9 rsc_begin 的 writes 必填（OCC 钉住点）",
+    "writes: list" in _chk_src)
+chk("C9 build_mcp_server 存在",
+    callable(getattr(_mcp, "build_mcp_server", None)))
+chk("C9 make_tools 模块级可测", "def make_tools" in _mcp_tools)
+
+# ---------------------------------------------------- extras 与测试
+for extra in ('langgraph = ["langchain>=1.2", "langgraph>=1.0"]',
+              'mcp = ["mcp>=1.9"]'):
+    chk(f"pyproject extras {extra.split('=')[0].strip()}", extra in _p)
+for f, names in (
+    ("tests/test_s22_facade.py",
+     ("test_c7_1_concurrent_write_conflict",
+      "test_c7_2_same_key_retry_returns_same_receipt",
+      "test_c7_3_same_key_different_content_conflicts",
+      "test_c7_4_expired_token_denied",
+      "test_c7_5_budget_wait_then_abort_reclaims",
+      "test_c7_6_coordinator_unavailable_is_deny",
+      "test_c7_7_token_restores_from_checkpoint",
+      "test_c7_7b_finish_snapshot_not_resurrected",
+      "test_c7_8_delete_and_stale_gate",
+      "test_c7_9_finish_idempotent_and_snapshot",
+      "test_c7_10_cross_session_same_key_does_not_replay",
+      "test_c7_11_cost_validation",
+      "test_c7_12_writes_empty_means_unpinned",
+      "test_c7_13_begin_failure_leaves_no_zombie")),
+    ("tests/test_s22_langgraph.py",
+     ("test_c8_undeclared_tool_passes_through",
+      "test_c8_root_injection_and_commit",
+      "test_c8_async_variant",
+      "test_c8_async_conflict",
+      "test_c8_conflict_returns_command",
+      "test_c8_expired_token_raises",
+      "test_c8_wait_returns_error_toolmessage",
+      "test_c8_deny_raises",
+      "test_c8_no_session_denied",
+      "test_c8_delete_read_back",
+      "test_c8_worktree_missing_denied",
+      "test_c8_unpinned_resource_denied",
+      "test_c8_root_arg_signature_mismatch_passthrough",
+      "test_c8_idempotency_key_stable_across_retries",
+      "test_c8_requires_worktrees")),
+    ("tests/test_s22_mcp.py",
+     ("test_c9_apply_returns_receipt", "test_c9_apply_idempotent",
+      "test_c9_apply_conflict", "test_c9_apply_requires_key",
+      "test_c9_apply_delete", "test_c9_apply_does_not_leak_token",
+      "test_c9_begin_write_finish_gate", "test_c9_begin_requires_writes",
+      "test_c9_agent_id_not_caller_declared",
+      "test_c9_build_mcp_server_registers_tools",
+      "test_c9_unknown_token_denied")),
+):
+    path = _ROOT / f
+    chk(f"测试文件存在 {f}", path.exists())
+    txt = path.read_text(encoding="utf-8") if path.exists() else ""
+    for n in names:
+        chk(f"用例存在 {n}", f"def {n}(" in txt)
+
 print(f"通过 {len(ok)} / 失败 {len(bad)}")
 for n, d in bad:
     print("  ❌", n, d)

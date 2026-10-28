@@ -29,6 +29,9 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `harness/orchestration.py` | L4 | MS4 |
 | `harness/harness.py` | L5 | 全部 |
 | `harness/spec/` | L2 | MS8（资源模型 / 协调协议 / 收据 / 不变量语料） |
+| `harness/worktree.py` | L1 | S22（Z3 私有工作区） |
+| `harness/facade.py` | L5 | S22（`RscSession` 六动作集成门面） |
+| `harness/integrations/` | 适配 | S22（LangGraph / MCP，可选依赖） |
 
 ## 测试
 
@@ -76,6 +79,11 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s19_budget_gc.py` | S19：K-88 三栅栏修剪（三个负对照 + 有界性 + 剪后不变量）/ K-89 claim 复制 / K-90 归档时间戳 / K-91 remaining / K-92 预检 / K-93 owner |
 | `tests/test_s20_tenant_metering.py` | S20：K-94 有界墓碑（剪后旧 worker 仍被拒 + 有界）/ K-95 fail-safe / K-96 连通性复核 / 多租户配额隔离 / 计量幂等 / 统一 Admin |
 | `tests/test_s21_tenant_and_leases.py` | S21：K-97 tenant 自动接准入（含负对照/配额隔离/计量一致性）/ K-99 失效租约回收（含 `tick` 驱动）/ K-100 窗口量化 + 逐墓碑年龄淘汰 + 三副本上限一致性 / 优先级份额（reserved / 超额借用 / 上限与冲突拒绝） |
+| `tests/test_s22_core.py` | S22 内核：公共 `abort`/`finish`、外部幂等键、token 回收、懒恢复（无全局 epoch 推进） |
+| `tests/test_s22_worktree.py` | S22 Z3：git/copy worktree 隔离、改动检测（含同尺寸同 mtime）、路径逃逸、并发 create |
+| `tests/test_s22_facade.py` | S22 门面：并发冲突 / 同键重放 / 跨会话命名空间 / 过期 token / 预算回收 / 重启恢复 |
+| `tests/test_s22_langgraph.py` | S22 LangGraph：root 注入、读回、sync+async、Conflict→Command、worktree 缺失 fail-closed |
+| `tests/test_s22_mcp.py` | S22 MCP：单次 apply / 多步会话 / 幂等 / 删除 / agent_id 不可冒名 |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

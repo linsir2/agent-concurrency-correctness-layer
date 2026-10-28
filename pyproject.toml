@@ -33,6 +33,9 @@ otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 landlock-alt = ["py-landlock>=0.1"]
 # L7 代理（只与 netns MODE_B 搭配；单独用不构成强制点，§0.1）
 proxy = ["mitmproxy>=10"]
+# S22 集成适配器：宿主框架接入面（核心 `dependencies` 仍为空）
+langgraph = ["langchain>=1.2", "langgraph>=1.0"]
+mcp = ["mcp>=1.9"]
 # 一次装齐（索引可用时）：`pip install -e '.[egress]'`
 egress = ["sandlock>=0.1", "py-landlock>=0.1", "mitmproxy>=10"]
 

@@ -474,3 +474,185 @@ agent.invoke({"messages": [...]})
 - C7 `RscSession`、C8 LangGraph 中间件、C9 MCP server —— 依赖本轮内核验收。
 - token 索引文件（C7 随 facade 一起落地）。
 - `run_plan`（已拍板砍掉）。
+
+---
+
+## 12. C7–C9 实现调研（2026-10-28）
+
+> 目标：确定 facade / LangGraph 中间件 / MCP server 的**真实可用形态**，并给出测试策略。
+> 核实方式：直接读 `langchain 1.2.15` / `langgraph 1.1.10` / `mcp 1.30.0` 的源码签名 + 本地实测。
+
+### 12.1 API 实况（已核实）
+
+| 项 | 事实 | 结论 |
+|---|---|---|
+| `AgentMiddleware.wrap_tool_call` | `(self, request, handler) -> ToolMessage \| Command` | 只拿到 `tool_call{name,args,id}` 与工具返回值 |
+| `AgentMiddleware.awrap_tool_call` | 同上，`handler` 是 async；**基类默认抛 `NotImplementedError`** | 必须 sync + async 双实现 |
+| `ToolCallRequest` | dataclass，字段 `tool_call/tool/state/runtime`；直接赋值**已废弃** | 用 `request.override(tool_call=...)` 做不可变替换 |
+| `request.runtime` | `ToolRuntime`：`state`、`config`（含 `run_id`/`thread_id`）、`context`、`tool_call_id` | 从这里取 agent_id / token / 身份 |
+| `before_agent` / `after_agent` | `(self, state, runtime) -> dict \| None`（返回即**合并进 state**） | 会话生命周期的正确挂点 |
+| `Runtime`（中间件里） | 只有 `context` / `store` / `stream_writer`，**没有** `config` | agent_id 从 `runtime.context` 取 |
+| `ToolMessage` | `content` / `tool_call_id` / `artifact` / `status` | 失败消息要绑定 `tool_call_id` |
+| `Command` | `Command(update={"messages": [ToolMessage(...)]})` | `ToolNode` 校验要求消息绑定同一 `tool_call_id` |
+| MCP `FastMCP` | `.tool(name=..., description=...)`、`.resource(uri, ...)`；stdio / Streamable HTTP（SSE 已废弃） | 装饰器必须关键字参数 |
+| 本地 codec | `storage/codec.dumps/loads`（str）、`storage/atomic.atomic_write` | token 索引文件可直接复用 |
+
+### 12.2 C7 · `RscSession`（facade.py）
+
+**语义**：token = agent 会话。`begin` 一次、多次 `apply`、`finish`/`abort` 一次；worktree 全程复用。
+
+```python
+@dataclass(frozen=True) class Token: token, run_id, agent_id, tenant, base_versions, worktree, deadline_ms
+@dataclass(frozen=True) class Wait: reason
+@dataclass(frozen=True) class Deny: reason
+@dataclass(frozen=True) class Receipt: receipt_id, seq, dedup
+@dataclass(frozen=True) class Conflict: reason
+@dataclass(frozen=True) class Allow
+```
+
+| 动作 | 步骤（全部复用内核） |
+|---|---|
+| `begin(agent_id, intent_key, *, writes=(), reads=())` | `run_id=f"rsc-{uuid4().hex[:12]}"` → `planner.plan` → `_admit_and_register` → 非 ADMITTED 映射 `Wait`(BUDGET/SLOT/PREDECESSOR) 或 `Deny` → 钉住 `base_version` → `worktrees.create(agent_id)` → 写 `rsc_token`/`token_deadline_ms` → `checkpoints.save` + 索引落盘 → `Token` |
+| `apply(token, writes, *, idempotency_key, cost=1)` | **先按外部键查**（`h._dedup_by_external_key`，算 `sha256(canonical_bytes(content))`）→ 命中即 `Receipt`、异内容 `Conflict`；否则解析 token → 校验 `cost<=min_budget` → `commit_batch(idempotency_key=...)` → OK 且非 dedup → `budget.consume` → `Receipt` |
+| `gate(token)` | 终态 → `Deny(terminal)`；逐项比对 `workspace.version` 与 `base_version` → `Deny(stale_view)` / `Allow` |
+| `finish(token)` | `h.finish` → 销毁 worktree → 删索引 |
+| `abort(token)` | `advance(cancel)` → `h.abort` → 销毁 worktree → 删索引 |
+| `snapshot(token)` | `dict(acb.base_version)` |
+
+**token 持久化（C5 的消费者）**：索引文件 `tokens.json`（`codec.dumps` + `atomic_write`），结构 `{token: {ref, worktree, agent_id, deadline_ms}}`。`resolve(token)`：内存 → 索引 → `checkpoints.load_strict(ref)` → `_restore_acb(..., bump_epoch=False)` → 终态或 `needs_readmit` → `Deny`。
+
+**异常 → Deny**：外层按**类名**映射 `RaftUnavailable/NotLeader/FencingRejected/ReceiptConflict/InvariantError` → `Deny`，其余原样抛。
+**注册清理钩子**：`h._token_cleanup = self._on_reaped`（C4 的消费者）。
+
+### 12.3 C8 · LangGraph 中间件
+
+```python
+def rsc_writes(*paths, root_arg=None): ...     # 装饰器 → func.__rsc_writes__/__rsc_root_arg__
+
+class RscMiddleware:
+    def __init__(self, session, *, agent_id_from=None)
+    def before_agent(self, state, runtime) -> dict | None   # begin → 返回 {"rsc_token": ...}
+    def after_agent(self, state, runtime) -> dict | None    # finish
+    def wrap_tool_call(self, request, handler) -> ToolMessage | Command
+    async def awrap_tool_call(self, request, handler) -> ToolMessage | Command
+```
+
+流程（每次工具调用）：
+1. 从 `tool` 读 `__rsc_writes__`；**未声明 → `handler(request)` 直接放行**（记 `unsupported`）。
+2. `token = request.state.get("rsc_token")`；无 token（宿主没用 `before_agent`）→ 懒建。
+3. `gate` → `Deny` 抛 typed error；`Allow` 继续。
+4. `root_arg` 存在 → `request.override(tool_call={**tc, "args": {**tc["args"], root_arg: worktree}})`；否则原样。
+5. `result = handler(req2)`（异步版 `await`）。
+6. 读回声明路径：`worktree.read(path, rel)` 存在 → `Write(rel, content)`；不存在且账本有 → `Write(rel, DELETE)`；不存在且账本没有 → 跳过。
+7. `apply(token, writes, idempotency_key=key)`：
+   - `Receipt` → 返回 `result`；
+   - `Conflict` → `Command(update={"messages": [ToolMessage(content="RSC_CONFLICT:...", tool_call_id=tc["id"], status="error")]})`；
+   - `Deny` → 抛 typed error；
+   - `Wait` → `ToolMessage(status="error", content="RSC_WAIT:...")`（不抛，可排队）。
+
+**幂等键**：`sha256(f"{tenant}|{agent_id}|{resource}|{tool_call['id']}")`。
+
+**agent_id 约定（重要）**：`agent_id_from` 默认 `runtime.context["agent_id"]` → `runtime.config["thread_id"]` → `"default"`。**多 agent 节点必须各自设置 `context.agent_id`**，否则多个节点共享一个 token/worktree（失去隔离）。
+
+### 12.4 C9 · MCP server
+
+| 工具 | 语义 |
+|---|---|
+| `rsc_apply(resource, content, idempotency_key)` | 无 token 的**单次会话**：begin→apply→finish（内部临时 worktree） |
+| `rsc_begin(agent_id)` / `rsc_finish(token)` | 多步会话 |
+| `rsc_gate(token)` / `rsc_snapshot(token)` | 副作用前校验 / 版本快照 |
+
++ resource `rsc://snapshot/{token}`。
+实现上：`make_tools(session) -> dict[str, callable]`（模块级可测函数）+ `build_mcp_server(session)`（用 `FastMCP` 装饰器包装）。服务端入口先 `h.tick()`。`agent_id` 由 server 配置，**不接受调用方声明**（防冒名）。
+
+### 12.5 测试策略（不跑真模型）
+
+| 形态 | 怎么测 |
+|---|---|
+| facade | 直接调 `RscSession`，配合 `tmp_path` git 仓库的 `WorktreeManager` |
+| LangGraph | 构造 duck-typed `SimpleNamespace` 的 `request`（`tool_call/tool/state/runtime`），直接调 `wrap_tool_call` 与 `await awrap_tool_call`；工具用真实函数写文件 |
+| MCP | 直接调 `make_tools(session)[...]` 返回的函数（不走 stdio） |
+
+8 个场景 × 三形态：并发写、同键重试、同键异内容、过期 token、预算耗尽+回收、协调器不可达、重启后 token 复用、路径逃逸。
+
+### 12.6 风险与边界
+
+| 风险 | 对策 |
+|---|---|
+| 宿主不用 `before_agent` | `wrap_tool_call` 里**懒建 token**（按 agent_id 复用），并在文档强调推荐用生命周期钩子 |
+| 宿主不设置 `agent_id`（多节点图） | 默认退化为 `thread_id`；文档写明"多 agent 节点必须各自设置 context.agent_id" |
+| 第三方工具没有 `root` 参数 | 无法重定向 → passthrough + 记 `unsupported`（不假装覆盖） |
+| `after_agent` 在异常路径不触发 | TTL reaper（C4）兜底 |
+| 中间件每次工具调用都建 worktree 的开销 | 用会话级 worktree（token 携带路径），不重复建 |
+| MCP 单次 `rsc_apply` 的 worktree | 内部临时创建/销毁（不复用），适合单写工具 |
+
+### 12.7 实施顺序与出口
+
+1. C7 facade（+ token 索引 + 8 场景 facade 形态）
+2. C6 的 `WorktreeManager` 作为 facade 依赖（已完成）
+3. C8 LangGraph（sync/async + root 注入 + 读回 + 8 场景）
+4. C9 MCP（4 工具 + resource + 8 场景）
+5. 更新 `pyproject` extras、`harness/__init__.py` 导出 `RscSession`、S22 conformance 扩到 C7–C9
+
+**出口**：8 场景 × 3 形态全绿；全量 679 → 679+N 零回归；`dependencies=[]` 不变。
+
+---
+
+## 13. C7–C9 实现结果（2026-10-28）
+
+### 13.1 交付
+
+| 编号 | 状态 | 落点 |
+|---|---|---|
+| C7 `RscSession` 六动作 + token 索引 | ✅ | [facade.py](harness/facade.py) |
+| C8 LangGraph 中间件（sync/async、root 注入、读回） | ✅ | [integrations/langgraph.py](harness/integrations/langgraph.py) |
+| C9 MCP server（6 工具 + resource） | ✅ | [integrations/mcp_server.py](harness/integrations/mcp_server.py) |
+| extras / 导出 / conformance | ✅ | `pyproject.toml`、`harness/__init__.py`、`scripts/check_s22_conformance.py` |
+
+### 13.2 验证
+
+| 门禁 | 结果 |
+|---|---|
+| 全量测试（连跑 3 轮） | **719 passed / 4 xfailed** |
+| S22 用例 | 67 个（core 20 + worktree 10 + facade 14 + langgraph 14 + mcp 11） |
+| S22 一致性核对 | **156 / 0** |
+| 历史核对 | S14–S21 全 0 失败 |
+| 覆盖率 | 整体 **84.27%** ≥ 80，门禁通过 |
+
+### 13.3 评审驱动的修复（第二、三轮对抗式评审）
+
+| 级别 | 发现 | 修复 |
+|---|---|---|
+| P0 | token 索引存 begin 时的 ref，`finish` 后仍可用旧快照复活 token，并导致预算双计 | `resolve` 改用 `latest_ref_for_acb`；`apply` 后 `_resave`；TTL 校验 |
+| P0 | 外部幂等键无命名空间 → 跨会话同键静默丢写 | 键改为 `{tenant}|{agent_id}|{key}` |
+| P0 | MCP `rsc_begin(agent_id_)` 允许冒名 → 可销毁他人 worktree | 删除该形参，`agent_id` 只由 server 配置 |
+| P0 | worktree 目录缺失时读回 `None` → 误判 DELETE 删账本 | 执行前 `_worktree_ok` 检查，缺失即 `RscDenied` |
+| P1 | `cost=0/-1/True/1.5` → 免费写；多预留重复扣费 | `apply` 前置校验；`_consume` 只消费一笔 |
+| P1 | `UPSTREAM_FAILED`（可重试）被硬 Deny；真 OCC 冲突被标成 key 复用 | 分别映射为 `Wait` / `Conflict("stale_write")` |
+| P1 | `writes` 漏传 → 静默失去 OCC（懒建路径 100%） | 取消懒建（无会话即 `no_session` 拒绝）；未钉住资源 `unpinned` 拒绝 |
+| P1 | `resolve` 恢复终态/`needs_readmit` 时不释放槽位 | 显式 `slots.release` |
+| P1 | `begin` 被拒（Wait/Deny）留下僵尸 ACB | `_discard`：`cancel` + `abort` + `purge_run` |
+| P1 | worktree 创建失败不回滚准入 | `begin` 内 try → `_discard` 后重抛 |
+| P1 | `gate` 靠字符串前缀判 `stale_view` | `Deny.code` 类型化判定 |
+| P1 | `root_arg` 与工具签名不匹配 → LangChain 静默吞参数 | `_accepts_root` 用 `inspect.signature` 校验，不接则 passthrough |
+| P1 | 路径逃逸/IO 异常裸抛给宿主 | `_read_back` 包 `(ValueError, OSError)` → 拒绝 |
+| P2 | `rsc_apply` 返回已失效 token | 移除该字段 |
+| P2 | 幂等键用逗号拼接路径可碰撞 | 改 `\x1f` 分隔 |
+| P2 | `session.h` 被适配器穿透 | 新增 `tick()/ledger_get()/ledger_version()` 公共方法 |
+
+### 13.4 已知边界（如实记录）
+
+| 边界 | 说明 |
+|---|---|
+| 必须用 `before_agent` | 中间件不再懒建 token；无会话 → `RscDenied(no_session)`（fail-closed） |
+| 必须声明 `writes` | 未钉住的资源一律 `unpinned` 拒绝；这是有意的 fail-closed |
+| 多 agent 需各自设 `context.agent_id` | 否则共享一个 token/worktree（失去隔离） |
+| 第三方工具无 `root` 参数 | passthrough（不假装覆盖） |
+| `after_agent` 异常路径 | 靠 TTL reaper（C4）兜底 |
+| 外部副作用 exactly-once | 归宿主 outbox；`gate` 只校验读集是否过期 |
+
+### 13.5 下一轮（S23）
+
+- CrewAI（`scoped_hooks`）+ OpenAI Agents SDK（guardrails + MCP）+ AG2 + HTTP sidecar
+- extras 打包与 3-agent 示例
+- 真机 DAG 演示（DashScope）

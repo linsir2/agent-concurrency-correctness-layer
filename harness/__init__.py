@@ -41,6 +41,7 @@ from .orchestration import (Planner, Dispatcher, Scheduler, SlotTracker,
                             RunCoordinator, ReconcileLoop, HITL)
 from .harness import (EpochStore, Harness, ReceiptScanFailed,
                      create_production_harness)
+from .facade import (RscSession, Allow, Deny, Receipt, Token, Wait)
 from .rebase import (MISSING, DELETE, Conflict, MergePolicy, MergeResult, merge3)
 
 __all__ = [
@@ -63,5 +64,6 @@ __all__ = [
     "ReconcileLoop", "HITL",
     "Harness",
     "EpochStore", "ReceiptScanFailed", "create_production_harness",
+    "RscSession", "Token", "Wait", "Deny", "Receipt", "Allow",
     "MISSING", "DELETE", "Conflict", "MergePolicy", "MergeResult", "merge3",
 ]
