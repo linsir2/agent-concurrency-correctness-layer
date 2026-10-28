@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ipaddress
 import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .auth import MissingSecret
@@ -27,6 +28,99 @@ _DATA_CLASS_LEVELS = {
     "confidential": 2,
     "restricted": 3,
 }
+
+
+class CapabilityAttenuationError(ValueError):
+    """S13c §2.4 P0-7：能力衰减遇到**未知 data_class** → fail-closed。
+
+    专用异常（不复用 `ValueError`）：调用方需要区分「参数非法」与
+    「等级序不可判 → 拒绝派生」，后者绝不能退化为字面量比较。
+    """
+
+
+@dataclass
+class Scope:
+    """子任务请求的能力范围（S13c §2.4）。`data_class=None` → 继承父等级。"""
+    tools: set[str] = field(default_factory=set)
+    paths: set[str] = field(default_factory=set)
+    network: set[str] = field(default_factory=set)
+    data_class: Optional[str] = None
+
+
+def _lower_class(a: str, b: Optional[str]) -> str:
+    """按分级序取**更低**的 data_class（S13c P0-7）。
+
+    ❌ `min("public", "confidential") == "confidential"`（字面量比较 → 越权）；
+    ✅ 用 `_DATA_CLASS_LEVELS` 比较。`"*"`：父 `*` → 取 requested；requested
+    `*`（或 None）→ 取父。未知等级 → `CapabilityAttenuationError`（fail-closed）。
+    """
+    if a == "*":
+        return b if b else "*"
+    if b is None or b == "*":
+        return a
+    la = _DATA_CLASS_LEVELS.get(a)
+    lb = _DATA_CLASS_LEVELS.get(b)
+    if la is None or lb is None:
+        raise CapabilityAttenuationError(
+            f"未知 data_class: {a!r}/{b!r}（无法按分级序比较 → 拒绝派生）")
+    return a if la <= lb else b
+
+
+def _intersect_scope(parent_set, requested_set) -> set[str]:
+    """通配感知交集（S13c §2.4）：父 `{"*"}` → requested；子 `{"*"}` → 父；否则 `&`。"""
+    parent = set(parent_set or ())
+    requested = set(requested_set or ())
+    if "*" in parent:
+        return requested
+    if "*" in requested:
+        return parent
+    return parent & requested
+
+
+def _token_contains(child: "CapabilityToken", parent: "CapabilityToken") -> bool:
+    """`child` 每一维是否 ⊆ `parent`（父 `"*"` 视作全集）。"""
+    for dim in ("tools", "paths", "network"):
+        p = set(getattr(parent, dim, ()) or ())
+        c = set(getattr(child, dim, ()) or ())
+        if "*" in p:
+            continue
+        if "*" in c or not c <= p:
+            return False
+    pd = getattr(parent, "data_class", "public")
+    cd = getattr(child, "data_class", "public")
+    if pd == "*":
+        return True
+    pc = _DATA_CLASS_LEVELS.get(pd)
+    cc = _DATA_CLASS_LEVELS.get(cd)
+    if pc is None or cc is None:
+        return cd == pd
+    return cc <= pc
+
+
+def attenuate_token(parent: "CapabilityToken", requested: Scope,
+                    child_id: str) -> "CapabilityToken":
+    """S13c §2.4 P0-7：子能力 = parent ∩ requested；`data_class` 按分级序取低。
+
+    这是**唯一**给子签发能力（派生）的路径；`policy.issue` 的合同保持不变
+    （`test_i4_capability_production_no_self_issue` 依赖旧签名/自证拒绝）。
+    """
+    if not isinstance(child_id, str) or not child_id:
+        raise ValueError("attenuate_token: child_id 必须是非空字符串")
+    if isinstance(requested, dict):
+        requested = Scope(
+            tools=set(requested.get("tools") or ()),
+            paths=set(requested.get("paths") or ()),
+            network=set(requested.get("network") or ()),
+            data_class=requested.get("data_class"))
+    token = CapabilityToken(
+        child_id,
+        tools=_intersect_scope(parent.tools, requested.tools),
+        paths=_intersect_scope(parent.paths, requested.paths),
+        network=_intersect_scope(parent.network, requested.network),
+        data_class=_lower_class(parent.data_class, requested.data_class),
+        parent_id=parent.agent_id,
+    )
+    return token
 
 
 def _split_host_port(entry: str) -> tuple[str, Optional[int]]:
@@ -64,12 +158,15 @@ class CapabilityToken:
     def __init__(self, agent_id: str = "", tools: Optional[set[str]] = None,
                  paths: Optional[set[str]] = None,
                  network: Optional[set[str]] = None,
-                 data_class: str = "public") -> None:
+                 data_class: str = "public",
+                 parent_id: str = "") -> None:
         self.agent_id = agent_id
         self.tools = set(tools or ())
         self.paths = set(paths or ())
         self.network = set(network or ())
         self.data_class = data_class
+        # S13c §2.4：派生 token 的父身份（`attenuate_token` 写入；根 token 为空）。
+        self.parent_id = parent_id
 
     def allows_tool(self, tool: str) -> bool:
         return "*" in self.tools or tool in self.tools
@@ -190,9 +287,22 @@ class PolicyEngine:
     def _resolve(self, token):
         """把 token 归一为 `CapabilityToken`；无法解析 → `None`。
 
+        S13c §2.4：**派生 token 必须可追溯到父 token**（`parent_id` 非空时，
+        父 token 必须已签发且子 scope ⊆ 父 scope）。否则子把 `acb.capability`
+        换成更宽的 token 会绕过 attenuation。
+
         终审 1-2：字符串 token 按**值**缓存已验签结果（同一 token 复用），
         避免 `Signer.verify` 的 jti 去重把第二次判定当成消息重放。
         """
+        resolved = self._resolve_raw(token)
+        if resolved is None:
+            return None
+        if not self._traceable(resolved):
+            return None
+        return resolved
+
+    def _resolve_raw(self, token):
+        """验签/归一（不做 parent 追溯；供 `_traceable` 内部避免递归）。"""
         if token is None:
             return None
         if isinstance(token, CapabilityToken):
@@ -225,11 +335,30 @@ class PolicyEngine:
                 tools=set(payload.get("tools") or []),
                 paths=set(payload.get("paths") or []),
                 network=set(payload.get("network") or []),
-                data_class=payload.get("data_class") or "public")
+                data_class=payload.get("data_class") or "public",
+                parent_id=str(payload.get("parent_id") or ""))
             if exp_value > time.time():
                 self._cache_verified(token, exp_value, resolved)
             return resolved
         return None
+
+    def _traceable(self, token: CapabilityToken, depth: int = 0) -> bool:
+        """`parent_id` 非空 → 父 token 必须已签发且 `token ⊆ parent`（可递归）。"""
+        parent_id = getattr(token, "parent_id", "") or ""
+        if not parent_id:
+            return True
+        if depth >= 16:                       # 防御性上限（避免伪造环）
+            return False
+        parent_raw = self._tokens.get(parent_id)
+        if parent_raw is None:
+            return False
+        parent = self._resolve_raw(parent_raw)
+        if parent is None:
+            return False
+        if not _token_contains(token, parent):
+            return False
+        return self._traceable(parent, depth + 1)
+
 
     def _cache_verified(self, token: str, exp: float,
                         resolved: CapabilityToken) -> None:

@@ -283,6 +283,22 @@ class Decision:
 
 
 @dataclass
+class ResultEnvelope:
+    """S13c §2.4：子任务结构化回传（父汇总用）。
+
+    `status` ∈ {DONE, DONE_PARTIAL, FAILED, CANCELLED}；`coverage` 记录覆盖了
+    哪些子目标；`artifacts` 收集 commit/effect/收据 id；`conflicts` 记录与其他
+    子的矛盾；`budget_usage` 为子任务已消耗预算合计。`DONE_PARTIAL` 由
+    「有子完成 + 有子未完成」产生（此前无任何产生路径）。
+    """
+    status: str = "DONE"
+    coverage: dict = field(default_factory=dict)
+    artifacts: list = field(default_factory=list)
+    conflicts: list = field(default_factory=list)
+    budget_usage: int = 0
+
+
+@dataclass
 class ACB:
     """Agent Context Block（文档 §4.5）。"""
     id: str

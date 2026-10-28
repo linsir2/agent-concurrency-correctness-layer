@@ -17,6 +17,7 @@
 
 from .types import (
     Resource, Lease, Event, ACB, Write, Decision, Action, Result,
+    ResultEnvelope,
     ReceiptConflict,
     Status, Mode, EventKind, TaskState, RunState, TASK_TERMINAL, RUN_TERMINAL,
     TRANSITIONS, advance,
@@ -30,7 +31,8 @@ from .checkpoint import (CheckpointCorrupt, CheckpointStore, EffectEntry,
                          EffectJournal, FileCheckpointStore)
 from .compensation import CompensationJournal, CompEntry
 from .subscription import SubscriptionRegistry
-from .policy import CapabilityToken, PolicyEngine
+from .policy import (CapabilityAttenuationError, CapabilityToken, PolicyEngine,
+                     Scope, attenuate_token)
 from .auth import Signer, MissingSecret
 from .context import ContextAssembler
 from .resolver import ConflictResolver, LLMResolver, ScriptedResolver
@@ -43,7 +45,7 @@ from .rebase import (MISSING, DELETE, Conflict, MergePolicy, MergeResult, merge3
 
 __all__ = [
     "Resource", "Lease", "Event", "ACB", "Write", "Decision", "Action",
-    "Result", "Reservation", "ReceiptConflict",
+    "Result", "ResultEnvelope", "Reservation", "ReceiptConflict",
     "Status", "Mode", "EventKind", "TaskState", "RunState",
     "TASK_TERMINAL", "RUN_TERMINAL", "TRANSITIONS", "advance",
     "Clock", "SystemClock", "ManualClock",
@@ -53,6 +55,7 @@ __all__ = [
     "CompensationJournal", "CompEntry",
     "SubscriptionRegistry",
     "PolicyEngine", "CapabilityToken", "Signer", "MissingSecret",
+    "Scope", "attenuate_token", "CapabilityAttenuationError",
     "ContextAssembler", "AgentRuntime",
     "InvariantError",
     "ConflictResolver", "ScriptedResolver", "LLMResolver",

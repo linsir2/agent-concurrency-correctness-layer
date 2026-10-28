@@ -187,6 +187,11 @@ class AgentRuntime:
             return False                                  # ① 不可解析 = 拒绝
         if resolved.agent_id not in (acb.id, "*"):
             return False                                  # ② 身份绑定
+        # S13c §2.4：有父的 ACB 必须持有**派生自该父**的 token —— 防止子把
+        # `acb.capability` 换成更宽（无 parent_id 或父不匹配）的 token。
+        parent_id = getattr(acb, "parent_id", "") or ""
+        if parent_id and str(getattr(resolved, "parent_id", "") or "") != str(parent_id):
+            return False
         network = action.network                          # 显式字段（不再 getattr）
         if network and not resolved.allows_network(network):
             return False

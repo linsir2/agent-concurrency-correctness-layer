@@ -108,6 +108,8 @@ def _capability_to_payload(token) -> Any:
         "paths": sorted(str(x) for x in (getattr(token, "paths", None) or ())),
         "network": sorted(str(x) for x in (getattr(token, "network", None) or ())),
         "data_class": str(getattr(token, "data_class", "public")),
+        # S13c §2.4：派生 token 的父身份必须随快照落盘（否则恢复后追溯失败）。
+        "parent_id": str(getattr(token, "parent_id", "") or ""),
     }
 
 

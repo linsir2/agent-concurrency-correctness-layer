@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import os
 import threading
 from contextlib import nullcontext
@@ -25,7 +26,8 @@ from .llm import LLMClient
 from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
                             RunCoordinator, Scheduler, SlotTracker, _UNSET,
                             classify_verdict)
-from .policy import CapabilityToken, PolicyEngine
+from .policy import (CapabilityAttenuationError, CapabilityToken, PolicyEngine,
+                     Scope, attenuate_token)
 from .resolver import ScriptedResolver
 from .runtime import AgentRuntime, CrashInjected
 from .spec.receipt import (GENESIS_HASH, Receipt, ReceiptMalformed,
@@ -36,8 +38,8 @@ from .storage.atomic import atomic_write
 from .storage.codec import CodecError, dumps, loads
 from .subscription import SubscriptionRegistry
 from .storage.blob import InMemoryBlobStore, canonical_bytes
-from .types import (ACB, TASK_TERMINAL, EventKind, Mode, ReceiptConflict, Result,
-                    Status, TaskState, Write, advance)
+from .types import (ACB, TASK_TERMINAL, EventKind, Mode, ReceiptConflict,
+                    ResultEnvelope, Result, Status, TaskState, Write, advance)
 from .workspace import WorkspaceManager, WorkspaceVersionStore
 from .rebase import DELETE
 
@@ -152,7 +154,10 @@ class Harness:
                  writer_id: str | None = None,
                  egress_required: bool | None = None,
                  epoch_scope: str = "global",
-                 replan_budget: int = 2) -> None:
+                 replan_budget: int = 2,
+                 spawn_depth: int = 1,
+                 max_fanout: int = 6,
+                 min_budget_per_child: int = 1) -> None:
         if epoch_scope not in ("run", "global"):
             raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
         if isinstance(replan_budget, bool) or not isinstance(replan_budget, int) \
@@ -160,6 +165,22 @@ class Harness:
             raise ValueError(f"非法 replan_budget：{replan_budget!r}（>=0 的整数）")
         self.epoch_scope = epoch_scope
         self.replan_budget = replan_budget       # S13b §2.3：replan 预算（写前计数）
+        # S13c §2.4 C-5：有界 spawn（Codex 默认 1 层 / fanout 6）
+        if isinstance(spawn_depth, bool) or not isinstance(spawn_depth, int) \
+                or spawn_depth < 0:
+            raise ValueError(f"非法 spawn_depth：{spawn_depth!r}（>=0 的整数）")
+        if isinstance(max_fanout, bool) or not isinstance(max_fanout, int) \
+                or max_fanout < 0:
+            raise ValueError(f"非法 max_fanout：{max_fanout!r}（>=0 的整数）")
+        if (isinstance(min_budget_per_child, bool)
+                or not isinstance(min_budget_per_child, int)
+                or min_budget_per_child < 1):
+            raise ValueError(
+                f"非法 min_budget_per_child：{min_budget_per_child!r}（>=1 的整数）")
+        self.spawn_depth = spawn_depth
+        self.max_fanout = max_fanout
+        self.min_budget_per_child = min_budget_per_child
+        self._spawn_counter = itertools.count(1)
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -1485,7 +1506,275 @@ class Harness:
         finally:
             self._drain_scheduler()            # D12：异常路径（含 CrashInjected）也消费队列
 
-    # ---- HITL 结算 -------------------------------------------------
+    # ---- S13c §2.4：spawn_child -------------------------------------
+    def _spawn_depth_of(self, acb: ACB) -> int:
+        """父 ACB 的嵌套深度（根 = 0）；内存 `parent_id` 链，缺失则保守 +1。"""
+        depth = 0
+        cur = acb
+        seen: set[str] = set()
+        while getattr(cur, "parent_id", ""):
+            if depth >= 64 or cur.id in seen:
+                return depth + 1
+            seen.add(cur.id)
+            depth += 1
+            parent = self.acbs.get(cur.parent_id)
+            if parent is None:
+                return depth
+            cur = parent
+        return depth
+
+    def _spawn_reject(self, parent: ACB | None, child_id: str, run_id: str,
+                      task_id: str, reason: str) -> ACB:
+        """拒绝 spawn：返回明确 failure 的 ACB（父不变、零残留、不抛）。"""
+        acb = ACB(id=child_id, run_id=run_id, task_id=task_id)
+        acb.state = TaskState.INADMISSIBLE
+        acb.failure = reason
+        acb.parent_id = parent.id if parent is not None else ""
+        acb.spec["spawn_error"] = reason
+        self._drain_skipped.append(
+            (parent.id if parent is not None else run_id, f"spawn_{reason}"))
+        return acb
+
+    def _spawn_rollback(self, child_id: str, node, resv, slot: bool) -> None:
+        """spawn 失败逆序回滚（预留 → 节点 → 槽位）；事件草稿由调用方丢弃。"""
+        if resv is not None:
+            try:
+                self.budget.settle(resv.reservation_id)
+                self.budget._reservations.pop(resv.reservation_id, None)
+                if node is not None:
+                    node.reservations.pop(resv.reservation_id, None)
+            except Exception:  # noqa: BLE001
+                pass
+        if node is not None:
+            try:
+                if not self.budget.remove_node(node.node_id):
+                    self.budget.archive_node(node.node_id)
+            except Exception:  # noqa: BLE001
+                pass
+        if slot:
+            self.slots.release(child_id)
+
+    def spawn_child(self, parent_acb: ACB, spec: dict,
+                    plan: dict | None = None) -> ACB:
+        """S13c §2.4：派生一个子 ACB（能力子集 + **无双重预留** + 两阶段落盘）。
+
+        预算的唯一写法：`create_node(B-{child}, limits=slice, parent_id=父节点)`
+        + `reserve(child_node, min)` → 链式传播只计一次（**禁止**再
+        `reserve(parent_node)`，否则父 `subtree_reserved` 2×）。父准入时
+        `footprint.child_alloc` 已把子份额计入父 limits。
+
+        两阶段：① 先写父 `children_ids=(child_id, None)` 并落盘（崩溃可续做）
+        → ② 建子 → ③ 成功后回填 `checkpoint_ref` 再落盘（避免 `try_admit`
+        与 save 之间崩溃产生孤儿）。
+        """
+        spec = dict(spec or {})
+        run_id = spec.get("run_id") or parent_acb.run_id
+        task_id = spec.get("task_id") or f"C{next(self._spawn_counter)}"
+        child_id = spec.get("child_id") or \
+            f"A-{run_id}-{task_id}-spawn-{next(self._spawn_counter)}"
+        min_budget = spec.get("min_budget")
+        if isinstance(min_budget, bool) or not isinstance(min_budget, int) \
+                or min_budget < 0:
+            return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                      "INVALID_INPUT")
+
+        with self._transition_lock(parent_acb):
+            if parent_acb.state in TASK_TERMINAL:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_PARENT_TERMINAL")
+            if child_id in self.acbs or child_id in {
+                    str(e[0]) for e in parent_acb.children_ids if e}:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_DUPLICATE_CHILD")
+            if self._spawn_depth_of(parent_acb) + 1 > self.spawn_depth:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_DEPTH_EXCEEDED")
+            child_ids = {str(e[0]) for e in parent_acb.children_ids if e}
+            child_ids |= {c.id for c in parent_acb.children if isinstance(c, ACB)}
+            if len(child_ids) >= self.max_fanout:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_FANOUT_EXCEEDED")
+            if min_budget < self.min_budget_per_child:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "CHILD_BUDGET_TOO_SMALL")
+            parent_node = parent_acb.budget_node
+            if parent_node is None:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_NO_BUDGET_NODE")
+            if min_budget > parent_node.remaining:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "CHILD_BUDGET_EXHAUSTED")
+            parent_token = self._effective_token(parent_acb)
+            resolved_parent = self.policy.resolve_token(parent_token)
+            if resolved_parent is None:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_NO_CAPABILITY")
+            requested = spec.get("scope")
+            if requested is None:
+                requested = spec.get("capability")
+            if requested is None:                     # 未声明 → 继承父的全量 scope
+                requested = Scope(tools=set(resolved_parent.tools),
+                                  paths=set(resolved_parent.paths),
+                                  network=set(resolved_parent.network),
+                                  data_class=resolved_parent.data_class)
+            try:
+                child_token = attenuate_token(resolved_parent, requested, child_id)
+            except CapabilityAttenuationError:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "SPAWN_CAPABILITY_DENIED")
+            # 追溯锚定到**父 ACB id**（生产 token 的 agent_id 即父 id；测试夹具的
+            # 通配 token agent_id="*" 也统一到 id，否则网关 lineage 校验必红）。
+            child_token.parent_id = parent_acb.id
+            # 父 token 必须可被追溯（`_traceable` 按 `_tokens[parent_id]` 查）。
+            if self.policy.token(parent_acb.id) is None and parent_token is not None:
+                self.policy._tokens[parent_acb.id] = parent_token
+
+            logical_subgoal = spec.get("logical_subgoal_id") or f"S-{task_id}"
+            try:
+                retry_budget = int(spec.get("retry_budget", 3) or 3)
+                slice_limits = int(spec.get("budget")
+                                   or (min_budget + retry_budget + 1))
+            except (TypeError, ValueError):
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "INVALID_INPUT")
+            if slice_limits < min_budget:
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          "CHILD_BUDGET_TOO_SMALL")
+
+            # ① 两阶段落盘：先登记 pending（ref=None），崩溃后可据此续做/回收。
+            pending = (child_id, None)
+            parent_acb.children_ids.append(pending)
+            self._safe_save(parent_acb)
+
+            child = ACB(id=child_id, run_id=run_id, task_id=task_id,
+                        logical_subgoal_id=logical_subgoal)
+            child.parent_id = parent_acb.id
+            child.capability = child_token
+            child.retry_budget = retry_budget
+            child.spec["plan_version"] = int((plan or {}).get("version", 1) or 1)
+            child.spec["spawn"] = {"parent_id": parent_acb.id,
+                                   "min_budget": min_budget,
+                                   "slice": slice_limits}
+
+            node = None
+            resv = None
+            slot = False
+            failure = None
+            with self.budget.suppressed():
+                # ② 建子：槽位（可回滚）→ 子预算节点（挂父节点）→ 预留
+                if not self.slots.try_acquire(child_id):
+                    failure = "SPAWN_NO_SLOT"
+                else:
+                    slot = True
+                    node = self.budget.create_node(
+                        f"B-{child_id}", slice_limits,
+                        parent_id=parent_node.node_id, run_id=run_id)
+                    if node is None:
+                        failure = "SPAWN_BUDGET_UNAVAILABLE"
+                    else:
+                        node.owner = child_id
+                        resv = self.budget.reserve(node.node_id, min_budget)
+                        if resv is None:
+                            failure = "CHILD_BUDGET_EXHAUSTED"
+            if failure is not None:
+                self._spawn_rollback(child_id, node, resv, slot)
+                self.budget.discard_pending()
+                parent_acb.children_ids.pop()
+                self._safe_save(parent_acb)
+                return self._spawn_reject(parent_acb, child_id, run_id, task_id,
+                                          failure)
+
+            self.budget.flush_pending()
+            child.reservation_ids = [resv.reservation_id]
+            child.budget_node = node
+            child.state = TaskState.ADMITTED
+            self.acbs[child.id] = child
+            self.run_coordinator.register(child)
+            self._register_admission(child)
+            if plan is not None:
+                plan.setdefault("tasks", {})[task_id] = {
+                    "task_id": task_id,
+                    "logical_subgoal_id": logical_subgoal,
+                    "footprint": {"min_budget": min_budget,
+                                  "child_alloc": 0,
+                                  "parent_budget": parent_node.node_id},
+                    "merge_policy": {},
+                    "state": TaskState.ADMITTED,
+                    "plan_version": child.spec["plan_version"],
+                }
+            self._safe_save(child)
+            # ③ 回填 checkpoint_ref（内存版 `latest_ref_for_acb` 恒 None）
+            ref = None
+            getter = getattr(self.checkpoints, "latest_ref_for_acb", None)
+            if callable(getter):
+                try:
+                    ref = getter(child.id)
+                except Exception:  # noqa: BLE001
+                    ref = None
+            parent_acb.children_ids[-1] = (child.id, ref)
+            parent_acb.children.append(child)
+            self._safe_save(parent_acb)
+            return child
+
+    def result_envelope(self, parent_acb: ACB) -> ResultEnvelope:
+        """S13c §2.4：汇总直接子的结构化回传（含 `DONE_PARTIAL` 产生路径）。"""
+        seen: set[str] = set()
+        children: list[ACB] = []
+        for child in list(getattr(parent_acb, "children", []) or []):
+            if isinstance(child, ACB) and child.id not in seen:
+                seen.add(child.id)
+                children.append(child)
+        for entry in list(getattr(parent_acb, "children_ids", []) or []):
+            try:
+                cid = str(entry[0])
+            except (TypeError, IndexError):
+                continue
+            child = self.acbs.get(cid)
+            if child is not None and cid not in seen:
+                seen.add(cid)
+                children.append(child)
+        coverage: dict = {}
+        artifacts: list = []
+        conflicts: list = []
+        budget_usage = 0
+        done = failed = pending = 0
+        for child in children:
+            coverage[child.task_id] = child.state.value
+            node = child.budget_node
+            if node is not None:
+                budget_usage += int(getattr(node, "consumed", 0) or 0)
+            artifacts.append({"acb_id": child.id, "task_id": child.task_id,
+                              "result_ref": child.result_ref})
+            if child.state in (TaskState.DONE, TaskState.DONE_PARTIAL):
+                done += 1
+            elif child.state in TASK_TERMINAL and child.state is not TaskState.CANCELLED:
+                failed += 1
+                conflicts.append({"acb_id": child.id,
+                                  "reason": child.failure or child.state.value})
+            else:
+                pending += 1
+        if not children or (done == len(children)):
+            status = "DONE"
+        elif pending:
+            status = "DONE_PARTIAL"
+        elif done:
+            status = "DONE_PARTIAL"
+        elif failed:
+            status = "FAILED"
+        else:
+            status = "CANCELLED"
+        return ResultEnvelope(status=status, coverage=coverage,
+                              artifacts=artifacts, conflicts=conflicts,
+                              budget_usage=budget_usage)
+
+    def apply_result_envelope(self, parent_acb: ACB) -> ResultEnvelope:
+        """父汇总落状态：`DONE_PARTIAL` 是此前不存在的产生路径。"""
+        env = self.result_envelope(parent_acb)
+        if env.status == "DONE_PARTIAL" and parent_acb.state not in TASK_TERMINAL:
+            parent_acb.state = TaskState.DONE_PARTIAL
+            self._finalize(parent_acb)
+        return env
+
     @staticmethod
     def _approval_slot(acb: ACB) -> tuple[str | None, int | None]:
         """取 `(approval_id, deadline_ms)`；任一不可用 → `None`（fail-closed 依据）。"""
@@ -2388,6 +2677,7 @@ class Harness:
                 paths=set(cap.get("paths") or ()),
                 network=set(cap.get("network") or ()),
                 data_class=str(cap.get("data_class", "public")),
+                parent_id=str(cap.get("parent_id", "") or ""),
             )
         elif isinstance(cap, str):
             acb.capability = cap
