@@ -21,7 +21,8 @@ from .types import Event, EventKind
 
 
 def _draft(kind, subject, payload, producer, caused_by, idempotency_key,
-           run_id, clock: Clock) -> dict:
+           run_id, clock: Clock, entropy=None) -> dict:
+    """生成事件草稿；`entropy` 给定时 `event_id` 可重放（S24-10）。"""
     return {
         "kind": kind.value if isinstance(kind, EventKind) else str(kind),
         "subject": subject,
@@ -30,7 +31,8 @@ def _draft(kind, subject, payload, producer, caused_by, idempotency_key,
         "caused_by": caused_by,
         "idempotency_key": idempotency_key,
         "run_id": run_id,
-        "event_id": uuid.uuid4().hex,
+        "event_id": (entropy.uuid("event_id") if entropy is not None
+                     else uuid.uuid4().hex),
         "ts": clock.now_ms(),
         "schema_version": 1,
     }
@@ -58,8 +60,10 @@ def _event(rec: dict) -> Event:
 
 
 class _EventLogBase:
-    def __init__(self, clock: Clock | None = None) -> None:
+    def __init__(self, clock: Clock | None = None, entropy=None) -> None:
         self._clock = clock or SystemClock()
+        # S24-10：可选确定性熵源（默认 None → uuid4 / 墙钟，字节不变）
+        self._entropy = entropy
         self._events: list[Event] = []
         self._by_subject: dict[str, list[Event]] = {}
         self._subscribers: list[Callable[[Event], None]] = []
@@ -88,6 +92,14 @@ class _EventLogBase:
 
     def subscribe(self, fn: Callable[[Event], None]) -> None:
         self._subscribers.append(fn)
+
+    @property
+    def entropy(self):
+        return self._entropy
+
+    def set_entropy(self, entropy) -> None:
+        """注入确定性熵源（Harness 在构造时调用；也覆盖用户传入的 EventLog）。"""
+        self._entropy = entropy
 
     def notify_events(self, events: list[Event]) -> None:
         self._notify(events)
@@ -134,8 +146,8 @@ class _EventLogBase:
 class EventLog(_EventLogBase):
     """内存实现（默认）。"""
 
-    def __init__(self, clock: Clock | None = None) -> None:
-        super().__init__(clock)
+    def __init__(self, clock: Clock | None = None, entropy=None) -> None:
+        super().__init__(clock, entropy)
         self._lock = threading.RLock()
         self._seq = 0
 
@@ -148,7 +160,7 @@ class EventLog(_EventLogBase):
         with self._lock:
             self._seq += 1
             rec = _draft(kind, subject, payload, producer, caused_by,
-                         idempotency_key, run_id, self._clock)
+                         idempotency_key, run_id, self._clock, self._entropy)
             rec["seq"] = self._seq
             ev = self._index(_event(rec))
         if notify:
@@ -163,7 +175,7 @@ class EventLog(_EventLogBase):
                 rec = _draft(d["kind"], d["subject"], d.get("payload"),
                              d.get("producer", ""), d.get("caused_by", ""),
                              d.get("idempotency_key", ""), d.get("run_id", ""),
-                             self._clock)
+                             self._clock, self._entropy)
                 rec["seq"] = self._seq
                 events.append(self._index(_event(rec)))
         if notify:
@@ -182,13 +194,13 @@ class WalEventLog(_EventLogBase):
     """
 
     def __init__(self, path, clock: Clock | None = None,
-                 fsync: bool = True) -> None:
-        super().__init__(clock)
+                 fsync: bool = True, entropy=None) -> None:
+        super().__init__(clock, entropy)
         # eventlog._lock：全序末位（进程内，无跨进程语义）
         self._lock = threading.RLock()
         # wal.lock：全序第 2 位（resource → receipts → wal → store → eventlog）
         self._wal_lock = _FileLock(wal_lock_path(path), order=WAL_ORDER)
-        self._wal = Wal(path, fsync=fsync, lock=self._wal_lock)
+        self._wal = Wal(path, fsync=fsync, lock=self._wal_lock, entropy=entropy)
         # S10b §3.4：fencing 注入点（由 Harness 在组装后设置；默认关闭）
         self._fencing_lock = None
         self._fencing_reader = None
@@ -229,7 +241,7 @@ class WalEventLog(_EventLogBase):
             _draft(d["kind"], d["subject"], d.get("payload"),
                    d.get("producer", ""), d.get("caused_by", ""),
                    d.get("idempotency_key", ""), d.get("run_id", ""),
-                   self._clock)
+                   self._clock, self._entropy)
             for d in drafts
         ]
         # ① wal.lock（+ 可选 store_flock）覆盖「读-分配-写-fdatasync」全程

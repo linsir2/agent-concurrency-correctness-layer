@@ -128,7 +128,10 @@ def _node_payload(node: BudgetNode, rid: str, amount: int, consumed: int,
 class BudgetManager:
     def __init__(self, run_limits: int = 1000, tombstone_ttl_s: float = 86400.0,
                  event_log=None, epoch_store=None,
-                 run_scope: str = "global") -> None:
+                 run_scope: str = "global", clock=None, id_factory=None) -> None:
+        # S24-10：可选确定性时钟 / id 工厂（默认 None → 墙钟 + uuid4，字节不变）
+        self._clock = clock
+        self._id_factory = id_factory
         self.root = BudgetNode("run", run_limits)
         self._lock = threading.RLock()
         self._nodes: dict[str, BudgetNode] = {"run": self.root}
@@ -363,7 +366,10 @@ class BudgetManager:
             for a in chain:
                 a.subtree_reserved += amount
             node.self_reserved += amount
-            resv = Reservation(reservation_id or uuid.uuid4().hex, node_id, amount)
+            rid = reservation_id or (self._id_factory("budget_reservation")
+                                     if self._id_factory is not None
+                                     else uuid.uuid4().hex)
+            resv = Reservation(rid, node_id, amount)
             node.reservations[resv.reservation_id] = resv
             self._reservations[resv.reservation_id] = (node, resv)
             self._emit(EventKind.BUDGET_RESERVED, node_id,
@@ -394,7 +400,7 @@ class BudgetManager:
             resv.state = "RELEASED"
             # S19 K-88：终结条目必须有**明确保留期**（原实现不设 → expires_at=0
             # 永不过期 → `_reservations` 无上限增长）
-            stamp = int(time.time() if now is None else now)
+            stamp = self._now_s(now)
             resv.settled_at = stamp
             resv.expires_at = stamp + int(self._tombstone_ttl_s)
             self._emit(EventKind.BUDGET_RELEASED, node.node_id,
@@ -423,7 +429,7 @@ class BudgetManager:
                     a.subtree_reserved -= freed
                 node.self_reserved -= freed
             resv.state = "SETTLED"
-            stamp = int(time.time() if now is None else now)
+            stamp = self._now_s(now)
             resv.settled_at = stamp
             resv.expires_at = stamp + int(self._tombstone_ttl_s)
             self._emit(EventKind.BUDGET_SETTLED, node.node_id,
@@ -618,7 +624,7 @@ class BudgetManager:
             # S18 K-87：`now` 可注入 —— Raft 副本必须使用**同一条命令里的**
             # 时间（由 leader 在提交时决定），否则各副本 tombstone 过期时间不同
             # → 状态发散（gc 时机不同，最终账目不同）。
-            stamp = int(time.time() if now is None else now)
+            stamp = self._now_s(now)
             for n in subtree:
                 for rid in list(n.reservations):
                     resv = n.reservations[rid]
@@ -804,7 +810,7 @@ class BudgetManager:
         # 只在旧事件缺该字段时回退 wall clock —— 否则「重放结果」与「RSM 结果」
         # 的 tombstone 过期时刻不同，gc 时机发散。
         stamp = p.get("expires_at")
-        now = int(stamp) if stamp is not None else int(time.time())
+        now = int(stamp) if stamp is not None else self._now_s(None)
         for r in node.reservations.values():
             r.state = "ARCHIVED"
             r.expires_at = (int(stamp) if stamp is not None
@@ -843,6 +849,14 @@ class BudgetManager:
     # ------------------------------------------------------------------ #
     # 不变量（K-14 / §5.4 / S10a §2.4）
     # ------------------------------------------------------------------ #
+    def _now_s(self, now: float | None) -> int:
+        """统一时间戳（秒）：显式 `now` > 注入时钟 > 墙钟（S24-10 可重放）。"""
+        if now is not None:
+            return int(now)
+        if self._clock is not None:
+            return int(self._clock.now_ms() // 1000)
+        return int(time.time())
+
     def _check_local(self, node: BudgetNode) -> None:
         """O(1) 单节点断言（热路径默认开）。"""
         if not (0 <= node.consumed <= node.self_reserved

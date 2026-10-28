@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import io
+import itertools
 import json
 import os
 import pathlib
@@ -300,6 +301,56 @@ for token in ("test_metrics_are_recomputed_from_turns",
     chk(f"回放用例 {token}", f"def {token}(" in _replay_tests)
 chk("usage 用例存在", (_ROOT / "tests/test_s24_llm_usage.py").exists())
 
+# ---------------------------------------------------------------- S24-10 确定性
+chk("entropy 模块存在", (_ROOT / "harness/entropy.py").exists())
+from harness.entropy import Deterministic
+
+_e1 = Deterministic("conformance-seed")
+_ids_a = [_e1.uuid("event_id") for _ in range(20)]
+_ids_b = [_e1.uuid("budget_reservation") for _ in range(20)]
+chk("域隔离（不同域不碰撞）", not (set(_ids_a) & set(_ids_b)))
+_e3 = Deterministic("conformance-seed")
+chk("同 seed 同域可重建", _ids_a[:3] == [_e3.uuid("event_id") for _ in range(3)])
+_e2 = Deterministic("s", start_ms=1_000, tick_ms=5)
+_ticks = [_e2.now_ms() for _ in range(20)]
+chk("模拟时钟严格单调", all(b > a for a, b in itertools.pairwise(_ticks)))
+chk("event_id 走熵源", 'entropy.uuid("event_id")' in _src("harness/event_log.py"))
+chk("run_id 可重放", "entropy.uuid('run_id')" in _src("harness/facade.py"))
+chk("预算 id/时间可注入",
+    "self._id_factory" in _src("harness/budget.py")
+    and "def _now_s" in _src("harness/budget.py"))
+chk("WAL generation 可注入",
+    'entropy.uuid("wal_generation")' in _src("harness/storage/wal.py"))
+chk("确定性拒绝 auth_secret",
+    "确定性模式不支持 auth_secret" in _src("harness/harness.py"))
+chk("确定性拒绝 merge_queue",
+    "确定性模式不支持 merge_queue" in _src("harness/facade.py"))
+_det_tests = _src("tests/test_s24_determinism.py")
+for token in ("test_same_seed_replays_identical_wal",
+              "test_different_seed_changes_bytes",
+              "test_default_mode_is_still_random",
+              "test_entropy_rejects_auth_secret"):
+    chk(f"确定性用例 {token}", f"def {token}(" in _det_tests)
+
+
+def _det_wal(root, seed):
+    """同一固定场景跑一遍（用于门禁里的逐字节重放断言）。"""
+    from harness.entropy import Deterministic as _D
+    from harness.event_log import WalEventLog as _WEL
+    from harness.harness import Harness as _H
+
+    root.mkdir(parents=True, exist_ok=True)
+    ent = _D(seed)
+    wal = _WEL(str(root / "wal.log"), fsync=False, clock=ent, entropy=ent)
+    h = _H(event_log=wal, checkpoint_root=str(root), entropy=ent, run_limits=10)
+    s = RscSession(h, tenant="t", min_budget=1, state_dir=str(root / "idx"))
+    tok = s.begin("a", "g", writes=["a.md"])
+    s.apply(tok.token, [("a.md", "v1")], idempotency_key="k", agent_id="a")
+    s.finish(tok.token)
+    wal.close()
+    return (root / "wal.log").read_bytes()
+
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)
@@ -379,6 +430,15 @@ with tempfile.TemporaryDirectory() as tmp:
     _store.set_fail(True)
     chk("租约后端故障 fail-closed",
         _h1._renew_writer_lease() is False and _h1._lease_outcome == "unavailable")
+
+    # S24-10 运行期：同 seed 的 WAL 逐字节相等；换 seed 必不同
+    _det_root = pathlib.Path(tmp)
+    chk("同 seed WAL 逐字节相等",
+        _det_wal(_det_root / "d1", "gate-seed")
+        == _det_wal(_det_root / "d2", "gate-seed"))
+    chk("不同 seed WAL 不同",
+        _det_wal(_det_root / "d3", "seed-a")
+        != _det_wal(_det_root / "d4", "seed-b"))
 
     # S24-9 运行期：离线回放 JSON 可解析
     from bench.llm_replay import main as replay_main

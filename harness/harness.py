@@ -222,6 +222,7 @@ class Harness:
                  checkpoint_root=None,
                  writer_id: str | None = None,
                  lease_store: LeaseStore | None = None,
+                 entropy=None,
                  egress_required: bool | None = None,
                  epoch_scope: str = "global",
                  replan_budget: int = 2,
@@ -239,6 +240,16 @@ class Harness:
                  drain_timeout_s: float = 5.0) -> None:
         if epoch_scope not in ("run", "global"):
             raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
+        # S24-10：确定性模式的安全/边界（fail-closed，绝不静默削弱）
+        if entropy is not None:
+            if clock is not None and clock is not entropy:
+                raise ValueError("entropy 与 clock 不能同时提供（entropy 自带时钟）")
+            if auth_secret or os.environ.get("HARNESS_AUTH_SECRET"):
+                raise ValueError(
+                    "确定性模式不支持 auth_secret：Signer 的 jti/exp 必须是真实随机/墙钟")
+            if scheduler_mode != "sync":
+                raise ValueError("确定性模式只支持 scheduler_mode='sync'（并发交错不可重放）")
+        self.entropy = entropy
         if isinstance(replan_budget, bool) or not isinstance(replan_budget, int) \
                 or replan_budget < 0:
             raise ValueError(f"非法 replan_budget：{replan_budget!r}（>=0 的整数）")
@@ -314,8 +325,16 @@ class Harness:
         # 只构造 guard 不接线等于「有锁不装门」——`ensure()` 永远不会被调用。
         self.llm = LLMClient(egress=self.egress)
 
-        self.clock = clock or SystemClock()
-        self.event_log = event_log if event_log is not None else EventLog(clock=self.clock)
+        # S24-10：确定性熵源同时充当时钟（严格单调的模拟时间）
+        self.clock = entropy if entropy is not None else (clock or SystemClock())
+        self.event_log = (event_log if event_log is not None
+                          else EventLog(clock=self.clock, entropy=entropy))
+        if entropy is not None:
+            # 覆盖用户传入的 EventLog：事件 id 与 ts 都必须可重放
+            setter = getattr(self.event_log, "set_entropy", None)
+            if callable(setter):
+                setter(entropy)
+            self.event_log._clock = entropy
         # S12 K-43：run 层 epoch store。WAL 模式 → `wal.log.epoch.<run_id>`；
         # 文件 checkpoint 模式 → `store.epoch.<run_id>`（与 store.json 同目录）；
         # 均无 → 纯内存（旧用例）。
@@ -342,7 +361,14 @@ class Harness:
                                                 lock_timeout_s=lock_timeout_s))
         self.budget = (budget if budget is not None
                        else BudgetManager(run_limits, tombstone_ttl_s=tombstone_ttl_s,
-                                          run_scope=self.epoch_scope))
+                                          run_scope=self.epoch_scope,
+                                          clock=entropy,
+                                          id_factory=(entropy.token
+                                                      if entropy is not None else None)))
+        if entropy is not None:
+            # 用户传入的 BudgetManager 也必须可重放（id + 时间）
+            self.budget._clock = entropy
+            self.budget._id_factory = entropy.token
         self.budget._epoch_store = self._epoch_store    # S12 K-43：run 层 epoch
         self.budget._run_scope = self.epoch_scope        # S12 K-43：scope 注入
         # S10a §2.1：预算事件溯源 = 唯一真相源（预算变更必须落到全局 EventLog）
@@ -484,9 +510,13 @@ class Harness:
         # S24-8：`lease_store` 提供时，租约走**可复制后端**（Raft/内存），
         # 不再读写本地 `writer_lease.json`；未提供时既有路径字节不变。
         self._lease_store = lease_store
-        self._lease_instance = (f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
-                                if lease_store is not None else "")
-        self._writer_id = writer_id or f"harness-{os.getpid()}"
+        if entropy is not None:
+            self._lease_instance = entropy.token("writer_instance")[:16]
+            self._writer_id = writer_id or f"writer-{entropy.uuid('writer')[:12]}"
+        else:
+            self._lease_instance = (f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                                    if lease_store is not None else "")
+            self._writer_id = writer_id or f"harness-{os.getpid()}"
         self._writer_epoch = 0
         self._lease_outcome = ""
         self._lease_reason = ""

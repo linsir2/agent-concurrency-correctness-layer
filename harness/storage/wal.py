@@ -58,10 +58,13 @@ class WalCorrupt(Exception):
 
 
 class Wal:
-    def __init__(self, path: str | Path, fsync: bool = True, lock=None) -> None:
+    def __init__(self, path: str | Path, fsync: bool = True, lock=None,
+                 entropy=None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fsync = fsync
+        # S24-10：确定性 generation（默认 None → uuid4，字节不变）
+        self._entropy = entropy
         # wal.lock：三锁全序的第 2 位（resource → receipts → wal → store → eventlog）
         self._lock = (lock if lock is not None
                       else _FileLock(wal_lock_path(self.path), order=WAL_ORDER))
@@ -104,7 +107,8 @@ class Wal:
         except OSError:
             gen = ""
         if not existed or not gen:
-            gen = uuid.uuid4().hex
+            gen = (self._entropy.uuid("wal_generation")
+                   if self._entropy is not None else uuid.uuid4().hex)
             atomic_write(self.generation_path, gen.encode("utf-8"))
         return gen
 

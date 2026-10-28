@@ -20,6 +20,7 @@ python3 examples/semantic_conflict/run.py             # [结论] 我们能拦住
 python3 -m harness.spec.corpus --check                # 语料无漂移（35 / 0）
 python3 -m harness.diagnose --state-dir <dir>         # 只读体检，退出码 0/1/2
 python3 -m bench.llm_replay --json                    # token 基准回放（n=1，离线）
+python3 -m pytest -q tests/test_s24_determinism.py    # 同 seed 逐字节重放
 ```
 
 `examples/semantic_conflict/run.py` 的实际输出（同一仓库、两处互不重叠的改动）：
@@ -59,7 +60,7 @@ python3 -m bench.llm_replay --json                    # token 基准回放（n=1
 | 多租户 / 计量 / Admin | 定位 §6.5 | ✅ S20/S15/S17 |
 | 宿主适配（LangGraph/CrewAI/OpenAI/AG2/MCP/HTTP） | 定位 §6.2 阶段一交付物、§6.4 MVP | ✅ S22/S23 |
 | 基准五指标 | phase1 §9.3 | ✅ S24-9：真实调用录制 → 离线回放，token 倍数 **1.39**、rework_rate **0.33**（n=1，`bench/fixtures/llm_replay.json`）；其余四指标见 S7 |
-| 确定性原语（seeded uuid/now） | 定位 §4.3 第 3 条 | ❌ `uuid4` 仍散落 |
+| 确定性原语（seeded uuid/now） | 定位 §4.3 第 3 条 | ✅ S24-10：`Deterministic`（域隔离 uuid/token + 单调模拟时钟）注入 event_id/run_id/预算 id/WAL generation；同 seed 单线程 WAL **逐字节相同** |
 | DurableTimer / 定义版本化 | design §14 | ❌ 仅 `tick` 轮询 |
 
 ### 里程碑状态（按 phase1 实录，非 milestones 旧表）
@@ -148,6 +149,7 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 | S24-7 | TLA+ 最小模型 I1/I2/I4/I7 + TLC 反例（jar/Java 可选，主门禁不依赖 Java） | ✅ 已实现，4 正确 + 4 broken 实跑 |
 | S24-8 | 跨主机租约复制：`LeaseState` 纯状态机 + `MemoryLeaseStore` + `RaftLeaseStore`；接管 epoch+1，旧 epoch 续租/提交被拒；缺依赖 fail-closed | ✅ 已实现，18 个用例（含真实 3 节点 Raft） |
 | S24-9 | 真实 token 基准：`LLMReply` 保留上游 usage → `bench/llm_replay.py` 录制 + 离线回放；报 token 倍数与返工率（n=1，不声称显著） | ✅ 已实现（实测 1.39× / 0.33），17 个用例 |
+| S24-10 | 确定性原语：`Deterministic(seed)` 域隔离 id + 单调时钟，注入 event_id/run_id/预算/WAL generation；同 seed 逐字节重放 | ✅ 已实现，11 个用例 |
 
 ### 5.1 S24-1 实现要点
 
@@ -299,6 +301,23 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 - **注意**：该模型把「思考」计入 `completion_tokens`（`reasoning_tokens` 约 674/920），
   `max_tokens=64` 并未真正限制总 completion；报告单列 `reasoning_tokens`。
 - **不做**：大规模评测、多模型横评、把回放数字写成 live、缺 usage 时按字符估算。
+
+### 5.11 S24-10 确定性原语（`harness/entropy.py`）
+
+- **注入面**：`Deterministic(seed)` 提供 `uuid(domain)` / `token(domain)` / `now_ms()`；
+  id = `blake2b(seed | domain | counter)`，**域隔离**（同 counter 不同 domain 不碰撞）；
+  时钟严格单调（默认每次 +1ms）。
+- **接入点**（默认 `entropy=None` → 既有 `uuid4`/墙钟，字节不变）：
+  `event_id`（`event_log._draft`）、`run_id`（`facade.begin`）、预算预留 id 与
+  release/settle 时间戳（`budget.py`）、WAL generation（`storage/wal.py`）、
+  `writer_id`/lease instance。租约/收据链不受影响（收据 payload 不含 event_id/ts）。
+- **重放保证**：同一 seed + **同一调用序列**、单线程、sync 调度、无 auth/无 merge queue
+  → `wal.log` **逐字节相同**（`tests/test_s24_determinism.py`，含换 seed 必不同的必杀变异）。
+- **fail-closed 边界**：确定性模式 + `auth_secret` → 构造即 `ValueError`（`Signer` 的
+  `jti/exp` 必须是真实随机/墙钟）；`scheduler_mode="pool"` 与 `merge_queue` 同样拒绝。
+- **诚实边界**：不承诺多线程交错、真实网络、真实 LLM、子进程 verify 的可复现；
+  确定性 id **不是安全随机**，不得用作能力令牌。checkpoint `store_uuid`/ref 文件名
+  与 worktree 绝对路径不在 v1 承诺内（它们不进 WAL 记录）。
 
 ---
 

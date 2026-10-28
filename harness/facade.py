@@ -177,6 +177,9 @@ class RscSession:
         # S24-4：可选单写者队列（默认关闭 → `apply` 路径字节不变）。
         self._queue: MergeQueue | None = None
         if merge_queue is not None:
+            if getattr(harness, "entropy", None) is not None:
+                raise ValueError(
+                    "确定性模式不支持 merge_queue：队列线程的调度交错不可重放")
             cfg = dict(merge_queue)
             self._queue = MergeQueue(
                 self._run_queued_ticket,
@@ -245,7 +248,10 @@ class RscSession:
         agent_id, intent_key = str(agent_id), str(intent_key)
         if not agent_id or not intent_key:
             return Deny("bad_agent_or_intent")
-        run_id = f"rsc-{uuid.uuid4().hex[:12]}"
+        # S24-10：确定性模式下 run_id 可重放（它进入 commit_key / 收据 id）
+        entropy = getattr(self.h, "entropy", None)
+        run_id = (f"rsc-{entropy.uuid('run_id')[:12]}" if entropy is not None
+                  else f"rsc-{uuid.uuid4().hex[:12]}")
         acb = None
         try:
             plan = self.h.planner.plan(run_id, [{
