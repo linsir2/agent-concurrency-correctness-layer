@@ -60,6 +60,7 @@ class BudgetNode:
         limits: int,
         parent: "BudgetNode | None" = None,
         owner: str = "",
+        run_id: str = "",
     ) -> None:
         self.node_id = node_id
         self.limits = limits
@@ -70,6 +71,7 @@ class BudgetNode:
         self.children: list["BudgetNode"] = []
         self.reservations: dict[str, Reservation] = {}
         self.owner = owner
+        self.run_id = run_id          # K-40：预算事件按 run 归属（per-run 过滤）
         self.parent = parent
         if parent is not None:
             parent.children.append(self)
@@ -106,7 +108,7 @@ def _is_budget_kind(kind) -> bool:
 
 def _node_payload(node: BudgetNode, rid: str, amount: int, consumed: int,
                   state: str, epoch: int) -> dict:
-    """统一的 BUDGET_* payload（node_id/rid/amount/consumed/state/limits/parent_id/epoch）。"""
+    """统一的 BUDGET_* payload（node_id/rid/amount/consumed/state/limits/parent_id/epoch/run_id）。"""
     return {
         "node_id": node.node_id,
         "rid": rid,
@@ -116,12 +118,14 @@ def _node_payload(node: BudgetNode, rid: str, amount: int, consumed: int,
         "limits": node.limits,
         "parent_id": node.parent.node_id if node.parent is not None else None,
         "budget_epoch": epoch,
+        "run_id": getattr(node, "run_id", "") or "",
     }
 
 
 class BudgetManager:
     def __init__(self, run_limits: int = 1000, tombstone_ttl_s: float = 86400.0,
-                 event_log=None) -> None:
+                 event_log=None, epoch_store=None,
+                 run_scope: str = "global") -> None:
         self.root = BudgetNode("run", run_limits)
         self._lock = threading.RLock()
         self._nodes: dict[str, BudgetNode] = {"run": self.root}
@@ -130,7 +134,12 @@ class BudgetManager:
         self._tombstone_ttl_s = tombstone_ttl_s
         # ---- S10a：事件溯源（唯一真相源）----
         self.event_log = event_log          # 由 Harness 注入（可 None）
-        self._epoch = 0                      # 预算 epoch（run 级，单调递增）
+        self._epoch = 0                      # 预算 epoch（全局 writer lease 层）
+        # ---- S12 K-40 / K-43 ----
+        self._run_id = ""                    # 当前 run 上下文（事件 run_id 兜底）
+        self._epoch_store = epoch_store      # run 层 epoch（Harness 注入）
+        # `run_scope="run"` 才启用 per-run fencing；默认 "global" 保持旧语义
+        self._run_scope = run_scope if run_scope in ("run", "global") else "global"
         self._suppress_depth = 0             # 事件抑制深度（准入事务用）
         self._pending: list[dict] = []       # 被抑制的事件草稿（set 语义）
         self._last_budget_seq = 0            # 最近一条已 append 预算事件的 seq
@@ -141,19 +150,55 @@ class BudgetManager:
     # ------------------------------------------------------------------ #
     # 内部工具
     # ------------------------------------------------------------------ #
-    def _durable_epoch(self) -> int:
-        """读取持久化 run 级 epoch（无注入 → 退回本地值，不 fence）。"""
+    def set_run_id(self, run_id: str) -> str:
+        """设置当前 run 上下文（K-40：预算事件 run_id 的兜底来源）。"""
+        self._run_id = run_id or ""
+        return self._run_id
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    def _node_run_id(self, node_id: str) -> str:
+        """事件的 run 归属：节点自带 `run_id` 优先，否则当前 run 上下文。"""
+        node = self._nodes.get(node_id)
+        if node is not None and getattr(node, "run_id", ""):
+            return node.run_id
+        return self._run_id
+
+    def _run_scoped(self, run_id: str | None) -> bool:
+        return (self._run_scope == "run" and bool(run_id)
+                and self._epoch_store is not None)
+
+    def _epoch_for(self, run_id: str | None) -> int:
+        """**本地** epoch（fencing 比较的本地侧）：全局 writer lease epoch。
+
+        K-43：per-run epoch 是**durable 侧**的隔离层（见 `_durable_epoch`），
+        不作为本地比较基准 —— 否则 per-run bump 会同时抬高本地值 → 永远不 fence
+        （那正是 v1.0 `_run_epochs` 装饰性的根因）。
+        """
+        return self._epoch
+
+    def _durable_epoch(self, run_id: str | None = None) -> int:
+        """读取持久化 epoch（无注入 → 退回本地值，不 fence）。
+
+        K-43：`run_scope="run"` → `max(全局 writer lease epoch, run 层 store)`；
+        否则只读 writer lease epoch（`wal.log.epoch` / `store.json`，旧语义）。
+        """
+        durable = 0
+        if self._run_scoped(run_id):
+            durable = int(self._epoch_store.read_epoch(run_id))
         source = self._epoch_source
         if source is None:
-            return self._epoch
+            return max(durable, self._epoch)
         try:
-            return int(source())
+            return max(durable, int(source()))
         except Exception:  # noqa: BLE001  # 读失败不得误杀写路径
-            return self._epoch
+            return max(durable, self._epoch)
 
-    def _epoch_fenced(self, durable: int) -> bool:
+    def _epoch_fenced(self, durable: int, run_id: str | None = None) -> bool:
         """本地 epoch 落后于持久化 epoch → 本写者已被 fence（慢写者被接管）。"""
-        return self._epoch < durable
+        return self._epoch_for(run_id) < durable
 
     def _chain(self, node: BudgetNode) -> list[BudgetNode]:
         """[node, parent, ..., root]"""
@@ -171,19 +216,26 @@ class BudgetManager:
     # ------------------------------------------------------------------ #
     # 事件溯源（S10a §2.1 / §2.6）
     # ------------------------------------------------------------------ #
-    def _emit(self, kind: EventKind, node_id: str, payload: dict) -> None:
+    def _emit(self, kind: EventKind, node_id: str, payload: dict,
+              run_id: str | None = None) -> None:
         """临界区内 append 预算事件（`notify=False`）。
+
+        K-40：事件带 `run_id`（`budget_events(run_id)` 才能按 run 过滤，
+        否则恒为空）。归属优先级：显式 `run_id` → 节点 `run_id` → 当前 run 上下文。
 
         抑制期间只记录草稿（`_pending`），由 `flush_pending` 一次性 append_batch；
         被丢弃时由 `discard_pending` 清空 —— 保证「失败准入零残留」（含事件）。
         """
+        if run_id is None:
+            run_id = self._node_run_id(node_id)
         if self.event_log is None:
             return
         if self._suppress_depth > 0:
             self._pending.append({"kind": kind, "subject": node_id,
-                                  "payload": payload})
+                                  "payload": payload, "run_id": run_id or ""})
             return
-        ev = self.event_log.append(kind, node_id, payload, notify=False)
+        ev = self.event_log.append(kind, node_id, payload, run_id=run_id or "",
+                                   notify=False)
         self._last_budget_seq = max(self._last_budget_seq, ev.seq)
 
     @contextmanager
@@ -215,22 +267,42 @@ class BudgetManager:
         with self._lock:
             self._pending = []
 
-    def set_epoch(self, epoch: int, emit: bool = True) -> int:
-        """设置 run 级 epoch（单调；`emit` 控制是否写入事件流）。"""
+    def set_epoch(self, epoch: int, emit: bool = True,
+                  run_id: str | None = None) -> int:
+        """设置 epoch（单调；`emit` 控制是否写入事件流）。
+
+        K-43：`run_id` 给定 → 写 **run 层**（`EpochStore`，durable 侧隔离层，
+        使该 run 的预算写被 fence）；否则写全局 writer lease 层。
+        """
         with self._lock:
             epoch = int(epoch or 0)
+            if self._run_scoped(run_id):
+                cur = int(self._epoch_store.read_epoch(run_id))
+                if epoch <= cur:
+                    return cur
+                self._epoch_store.set_epoch(run_id, epoch)
+                if emit:
+                    self._emit(EventKind.BUDGET_EPOCH, "run",
+                               {"epoch": epoch, "reason": "fence",
+                                "run_id": run_id},
+                               run_id=run_id)
+                return int(self._epoch_store.read_epoch(run_id))
             if epoch <= self._epoch:
                 return self._epoch
             self._epoch = epoch
             if emit:
                 self._emit(EventKind.BUDGET_EPOCH, "run",
-                           {"epoch": epoch, "reason": "fence"})
+                           {"epoch": epoch, "reason": "fence", "run_id": ""})
             return self._epoch
 
-    def bump_epoch(self, reason: str = "") -> int:
-        """run 级 epoch 单调递增（fencing 依据），并写入事件流。"""
+    def bump_epoch(self, reason: str = "", run_id: str | None = None) -> int:
+        """epoch 单调递增（fencing 依据），并写入事件流。
+
+        `run_id` 给定 → run 层（K-43）；否则全局（向后兼容）。
+        """
         with self._lock:
-            return self.set_epoch(self._epoch + 1, emit=True)
+            return self.set_epoch(self._durable_epoch(run_id) + 1, emit=True,
+                                  run_id=run_id)
 
     # ------------------------------------------------------------------ #
     # 预留 / 释放 / 结算
@@ -238,10 +310,12 @@ class BudgetManager:
     def reserve(self, node_id: str, amount: int) -> Reservation | None:
         if not self._valid_amount(amount):
             return None
+        node0 = self._nodes.get(node_id)
+        run_id = getattr(node0, "run_id", "") or self._run_id
         # fencing：先读 durable epoch（不得在 `_lock` 内读 → 避免 budget→checkpoint 反向锁序）
-        durable = self._durable_epoch()
+        durable = self._durable_epoch(run_id)
         with self._lock:
-            if self._epoch_fenced(durable):
+            if self._epoch_fenced(durable, run_id):
                 return None
             node = self._nodes.get(node_id)
             if node is None:
@@ -258,14 +332,16 @@ class BudgetManager:
             self._reservations[resv.reservation_id] = (node, resv)
             self._emit(EventKind.BUDGET_RESERVED, node_id,
                        _node_payload(node, resv.reservation_id, amount, 0, "ACTIVE",
-                                     self._epoch))
+                                     self._epoch_for(run_id)))
             self._check_local(node)
             return resv
 
     def release(self, reservation_id: str) -> int:
-        durable = self._durable_epoch()
+        found0 = self._reservations.get(reservation_id)
+        run_id = (getattr(found0[0], "run_id", "") or self._run_id) if found0 else self._run_id
+        durable = self._durable_epoch(run_id)
         with self._lock:
-            if self._epoch_fenced(durable):
+            if self._epoch_fenced(durable, run_id):
                 return 0
             found = self._reservations.get(reservation_id)
             if found is None:
@@ -281,14 +357,16 @@ class BudgetManager:
             resv.state = "RELEASED"
             self._emit(EventKind.BUDGET_RELEASED, node.node_id,
                        _node_payload(node, reservation_id, resv.amount, resv.consumed,
-                                     "RELEASED", self._epoch))
+                                     "RELEASED", self._epoch_for(run_id)))
             self._check_local(node)
             return freed
 
     def settle(self, reservation_id: str) -> int:
-        durable = self._durable_epoch()
+        found0 = self._reservations.get(reservation_id)
+        run_id = (getattr(found0[0], "run_id", "") or self._run_id) if found0 else self._run_id
+        durable = self._durable_epoch(run_id)
         with self._lock:
-            if self._epoch_fenced(durable):
+            if self._epoch_fenced(durable, run_id):
                 return 0
             found = self._reservations.get(reservation_id)
             if found is None:
@@ -304,19 +382,21 @@ class BudgetManager:
             resv.state = "SETTLED"
             self._emit(EventKind.BUDGET_SETTLED, node.node_id,
                        _node_payload(node, reservation_id, resv.amount, resv.consumed,
-                                     "SETTLED", self._epoch))
+                                     "SETTLED", self._epoch_for(run_id)))
             self._check_local(node)
             return freed
 
     def consume(self, reservation_id: str, amount: int = 1) -> Result:
         if not self._valid_amount(amount):
             return Result(Status.INVALID_INPUT, {"reason": "bad_amount", "amount": amount})
-        durable = self._durable_epoch()
+        found0 = self._reservations.get(reservation_id)
+        run_id = (getattr(found0[0], "run_id", "") or self._run_id) if found0 else self._run_id
+        durable = self._durable_epoch(run_id)
         with self._lock:
-            if self._epoch_fenced(durable):
+            if self._epoch_fenced(durable, run_id):
                 return Result(Status.REJECT_STALE, {
                     "reason": "budget_epoch_fenced",
-                    "budget_epoch": self._epoch, "durable_epoch": durable,
+                    "budget_epoch": self._epoch_for(run_id), "durable_epoch": durable,
                 })
             found = self._reservations.get(reservation_id)
             if found is None:
@@ -335,7 +415,7 @@ class BudgetManager:
             resv.consumed += amount
             node.consumed += amount
             payload = _node_payload(node, reservation_id, resv.amount, resv.consumed,
-                                    resv.state, self._epoch)
+                                    resv.state, self._epoch_for(run_id))
             self._check_local(node)
             # 事件 append 必须在 `_lock` 内：否则与 release/settle 交错时事件序变成
             # RESERVED→RELEASED→CONSUMED，重放态与实时态不符（E3 误破）。
@@ -371,7 +451,8 @@ class BudgetManager:
     # 节点生命周期
     # ------------------------------------------------------------------ #
     def create_node(
-        self, node_id: str, limits: int, parent_id: str = "run"
+        self, node_id: str, limits: int, parent_id: str = "run",
+        run_id: str = ""
     ) -> BudgetNode | None:
         if limits <= 0:
             return None
@@ -384,11 +465,12 @@ class BudgetManager:
             parent = self._nodes.get(parent_id)
             if parent is None:
                 return None
-            node = BudgetNode(node_id, limits, parent)
+            node = BudgetNode(node_id, limits, parent, run_id=run_id or self._run_id)
             self._nodes[node_id] = node
             self._emit(EventKind.BUDGET_NODE_CREATED, node_id,
                        {"node_id": node_id, "parent_id": parent_id, "limits": limits,
-                        "budget_epoch": self._epoch})
+                        "budget_epoch": self._epoch_for(node.run_id or None),
+                        "run_id": node.run_id})
             return node
 
     def remove_node(self, node_id: str, *, owner: str = "") -> bool:
@@ -467,7 +549,8 @@ class BudgetManager:
                 self._nodes.pop(n.node_id, None)
             self._emit(EventKind.BUDGET_ARCHIVED, node_id,
                        {"node_id": node_id, "folded_consumed": folded_consumed,
-                        "budget_epoch": self._epoch})
+                        "budget_epoch": self._epoch_for(node.run_id or None),
+                        "run_id": node.run_id})
             return True
 
     def gc(self, now: float) -> int:
@@ -486,11 +569,18 @@ class BudgetManager:
     # ------------------------------------------------------------------ #
     # 事件重放（S10a §2.2）—— 唯一真相源
     # ------------------------------------------------------------------ #
-    def budget_events(self) -> list[Event]:
-        """EventLog 中的全部 `BUDGET_*` 事件（按 seq 升序）。"""
+    def budget_events(self, run_id: str | None = None) -> list[Event]:
+        """EventLog 中的 `BUDGET_*` 事件（按 seq 升序）。
+
+        K-40：`run_id` 给定 → 只返回该 run 的事件（按 `e.run_id` 过滤）；
+        `None` → 全部（向后兼容）。
+        """
         if self.event_log is None:
             return []
-        return [e for e in self.event_log.all() if _is_budget_kind(e.kind)]
+        events = [e for e in self.event_log.all() if _is_budget_kind(e.kind)]
+        if run_id is None:
+            return events
+        return [e for e in events if e.run_id == run_id]
 
     def _reset_baseline(self) -> None:
         """重放前重置基线为 0（只留 `run`，清空全部账）—— 修 P1-3 双份。
@@ -530,6 +620,7 @@ class BudgetManager:
                     return False
                 parent_id = p.get("parent_id") or "run"
                 limits = int(p.get("limits", 0) or 0)
+                run_id = p.get("run_id") or ""
                 cur = self._nodes.get(nid)
                 if cur is not None:
                     return (cur.limits == limits
@@ -539,7 +630,7 @@ class BudgetManager:
                 parent = self._nodes.get(parent_id)
                 if parent is None:
                     return False
-                self._nodes[nid] = BudgetNode(nid, limits, parent)
+                self._nodes[nid] = BudgetNode(nid, limits, parent, run_id=run_id)
                 return True
             if kind in (EventKind.BUDGET_RESERVED, EventKind.BUDGET_CONSUMED,
                         EventKind.BUDGET_RELEASED, EventKind.BUDGET_SETTLED):
@@ -706,8 +797,11 @@ class BudgetManager:
                 f"Σ self_reserved - Σ non-ACTIVE.consumed - Σ folded = "
                 f"{total_self - nonactive_consumed - total_folded}")
 
-    def _tree_integrity(self) -> None:
+    def _tree_integrity(self, run_id: str | None = None) -> None:
         """S10a §2.3：树完整性**锚定 EventLog 声明的节点集**（非同义反复）。
+
+        S12 K-40：`run_id` 给定 → 只按该 run 的预算事件校验（分 run 重放用）；
+        否则全局（旧语义）。
 
         `declared` = 事件声明的 node_id 集（ARCHIVED 视为已摘除）；
         `rebuilt` = `self._nodes`。**双向**校验：
@@ -727,7 +821,7 @@ class BudgetManager:
         declared: set[str] = set()
         node_max: dict[str, int] = {}
         fence_epochs: list[int] = []
-        for ev in self.budget_events():
+        for ev in self.budget_events(run_id):
             p = ev.payload or {}
             if ev.kind == EventKind.BUDGET_EPOCH:
                 fence_epochs.append(int(p.get("epoch", 0) or 0))

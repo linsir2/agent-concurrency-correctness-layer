@@ -92,9 +92,17 @@ class _EventLogBase:
     def notify_events(self, events: list[Event]) -> None:
         self._notify(events)
 
-    def replay(self, subject: Optional[str] = None, from_seq: int = 0) -> Iterable[Event]:
-        """按 `(resource, version)` 单调投递（文档 §5.6）。"""
+    def replay(self, subject: Optional[str] = None, from_seq: int = 0, *,
+               run_id: str | None = None) -> Iterable[Event]:
+        """按 `(resource, version)` 单调投递（文档 §5.6）。
+
+        S12 K-33：`run_id` 给定 → 只返回该 run 的事件（同名 subject 不串味）；
+        **未打 run 标签**的事件（`run_id=""`）视为旧日志/全局，仍保留（向后兼容）。
+        """
         source = self._by_subject.get(subject, []) if subject else self._events
+        if run_id is not None:
+            return [e for e in source
+                    if e.seq >= from_seq and (not e.run_id or e.run_id == run_id)]
         return [e for e in source if e.seq >= from_seq]
 
     def has(self, subject: str, kind: EventKind) -> bool:

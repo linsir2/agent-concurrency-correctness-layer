@@ -17,7 +17,8 @@ from .types import Lease
 
 
 class IntentRegistry:
-    def __init__(self, clock=None) -> None:
+    def __init__(self, clock=None, epoch_store=None,
+                 run_scope: str = "global") -> None:
         self._clock = clock or SystemClock()
         self._leases: dict[str, Lease] = {}
         self._active: dict[str, list[Lease]] = {}
@@ -25,6 +26,26 @@ class IntentRegistry:
         self._counter = itertools.count(1)
         self._lock = threading.RLock()
         self._epoch = 0
+        # S12 K-43：run 层 epoch store（Harness 注入；None → 全局语义）
+        self._epoch_store = epoch_store
+        # S12 K-43：`run_scope="run"` 才启用 per-run 隔离；默认 "global" 保持旧语义
+        self._run_scope = run_scope if run_scope in ("run", "global") else "global"
+
+    def _run_scoped(self, run_id: str | None) -> bool:
+        return (self._run_scope == "run" and bool(run_id)
+                and self._epoch_store is not None)
+
+    def _epoch_for(self, run_id: str | None) -> int:
+        """本地 epoch：per-run（`run_scope="run"` 且给了 run_id）→
+        `max(全局, run 层)`；否则全局（旧语义）。
+
+        全局 writer lease epoch 是跨 run 的下界（接管 fencing 对所有 run 生效），
+        run 层只在其上叠加隔离 → 其他 run 的租约不被本 run 的 bump 误伤。
+        """
+        epoch = self._epoch
+        if self._run_scoped(run_id):
+            epoch = max(epoch, int(self._epoch_store.read_epoch(run_id)))
+        return epoch
 
     def declare_logical(self, dep_id: str, agent_id: str, kind: str) -> None:
         """声明逻辑依赖（文档 §7.3）。供准入判定使用。"""
@@ -42,7 +63,8 @@ class IntentRegistry:
                 self._logical.pop(dep_id, None)
 
     def reserve(self, resource: str, agent_id: str, base_version: int,
-                ttl_ms: int = 5000, mode: str = "WRITE") -> Lease:
+                ttl_ms: int = 5000, mode: str = "WRITE",
+                run_id: str = "") -> Lease:
         with self._lock:
             mode = "W" if mode == "WRITE" else mode
             expires_at = 0 if ttl_ms <= 0 else self._clock.now_ms() + ttl_ms
@@ -50,11 +72,12 @@ class IntentRegistry:
                 lease_id=f"L{next(self._counter)}",
                 resource=resource,
                 agent_id=agent_id,
-                epoch=self._epoch,
+                epoch=self._epoch_for(run_id or None),
                 ttl_ms=ttl_ms,
                 valid=True,
                 mode=mode,
                 expires_at=expires_at,
+                run_id=run_id or "",
             )
             self._leases[lease.lease_id] = lease
             self._active.setdefault(resource, []).append(lease)
@@ -64,11 +87,12 @@ class IntentRegistry:
         """无锁只读：按 `lease_id` 查注册表当前租约，再判 valid/epoch/expires_at。
 
         注册表无该 `lease_id`（如调用方持有外部租约）时回退到传入对象。
+        K-43：epoch 按**租约所属 run** 比较（per-run bump 不误伤其他 run）。
         """
         cur = self._leases.get(lease.lease_id, lease)
         if not cur.valid:
             return False
-        if cur.epoch != self._epoch:
+        if cur.epoch != self._epoch_for(cur.run_id or None):
             return False
         if cur.expires_at == 0:
             return True
@@ -91,7 +115,7 @@ class IntentRegistry:
     def renew(self, lease: Lease) -> bool:
         """检查过期并续期；只对当前 epoch 生效（revoke 后不可复活，文档 §3.3/§4.4）。"""
         with self._lock:
-            if lease.epoch != self._epoch:
+            if lease.epoch != self._epoch_for(lease.run_id or None):
                 return False
             cur = self._leases.get(lease.lease_id)
             if cur is None or not cur.valid:
@@ -109,7 +133,9 @@ class IntentRegistry:
             now = self._clock.now_ms()
             ok = False
             for lease in self._leases.values():
-                if lease.agent_id != acb.id or lease.epoch != self._epoch:
+                if lease.agent_id != acb.id:
+                    continue
+                if lease.epoch != self._epoch_for(lease.run_id or None):
                     continue
                 if not lease.valid:
                     continue
@@ -119,26 +145,46 @@ class IntentRegistry:
                 ok = True
             return ok
 
-    def bump_epoch(self) -> None:
-        """Supervisor 回收时调用：旧租约全部失效。"""
+    def bump_epoch(self, run_id: str | None = None,
+                   epoch: int | None = None) -> int | None:
+        """Supervisor 回收时调用：旧租约全部失效。
+
+        K-43：`run_id` 给定 → 只推进该 run 的 epoch、只作废该 run 的租约
+        （其他 run 不受影响）；无参 → 全局（作废全部租约，向后兼容）。
+        `epoch` 给定时**不重复 bump** store（由调用方统一推进，避免双计数）。
+        """
         with self._lock:
-            self._epoch += 1
+            if not self._run_scoped(run_id):
+                # 全局 writer lease 层（`run_scope="global"` 或未给 run_id）
+                self._epoch += 1
+                for lease in self._leases.values():
+                    lease.valid = False
+                return self._epoch
+            if epoch is None:
+                epoch = int(self._epoch_store.bump_epoch(run_id))
+            else:
+                self._epoch_store.set_epoch(run_id, epoch)
             for lease in self._leases.values():
-                lease.valid = False
+                if lease.run_id == run_id:
+                    lease.valid = False
+            return epoch
 
-    def get_epoch(self) -> int:
-        """当前 run 级 epoch（run 级 fencing 依据，§4.4）。"""
+    def get_epoch(self, run_id: str | None = None) -> int:
+        """当前 epoch（`run_id` 给定 → run 层；否则全局，§4.4）。"""
         with self._lock:
-            return self._epoch
+            return self._epoch_for(run_id or None)
 
-    def set_epoch(self, epoch: int) -> int:
-        """从**持久化存储**恢复 run 级 epoch（单调，禁止回绕）。
+    def set_epoch(self, epoch: int, run_id: str | None = None) -> int:
+        """从**持久化存储**恢复 epoch（单调，禁止回绕）。
 
         S10a §3.4：跨进程恢复时 epoch 必须读持久化值，否则新进程从 0 开始
         → 旧租约被误判为有效（fencing 失效）。
+        K-43：`run_id` 给定 → 写 run 层 store；否则全局（向后兼容）。
         """
         with self._lock:
             epoch = int(epoch or 0)
+            if self._run_scoped(run_id):
+                return self._epoch_store.set_epoch(run_id, epoch)
             if epoch > self._epoch:
                 self._epoch = epoch
             return self._epoch

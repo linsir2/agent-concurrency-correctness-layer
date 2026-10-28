@@ -225,6 +225,7 @@ class Lease:
     valid: bool = True
     mode: str = "W"            # "R" | "W"（S2 起由 reserve 显式传入）
     expires_at: int = 0        # 注入时钟的毫秒时间戳（0 = 不按时间过期）
+    run_id: str = ""           # S12 K-43：租约所属 run（per-run epoch 隔离）
 
 
 @dataclass

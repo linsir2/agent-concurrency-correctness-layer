@@ -14,12 +14,18 @@ from .types import Event
 
 
 class ContextAssembler:
-    def __init__(self, event_log, workspace, retention: int = 10000) -> None:
+    def __init__(self, event_log, workspace, retention: int = 10000,
+                 floor_for=None, run_scoped: bool = False) -> None:
         if retention < 0:
             raise ValueError(f"retention must be >= 0, got {retention}")
         self._event_log = event_log
         self._workspace = workspace
         self.retention = retention
+        # S12 K-33：per-run 保留窗口下界（由 Harness 注入；None → 全局 tail，
+        # 向后兼容直接构造 `ContextAssembler` 的旧用例）。
+        self._floor_for = floor_for
+        # S12 K-33：`run_scoped=True` → 重放按 `run_id` 过滤（同名 subject 不串 run）
+        self._run_scoped = bool(run_scoped)
         # S9 §2.2：两个计数器必须在构造时初始化（v1.0 漏了 → AttributeError）
         self.snapshots_forced = 0      # 总：有快照 → 强制抬 cursor 的次数
         self.retention_bypassed = 0    # 总：无快照/水位不足 → 放弃窗口限制（不跳）
@@ -44,7 +50,10 @@ class ContextAssembler:
         """
         tail = self._event_log.tail()
         if self.retention > 0:
-            floor = max(0, tail - self.retention + 1)
+            if self._floor_for is not None:
+                floor = self._floor_for(acb.run_id)      # K-33：per-run tail
+            else:
+                floor = max(0, tail - self.retention + 1)
             if acb.cursor < floor:
                 watermark = int(getattr(acb, "materialized_watermark", 0) or 0)
                 scope = self._scope_of(acb)
@@ -60,7 +69,13 @@ class ContextAssembler:
                               else self.no_snapshot_bypassed)
                     self._bump(bucket, scope)
         view = copy.deepcopy(acb.materialized)
-        for ev in self._event_log.replay(from_seq=acb.cursor):
+        run_id = getattr(acb, "run_id", "") or ""
+        if self._run_scoped:
+            # K-33：视图不串 run（重放在 EventLog 侧过滤，同名 subject 不串味）
+            events = self._event_log.replay(from_seq=acb.cursor, run_id=run_id)
+        else:
+            events = self._event_log.replay(from_seq=acb.cursor)
+        for ev in events:
             if ev.subject in acb.subscriptions:
                 if isinstance(ev.payload, dict) and "content" in ev.payload:
                     view[ev.subject] = ev.payload["content"]
@@ -73,6 +88,9 @@ class ContextAssembler:
         return view
 
     def replay(self, acb) -> list[Event]:
+        if self._run_scoped:
+            return list(self._event_log.replay(
+                from_seq=acb.cursor, run_id=getattr(acb, "run_id", "") or ""))
         return list(self._event_log.replay(from_seq=acb.cursor))
 
     @staticmethod

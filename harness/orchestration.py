@@ -397,7 +397,8 @@ class Dispatcher:
             limits = min_budget + acb.retry_budget + 1
             node = self.h.budget.create_node(
                 f"B-{acb.id}", limits,
-                parent_id=task["footprint"].get("parent_budget", "run"))
+                parent_id=task["footprint"].get("parent_budget", "run"),
+                run_id=acb.run_id)
             if node is None:
                 self._deny(acb, "BUDGET_UNAVAILABLE")
                 return False

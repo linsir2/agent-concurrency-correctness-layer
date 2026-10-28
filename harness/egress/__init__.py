@@ -21,7 +21,7 @@ import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-from . import lsm, netns
+from . import container, lsm, netns
 from .resolver import (
     CLOUD_METADATA,
     EgressDenied,
@@ -43,6 +43,15 @@ _FALSE = {"0", "false", "no", "off"}
 
 class EgressUnavailable(RuntimeError):
     """无可用 egress 强制点（库缺失 / 内核不支持 / 无 root）→ **拒绝服务**。"""
+
+
+class SandboxUnavailable(RuntimeError):
+    """S12：**沙箱后端**不可用（`unshare` 缺失/EPERM、`runsc` 缺失）。
+
+    **专用异常**（不复用 `EgressUnavailable`）：语义不同 —— 前者是「无强制点」，
+    后者是「选定的隔离后端跑不起来」。混用会让「后端选型失败」被误报成
+    「没有强制点」，掩盖真实降级原因。
+    """
 
 
 @dataclass(frozen=True)
@@ -148,26 +157,48 @@ class EgressGuard:
             return status
         raise EgressUnavailable("无可用 egress 强制点：" + "；".join(status.reasons))
 
+    def require_available(self) -> EgressStatus:
+        """**生产 gate**（S12 K-55）：无强制点 → `EgressUnavailable`（拒绝启动）。
+
+        与 `ensure()` 的差别：`ensure()` 尊重 `required=False` 的显式降级，
+        本方法**不尊重** —— 生产入口不允许「降级继续跑」。
+        """
+        return require_available()
+
     def __repr__(self) -> str:  # 避免把探测细节泄漏进日志（只给结论）
         return f"EgressGuard(required={self.required!r}, available={self.status.available})"
 
 
 def enforce(argv: Sequence[str], allow_hosts: Iterable[str] = (), *,
             backend: str = "auto", netns_name: str = "harness-egress",
-            mode: str = netns.MODE_A_NO_ROUTE, proxy: str | None = None) -> int:
+            mode: str = netns.MODE_A_NO_ROUTE, proxy: str | None = None,
+            bundle: str | None = None) -> int:
     """把 `argv` 放进**最强可用**的强制点里跑，返回退出码。
 
-    `backend`：`auto`（LSM 优先，退 netns）/ `lsm` / `netns`；都不可用 →
-    `EgressUnavailable`（**拒绝服务**，绝不静默直接跑）。
+    `backend`：`auto`（LSM 优先，退 netns）/ `lsm` / `netns` /
+    **`userns`**（`unshare -Urn`，无需 root）/ **`gvisor`**（`runsc` + OCI
+    bundle，需 `bundle`）；都不可用 → `EgressUnavailable`
+    （**拒绝服务**，绝不静默直接跑）。
+
+    `auto` **不**降级到 `userns`/`gvisor`：显式后端才启用，避免改变
+    「无强制点即拒绝」的既有语义（与 S11 用例一致）。
     """
     hosts = tuple(sorted({str(h) for h in allow_hosts if str(h).strip()}))
-    if backend not in ("auto", "lsm", "netns"):
+    if backend not in ("auto", "lsm", "netns", "userns", "gvisor"):
         raise ValueError(f"未知 backend：{backend!r}")
+    if backend == "gvisor":
+        if not bundle:
+            raise ValueError("backend='gvisor' 必须提供 OCI bundle")
+        proc = container.spawn_in_gvisor(argv, bundle)
+        return int(proc.wait())
     status = probe()
     if backend in ("auto", "lsm") and status.lsm:
         return lsm.run_sandboxed(argv, hosts)
     if backend in ("auto", "netns") and status.netns:
         proc = netns.spawn_in_netns(argv, netns_name, mode=mode, proxy=proxy)
+        return int(proc.wait())
+    if backend == "userns":
+        proc = netns.spawn_userns(argv)
         return int(proc.wait())
     raise EgressUnavailable("无可用 egress 强制点：" + "；".join(status.reasons))
 
@@ -180,9 +211,11 @@ __all__ = [
     "EgressStatus",
     "EgressUnavailable",
     "NoRedirect",
+    "SandboxUnavailable",
     "build_opener",
     "connect_and_verify",
     "connect_pinned",
+    "container",
     "enforce",
     "is_forbidden",
     "lsm",

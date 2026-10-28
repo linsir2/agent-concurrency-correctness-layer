@@ -220,13 +220,141 @@ def delete_netns(name: str) -> None:
     _remove_mode_marker(name)
 
 
+# ================================================================ #
+# S12：`unshare -Urn` backend（用户态 + 网络命名空间，无需 root）
+# ================================================================ #
+#
+# 与上面的 `ip netns`（部署级、需 CAP_NET_ADMIN）互补：`unshare --map-root-user
+# --net` 用 **user namespace** 映射 root，普通用户即可创建**独立网络命名空间**
+# → 新 netns 内**无路由**（只有未起的 loopback）→ 任何外部 connect 得
+# `ENETUNREACH`（默认拒绝，语义同 MODE_A）。
+#
+# **不叠加** `ip netns`：两者是**替代关系**（一个用 user ns、一个用
+# CAP_NET_ADMIN），同时启用只会互相干扰。
+
+# 显式降级登记（不允许静默）：`(backend, reason)` 列表，`degradations()` 可读。
+_DEGRADATIONS: list[tuple[str, str]] = []
+
+# 正确参数（**修 P1**：`--map-root` 不存在，应为 `--map-root-user`）
+USERNS_ARGV = ["unshare", "--user", "--map-root-user", "--net",
+               "--fork", "--pid", "--mount-proc"]
+# 规范探针用的简写（与 `USERNS_ARGV` 的隔离语义等价；见 `_probe_userns`）
+USERNS_SHORT = ["unshare", "-Urn"]
+
+# 探针目标：TEST-NET-1（RFC 5737，保证不可路由）
+_PROBE_SNIPPET = (
+    "import socket,sys,errno\n"
+    "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+    "s.settimeout(2)\n"
+    "try:\n"
+    "    s.connect(('192.0.2.1',443))\n"
+    "except OSError as e:\n"
+    "    sys.stderr.write('ERR:%s\\n'%errno.errorcode.get(e.errno,'UNKNOWN'))\n"
+    "    sys.exit(1)\n"
+    "sys.exit(0)\n"
+)
+
+# S12：探针缓存（session 级；key = (python, argv 前缀)）
+_PROBE_CACHE: dict[tuple[str, tuple[str, ...]], bool] = {}
+
+
+def register_degradation(backend: str, reason: str) -> None:
+    """显式登记一项后端降级（不静默）。"""
+    _DEGRADATIONS.append((backend, (reason or "").strip() or "未给出原因"))
+
+
+def degradations() -> list[tuple[str, str]]:
+    """已登记的后端降级（空列表 = 无降级）。"""
+    return list(_DEGRADATIONS)
+
+
+def userns_available() -> tuple[bool, str]:
+    """`unshare -Urn` 是否可用（不可用 = 无 user/net namespace 权限）。"""
+    import shutil as _shutil
+    import sys as _sys
+    if _shutil.which("unshare") is None:
+        return False, "unshare 不可用（util-linux 未安装）"
+    if _probe_userns(_sys.executable):
+        return True, ""
+    return False, ("unshare -Urn 探针未通过（netns 内 connect 未得 ENETUNREACH"
+                   " → 隔离语义不成立，可能 EPERM/被 seccomp 拦）")
+
+
+def _probe_userns(python: str | None = None,
+                  prefix: Sequence[str] | None = None) -> bool:
+    """**启动前探针**（真跑一次）：netns 内 connect 必须 `ENETUNREACH`。
+
+    不依赖「已强制」的声明 —— 直接验证隔离语义本身。`prefix` 默认用规范简写
+    `unshare -Urn`；传 `USERNS_ARGV` 可验证**完整 argv**（含 `--mount-proc`）。
+
+    S12：结果按 `(python, prefix)` **session 级缓存**（避免每用例重复起子进程）。
+    """
+    import shutil as _shutil
+    import sys as _sys
+    python = python or _sys.executable
+    argv = list(prefix) if prefix is not None else list(USERNS_SHORT)
+    key = (python, tuple(argv))
+    if key in _PROBE_CACHE:
+        return _PROBE_CACHE[key]
+    if _shutil.which("unshare") is None:
+        _PROBE_CACHE[key] = False
+        return False
+    try:
+        proc = subprocess.run([*argv, python, "-c", _PROBE_SNIPPET],
+                              capture_output=True, text=True, timeout=20,
+                              check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        _PROBE_CACHE[key] = False
+        return False
+    ok = (proc.returncode != 0
+          and "ENETUNREACH" in (proc.stderr or ""))
+    _PROBE_CACHE[key] = ok
+    return ok
+
+
+def spawn_userns(argv: Sequence[str], **popen_kwargs) -> subprocess.Popen:
+    """在 `unshare -Urn` 子进程里跑 `argv`（**默认拒绝出站**）。
+
+    - 无 `unshare` / 探针未过 → `SandboxUnavailable`（**专用异常**，非
+      `EgressUnavailable`），并显式登记降级；
+    - 规范 argv = `USERNS_ARGV`（`--map-root-user` 而非 `--map-root`），
+      **必须**含 `--net`；完整 argv 探针不过 → 同样拒绝（**不静默降级**为
+      无 `--net` 或残缺 argv）。
+    """
+    from . import SandboxUnavailable
+
+    import shutil as _shutil
+    import sys as _sys
+    if _shutil.which("unshare") is None:
+        reason = "unshare 不可用（util-linux 未安装）→ 无法建立 netns 隔离"
+        register_degradation("unshare", reason)
+        raise SandboxUnavailable(reason)
+    if not _probe_userns(_sys.executable):
+        reason = ("unshare -Urn 探针未通过（netns 内 connect 未得 ENETUNREACH"
+                  " → 隔离语义不成立，可能 EPERM/被 seccomp 拦）")
+        register_degradation("unshare", reason)
+        raise SandboxUnavailable(reason)
+    if not _probe_userns(_sys.executable, USERNS_ARGV):
+        reason = ("unshare 完整 argv 探针未通过（--mount-proc/--fork 可能 EPERM）"
+                  " → 拒绝启动（不静默降级为残缺隔离）")
+        register_degradation("unshare", reason)
+        raise SandboxUnavailable(reason)
+    return subprocess.Popen([*USERNS_ARGV, *argv], **popen_kwargs)
+
+
 __all__ = [
     "MODES",
     "MODE_A_NO_ROUTE",
     "MODE_B_PROXY",
+    "USERNS_ARGV",
+    "USERNS_SHORT",
     "create_netns",
     "delete_netns",
+    "degradations",
     "ip_path",
     "netns_available",
+    "register_degradation",
     "spawn_in_netns",
+    "spawn_userns",
+    "userns_available",
 ]

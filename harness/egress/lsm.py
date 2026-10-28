@@ -37,25 +37,68 @@ _LANDLOCK_CREATE_RULESET_VERSION = 1
 # landlock_create_ruleset 在 x86_64 / arm64 的通用编号均为 444
 _SYSCALL_NR = {"x86_64": 444, "amd64": 444, "aarch64": 444, "arm64": 444}
 
+# 非通用架构登记（不允许静默）：`(arch, reason)`
+_ARCH_DEGRADATIONS: list[tuple[str, str]] = []
+
+
+def _arch_degradation(arch: str, reason: str) -> None:
+    _ARCH_DEGRADATIONS.append((arch, (reason or "").strip() or "未给出原因"))
+
+
+def arch_degradations() -> list[tuple[str, str]]:
+    """已登记的非通用架构降级（空列表 = 无降级）。"""
+    return list(_ARCH_DEGRADATIONS)
+
+
 DEFAULT_FS_READABLE: tuple[str, ...] = ("/usr", "/etc", "/workspace")
 DEFAULT_DNS_ALLOW = "udp://:53"
 
 
-def landlock_abi_version() -> int:
-    """探测内核 Landlock ABI 版本；不可用（ENOSYS/EPERM/非 Linux）→ 0（不抛）。"""
+def landlock_probe(syscall_fn=None) -> tuple[int, int | None]:
+    """探测内核 Landlock ABI 版本，返回 `(abi, errno)`。
+
+    **修 P1**：旧实现丢弃 errno → 38/95/1 全塌缩成 `(0, None)`，四成因判别是空的。
+    现在：
+    - `ctypes.set_errno(0)` 前置、`get_errno()` 后置（errno 不被中间调用污染）；
+    - `r >= 1` → `(r, None)`（ABI 版本）；
+    - 否则 → `(0, errno)`：38=ENOSYS（内核未编译/用户态内核）、
+      95=EOPNOTSUPP（编译未启用）、1=EPERM（seccomp 过滤）；
+    - 非通用架构（i686/riscv 等）→ `(0, None)` + **显式登记**；
+    - 非 Linux / 无 `libc.syscall` → `(0, None)`。
+
+    `syscall_fn` 可注入（测试用替身，返回值语义同 `libc.syscall`）。
+    """
     if not hasattr(os, "uname") or os.uname().sysname != "Linux":
-        return 0
-    nr = _SYSCALL_NR.get(platform.machine().lower())
-    if nr is None:                      # pragma: no cover - 非 x86_64/arm64 架构
-        return 0
+        return (0, None)
+    arch = platform.machine().lower()
+    nr = _SYSCALL_NR.get(arch)
+    if nr is None:
+        _arch_degradation(arch, f"unsupported arch: {arch}（无 landlock syscall 编号）")
+        return (0, None)
+    libc = ctypes.CDLL(None, use_errno=True)
+    ctypes.set_errno(0)
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        rc = libc.syscall(ctypes.c_long(nr), None,
-                          ctypes.c_size_t(0),
-                          ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION))
+        if syscall_fn is None:
+            rc = libc.syscall(ctypes.c_long(nr), None,
+                              ctypes.c_size_t(0),
+                              ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION))
+        else:
+            rc = syscall_fn(nr)
     except (OSError, AttributeError):   # pragma: no cover - 平台无 libc.syscall
-        return 0
-    return max(0, int(rc))
+        return (0, None)
+    rc = int(rc)
+    if rc >= 1:
+        return (rc, None)
+    return (0, ctypes.get_errno())
+
+
+def landlock_abi_version() -> int:
+    """探测内核 Landlock ABI 版本；不可用（ENOSYS/EPERM/非 Linux）→ 0（不抛）。
+
+    内部走 `landlock_probe`（保留 int 兼容）。
+    """
+    abi, _errno = landlock_probe()
+    return int(abi)
 
 
 def kernel_release() -> str:
@@ -149,12 +192,14 @@ __all__ = [
     "KERNEL_MIN",
     "LANDLOCK_ABI_MIN",
     "LANDLOCK_ABI_UDP",
+    "arch_degradations",
     "build_sandbox",
     "confine",
     "dns_enforceable",
     "kernel_release",
     "kernel_version",
     "landlock_abi_version",
+    "landlock_probe",
     "run_sandboxed",
     "sandbox_available",
 ]

@@ -40,6 +40,89 @@ from .workspace import WorkspaceManager, WorkspaceVersionStore
 from .rebase import DELETE
 
 
+class ReceiptScanFailed(RuntimeError):
+    """K-45：收据回扫失败（EventLog 不可用 / WAL 回扫失败）。
+
+    **专用异常**（不复用 `EgressUnavailable`）：收据回扫与 egress 无关，
+    语义混用会让上层无法区分「出站不可用」与「审计状态不可信」。
+    抛出即**拒绝服务**（不 append、不改 head、不加 taint），由粘滞闩锁
+    （`_receipt_scan_failed`）保证后续提交一律被拒，直到一次成功的全量重建。
+    """
+
+
+class EpochStore:
+    """K-43 两层 epoch 中的 **run 层**：`read_epoch(run_id)` / `bump_epoch(run_id)`。
+
+    - 全局 writer lease epoch 仍由 `wal.log.epoch` 承担（接管 fencing，保留）；
+    - 本 store 按 run 分键，隔离**同一 run 内**的租约（监督者回收一个 run
+      不得作废另一个 run 的租约）；
+    - `run_id=None`（无参）→ 全局键 `""`，退回全局语义（向后兼容）；
+    - 持久化：`path_prefix` 给定 → 每 run 一个文件 `"{prefix}.{run_id}"`
+      （WAL 模式即 `wal.log.epoch.<run_id>`），`atomic_write` 保证不撕裂。
+    """
+
+    def __init__(self, path_prefix=None) -> None:
+        self._lock = threading.RLock()
+        self._epochs: dict[str, int] = {}
+        self._prefix = str(path_prefix) if path_prefix else None
+
+    @staticmethod
+    def _key(run_id: str | None) -> str:
+        return run_id or ""
+
+    @staticmethod
+    def _safe(key: str) -> str:
+        if not key:
+            return "global"
+        clean = "".join(c if (c.isalnum() or c in "._-") else "_" for c in key)
+        if clean != key:
+            clean = f"{clean}-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:8]}"
+        return clean
+
+    def _path(self, key: str):
+        if self._prefix is None:
+            return None
+        return f"{self._prefix}.{self._safe(key)}"
+
+    def _load(self, key: str) -> int:
+        path = self._path(key)
+        if path is None:
+            return 0
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return int((fh.read() or "0").strip())
+        except (OSError, ValueError):
+            return 0
+
+    def _store(self, key: str, epoch: int) -> int:
+        self._epochs[key] = epoch
+        path = self._path(key)
+        if path is not None:
+            atomic_write(path, str(epoch).encode("utf-8"))
+        return epoch
+
+    def read_epoch(self, run_id: str | None = None) -> int:
+        with self._lock:
+            key = self._key(run_id)
+            if key not in self._epochs:
+                self._epochs[key] = self._load(key)
+            return int(self._epochs.get(key, 0) or 0)
+
+    def set_epoch(self, run_id: str | None, epoch: int) -> int:
+        with self._lock:
+            key = self._key(run_id)
+            epoch = int(epoch or 0)
+            cur = self.read_epoch(run_id)
+            if epoch > cur:
+                self._store(key, epoch)
+            return int(self._epochs.get(key, 0) or 0)
+
+    def bump_epoch(self, run_id: str | None = None) -> int:
+        with self._lock:
+            key = self._key(run_id)
+            return self._store(key, self.read_epoch(run_id) + 1)
+
+
 class Harness:
     """组装所有组件的门面（对应文档 §20.2 端到端数据流）。
 
@@ -64,7 +147,11 @@ class Harness:
                  receipts_enabled: bool = True,
                  checkpoint_root=None,
                  writer_id: str | None = None,
-                 egress_required: bool | None = None) -> None:
+                 egress_required: bool | None = None,
+                 epoch_scope: str = "global") -> None:
+        if epoch_scope not in ("run", "global"):
+            raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
+        self.epoch_scope = epoch_scope
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -72,6 +159,8 @@ class Harness:
         self.max_concurrent = max_concurrent
         self.retention = retention
         self.per_action_delay = per_action_delay   # §2.5：基准配对用注入点
+        # S12 K-33：per-run 高水位游标（每 run 独立推进，见 `floor_for`）
+        self._run_cursors: dict[str, int] = {}
 
         # ---- S11c/d/e：egress 强制点（见 `harness/egress/__init__.py`）---------
         # `egress_required=True`  → 构造即校验，无强制点 → `EgressUnavailable`（拒绝启动）
@@ -84,8 +173,24 @@ class Harness:
 
         self.clock = clock or SystemClock()
         self.event_log = event_log if event_log is not None else EventLog(clock=self.clock)
+        # S12 K-43：run 层 epoch store。WAL 模式 → `wal.log.epoch.<run_id>`；
+        # 文件 checkpoint 模式 → `store.epoch.<run_id>`（与 store.json 同目录）；
+        # 均无 → 纯内存（旧用例）。
+        _wal0 = getattr(self.event_log, "_wal", None)
+        _epoch_prefix = None
+        if _wal0 is not None and getattr(_wal0, "epoch_path", None) is not None:
+            _epoch_prefix = str(_wal0.epoch_path)
+        else:
+            _root = (checkpoint_root if checkpoint_root is not None
+                     else getattr(checkpoints, "root", None))
+            if _root is not None:
+                _epoch_prefix = os.path.join(str(_root), "store.epoch")
+        self._epoch_store = EpochStore(_epoch_prefix)
         self.blobs = blobs if blobs is not None else InMemoryBlobStore()
-        self.intents = intents if intents is not None else IntentRegistry(self.clock)
+        self.intents = (intents if intents is not None
+                        else IntentRegistry(self.clock, run_scope=self.epoch_scope))
+        self.intents._epoch_store = self._epoch_store    # S12 K-43：run 层 epoch
+        self.intents._run_scope = self.epoch_scope       # S12 K-43：scope 注入
         self.versions = versions if versions is not None else WorkspaceVersionStore()
         self.lock_timeout_s = lock_timeout_s
         self.workspace = (workspace if workspace is not None
@@ -93,7 +198,10 @@ class Harness:
                                                 blobs=self.blobs, path_of=path_of,
                                                 lock_timeout_s=lock_timeout_s))
         self.budget = (budget if budget is not None
-                       else BudgetManager(run_limits, tombstone_ttl_s=tombstone_ttl_s))
+                       else BudgetManager(run_limits, tombstone_ttl_s=tombstone_ttl_s,
+                                          run_scope=self.epoch_scope))
+        self.budget._epoch_store = self._epoch_store    # S12 K-43：run 层 epoch
+        self.budget._run_scope = self.epoch_scope        # S12 K-43：scope 注入
         # S10a §2.1：预算事件溯源 = 唯一真相源（预算变更必须落到全局 EventLog）
         self.budget.event_log = self.event_log
         self._run_limits = int(run_limits)
@@ -140,8 +248,11 @@ class Harness:
                        else PolicyEngine(default_allow=policy_default_allow,
                                          default_token=default_token))
         self.policy._signer_factory = self._get_signer
+        self._sync_run_cursors()          # S12 K-33：从既有事件初始化 per-run 游标
         self.context = (context if context is not None
-                        else ContextAssembler(self.event_log, self.workspace, retention))
+                        else ContextAssembler(self.event_log, self.workspace, retention,
+                                              floor_for=self.floor_for,
+                                              run_scoped=(self.epoch_scope == "run")))
         self.compensation_journal: list[dict] = []      # 文档 §5.4
         self.decide = decide
         self.resolver = (resolver if resolver is not None
@@ -176,6 +287,8 @@ class Harness:
         # scope 锁即跨进程 flock，天然串行；此锁仍保证同进程多线程一致。
         self._receipt_scan_watermark = 0
         self._receipt_refresh_lock = threading.RLock()
+        # S12 K-45：粘滞闩锁（回扫失败 → 后续提交一律被拒，直到全量重建）
+        self._receipt_scan_failed = False
         self._rebuild_receipts()
 
         # ---- S10a §2.5：单写者租约（durable 模式在构造期即 acquire）----
@@ -242,6 +355,8 @@ class Harness:
         self._receipt_ids = ids
         self._tainted_scopes = tainted
         self._malformed_receipts = malformed
+        # K-45：**成功的全量重建**是粘滞闩锁的唯一解除条件（水位推到 tail）。
+        self._receipt_scan_failed = False
         # 首次构建完成 → 水位推到当前尾：之后锁内刷新只扫「新增」收据，
         # 不重复扫旧事件（否则每次 commit 全量扫 EventLog → O(N²)）。
         try:
@@ -322,18 +437,20 @@ class Harness:
 
     @staticmethod
     def _rescan_wal_from_disk(wal) -> None:
-        """flock 内 O(1) fstat 比对：仅当别的进程写过才回扫（复用 WAL 既有优化）。"""
-        try:
-            fd = getattr(wal, "_fd", None)
-            cached = getattr(wal, "_cached_end", None)
-            if fd is not None and cached is not None:
-                if os.fstat(fd).st_size == cached:
-                    return
-            rescan = getattr(wal, "_rescan_from_disk", None)
-            if callable(rescan):
-                rescan()
-        except Exception:  # noqa: BLE001  # 回扫失败 → 调用方回退内存态
-            pass
+        """flock 内 O(1) fstat 比对：仅当别的进程写过才回扫（复用 WAL 既有优化）。
+
+        K-45：回扫失败**不得静默**（与 `_receipt_records` / `Wal.receipts_from`
+        同口径）—— 异常向上抛，由 `_refresh_receipts_locked` 置粘滞闩锁并
+        抛 `ReceiptScanFailed` → 提交 fail-closed。
+        """
+        fd = getattr(wal, "_fd", None)
+        cached = getattr(wal, "_cached_end", None)
+        if fd is not None and cached is not None:
+            if os.fstat(fd).st_size == cached:
+                return
+        rescan = getattr(wal, "_rescan_from_disk", None)
+        if callable(rescan):
+            rescan()
 
     def _refresh_receipts_locked(self) -> None:
         """scope 临界区内：从 EventLog **增量**刷新 head/ids（跨进程安全）。
@@ -345,8 +462,11 @@ class Harness:
         append_batch → 提交内存态。
 
         增量：只处理 `seq > _receipt_scan_watermark` 的 RECEIPT_ISSUED（水位
-        在首次构建时推到当前尾），避免每次 commit 全量扫。刷新失败（EventLog
-        不可用 / 回扫失败）→ 静默回退现有内存态，**不得让提交失败**。
+        在首次构建时推到当前尾），避免每次 commit 全量扫。
+
+        K-45（fail-closed）：回扫失败**不再静默回退** —— 置粘滞闩锁
+        `_receipt_scan_failed` 并抛 `ReceiptScanFailed`（专用异常）。
+        不 append、不改 head、不加 taint（链未污染，无需隔离）。
         """
         if not self.receipts_enabled:
             return
@@ -354,8 +474,9 @@ class Harness:
             watermark = self._receipt_scan_watermark
             try:
                 records = self._receipt_records(watermark)
-            except Exception:  # noqa: BLE001  # EventLog 不可用 → 回退内存态
-                return
+            except Exception as exc:  # noqa: BLE001  # K-45：回扫失败 → 拒绝服务
+                self._receipt_scan_failed = True
+                raise ReceiptScanFailed(str(exc)) from exc
             new_records = [rp for rp in records if rp[0] > watermark]
             if not new_records:
                 return
@@ -397,6 +518,37 @@ class Harness:
                 lock = threading.RLock()
                 self._scope_locks[scope] = lock
             return lock
+
+    # ---- K-33：per-run retention（每 run 独立高水位）----------------
+    def _sync_run_cursors(self) -> None:
+        """从既有事件初始化 per-run 游标（构造 / 恢复后调用一次）。"""
+        for ev in self.event_log.all():
+            self._track_run_cursor(ev)
+
+    def _track_run_cursor(self, ev) -> None:
+        """事件到达 → 推进其 run 的高水位（未打 run 标签的事件记入 `""`）。"""
+        run_id = getattr(ev, "run_id", "") or ""
+        seq = int(getattr(ev, "seq", 0) or 0)
+        if seq > self._run_cursors.get(run_id, 0):
+            self._run_cursors[run_id] = seq
+
+    def _run_tail(self, run_id: str) -> int:
+        """该 run 的**per-run** tail（含未打标签事件 `""`，向后兼容旧日志）。"""
+        return max(int(self._run_cursors.get(run_id, 0) or 0),
+                   int(self._run_cursors.get("", 0) or 0))
+
+    def floor_for(self, run_id: str) -> int:
+        """该 run 的保留窗口下界（`retention <= 0` → 不限制）。
+
+        S12 K-33：`epoch_scope="run"` → 用 **per-run tail**（否则 run B 的活动会把
+        run A 的保留窗口一起推进，A 的历史事件被截断后**找不回**）；
+        `epoch_scope="global"` → **保持现状**（全局 tail，旧语义）。
+        """
+        if self.retention <= 0:
+            return 0
+        if self.epoch_scope != "run":
+            return max(0, self.event_log.tail() - self.retention + 1)
+        return max(0, self._run_tail(run_id) - self.retention + 1)
 
     def _wire_wal_fencing(self) -> None:
         """S11b K-46：把 fencing 三件套注入 `WalEventLog`（fencing **绑 WAL**）。
@@ -661,6 +813,8 @@ class Harness:
 
     # ---- 事件 → 订阅失效（文档 §5.6） ----------------------------
     def _on_event(self, ev) -> None:
+        # S12 K-33：per-run 高水位游标独立推进（run 之间不串）
+        self._track_run_cursor(ev)
         # 周期性清理已过期的 jti（按注入时钟，避免 `_seen` 无界增长）
         self._event_count += 1
         if self._event_count % self.gc_every == 0:
@@ -715,6 +869,10 @@ class Harness:
         """
         if not writes:
             return Result(Status.OK, {"noop": True, "seq": None})
+        # K-45：收据回扫失败的粘滞闩锁未解除 → 一律拒绝服务（fail-closed，
+        # 不 append、不改 head、不加 taint；绝不把水位清水位到 0）。
+        if self._receipt_scan_failed:
+            return Result(Status.UPSTREAM_FAILED, {"reason": "receipt_scan_failed"})
         # S10a §2.5：提交前续租（心跳）；租约被其他写者持有时拒绝服务。
         if not self._ensure_writer_lease():
             return Result(Status.UPSTREAM_FAILED, {
@@ -746,7 +904,8 @@ class Harness:
         try:
             for w in writes:                                       # ② 预留租约（L0）
                 base = self.workspace._base_of(acb, w.resource)
-                lease = self.intents.reserve(w.resource, acb.id, base, self.lease_ms)
+                lease = self.intents.reserve(w.resource, acb.id, base, self.lease_ms,
+                                             run_id=acb.run_id)
                 if lease is None:
                     return Result(Status.DENIED, {"resource": w.resource})
                 leases[w.resource] = lease
@@ -792,7 +951,12 @@ class Harness:
             # P2：去重检查**必须**在临界区内 —— 否则同 scope 跨资源场景下，去重判断
             # 与 head/append 非原子（并发写各自判定「非去重」→ 重复提交 + 重复收据）。
             with self._scope_lock(scope):                          # 锁序 resource → scope → eventlog
-                self._refresh_receipts_locked()
+                try:
+                    self._refresh_receipts_locked()
+                except ReceiptScanFailed:
+                    # K-45：拒绝服务（不 append、不改 head、不加 taint）
+                    return Result(Status.UPSTREAM_FAILED,
+                                  {"reason": "receipt_scan_failed"})
                 # 幂等短路（S9 §2.3.3 / P0-1②③）：逐写匹配既有提交事件
                 #   键 = (run_id, logical_subgoal_id, resource, content_hash, mode)，
                 #   且已提交 blob_hash 必须 == 新内容 hash（内容不同 → 不得短路）。
@@ -871,6 +1035,9 @@ class Harness:
                     return Result(Status.REJECT_STALE, {
                         "reason": "fencing_epoch_rejected",
                         "scope": list(scope), "detail": str(exc)})
+                # S12 K-33：`notify=False` 不触发订阅钩子 → 主动推进 per-run 游标
+                for ev in events:
+                    self._track_run_cursor(ev)
                 # ③ head 后置提交：append 成功后才改内存态
                 # 水位随 append 同步推进：否则下次锁内刷新会重扫本进程刚 append
                 # 的收据，与「已更新的 head」比对 → 误判断链 → 误 taint scope。
@@ -1213,23 +1380,35 @@ class Harness:
         self.budget.set_epoch(epoch, emit=False)
         return epoch
 
-    def bump_epoch(self, reason: str = "") -> int:
-        """run 级 epoch 单调递增（同一 epoch 锁内 RMW，§2.5/§3.4）。
+    def bump_epoch(self, reason: str = "", run_id: str | None = None, *,
+                   epoch_scope: str | None = None) -> int:
+        """epoch 单调递增（K-43 两层）。
 
-        K-46：epoch 绑 WAL（`wal.log.epoch`）——`bump_epoch` **只取独立 epoch
-        锁**，不得在 `store.lock` 内调用（否则 store(5) → epoch(4) 反向获取）。
+        - `epoch_scope="run"`（构造参数，可用 `epoch_scope=` 覆盖）+ `run_id`
+          → **run 层**：只推进该 run 的 epoch（`EpochStore`），只作废该 run 的
+          租约 → 其他 run 不受影响；
+        - `run_id is None` 或 `epoch_scope="global"` → **全局 writer lease 层**：
+          推进 `wal.log.epoch`（接管 fencing），作废全部租约（向后兼容）。
+
+        K-46：全局路径只取独立 epoch 锁，不得在 `store.lock` 内调用。
         """
-        bumper = getattr(self._epoch_backend(), "bump_epoch", None)
-        epoch = None
-        if callable(bumper):
-            try:
-                epoch = int(bumper())
-            except Exception:  # noqa: BLE001
-                epoch = None
-        if epoch is None:
-            epoch = self.intents.get_epoch() + 1
-        self.intents.set_epoch(epoch)
-        self.budget.set_epoch(epoch, emit=True)
+        scope = self.epoch_scope if epoch_scope is None else epoch_scope
+        if run_id is None or scope == "global":
+            bumper = getattr(self._epoch_backend(), "bump_epoch", None)
+            epoch = None
+            if callable(bumper):
+                try:
+                    epoch = int(bumper())
+                except Exception:  # noqa: BLE001
+                    epoch = None
+            if epoch is None:
+                epoch = self.intents.get_epoch() + 1
+            self.intents.set_epoch(epoch)
+            self.budget.set_epoch(epoch, emit=True)
+            return epoch
+        # ---- run 层（K-43）：per-run epoch，隔离同 run 内的租约 ----
+        epoch = self.budget.bump_epoch(run_id=run_id)     # store 唯一一次推进 + 事件
+        self.intents.bump_epoch(run_id, epoch=epoch)      # 作废该 run 租约
         return epoch
 
     # ---- 端到端运行 -----------------------------------------------
@@ -1606,11 +1785,13 @@ class Harness:
                 return
         self._restore_budget_ledger(acb, data, node_id)
 
-    def _replay_budget_events(self, cutoff_epoch: int) -> tuple[bool, list[str]]:
+    def _replay_budget_events(self, cutoff_epoch: int,
+                              run_id: str | None = None) -> tuple[bool, list[str]]:
         """从 EventLog 重放 `BUDGET_*` 事件（**重放前重置基线为 0**）。
 
         epoch 过滤：`budget_epoch < cutoff_epoch` 的事件视为**旧 epoch 已 fence**，
         不重建（真实路径，**不删文件**，§2.3 / S10-4）。
+        `run_id` 给定 → **分 run 重放**（K-40/K-43）；否则全局（向后兼容）。
         返回 `(ok, built_nodes)`；失败时已回滚已建节点。
         """
         budget = self.budget
@@ -1618,7 +1799,7 @@ class Harness:
         with budget.suppressed():
             budget._reset_baseline()
             try:
-                for ev in budget.budget_events():
+                for ev in budget.budget_events(run_id):
                     p = ev.payload or {}
                     if ev.kind == EventKind.BUDGET_EPOCH:
                         budget.apply_budget_event(ev)
@@ -1662,10 +1843,13 @@ class Harness:
             budget.discard_pending()
         return True, built
 
-    def _declared_budget_nodes(self) -> set[str]:
-        """EventLog 声明的节点集（`ARCHIVED` 视为已摘除）——树完整性的真相源。"""
+    def _declared_budget_nodes(self, run_id: str | None = None) -> set[str]:
+        """EventLog 声明的节点集（`ARCHIVED` 视为已摘除）——树完整性的真相源。
+
+        S12 K-40：`run_id` 给定 → 只统计该 run 的预算事件（分 run 重放）。
+        """
         declared: set[str] = set()
-        for ev in self.budget.budget_events():
+        for ev in self.budget.budget_events(run_id):
             p = ev.payload or {}
             nid = p.get("node_id")
             if not nid or nid == "run":
@@ -1907,3 +2091,20 @@ class Harness:
         while parent is not None:
             parent.subtree_reserved += delta
             parent = parent.parent
+
+
+def create_production_harness(*args, **kwargs) -> Harness:
+    """S12 K-55：**生产唯一入口**（显式 fail-closed，不依赖运维记得设 env）。
+
+    - 强制 `egress_required=True`（构造即校验，无强制点 → 拒绝启动）；
+    - 再显式 `require_available()`（无强制点 → `EgressUnavailable`）。
+
+    `Harness()` 默认 `egress_required=None`（本地可跑）——**生产必须走本入口**。
+    """
+    kwargs["egress_required"] = True
+    harness = Harness(*args, **kwargs)
+    harness.egress.require_available()
+    return harness
+
+
+__all__ = ["Harness", "ReceiptScanFailed", "EpochStore", "create_production_harness"]
