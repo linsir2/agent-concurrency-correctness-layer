@@ -214,8 +214,8 @@ def test_drain_scheduler_consumes_without_recursion():
     nested: list[int] = []
     h.run_task = lambda *a, **k: nested.append(1)
 
-    for tid in ("T1", "T2", "T3"):
-        h.scheduler.push(tid)
+    for acb in (a1, a2, a3):
+        h.scheduler.push(acb.id)
     h._drain_scheduler()
 
     assert h.scheduler.is_empty()
@@ -300,7 +300,7 @@ def test_d6_patch_renamed_task_still_gates_successor():
     assert blocked.state is TaskState.INADMISSIBLE
     assert blocked.failure == "PREDECESSOR_NOT_DONE"
 
-    new_plan = h.planner.patch(plan, {"failing_subgoals": ["S1"], "missing_deps": []})
+    new_plan, _ = h.planner.patch(plan, {"failing_subgoals": ["S1"], "missing_deps": []})
     h.plans["D6"] = new_plan
     still_blocked = h.dispatcher.try_admit(new_plan["tasks"]["T2"], "D6")
     assert still_blocked.state is TaskState.INADMISSIBLE
@@ -367,7 +367,7 @@ def test_d14_old_acb_failure_after_patch_no_keyerror():
     plan = h.planner.plan("D14", [{"task_id": "T1", "logical_subgoal_id": "S1", "min_budget": 10}])
     h.plans["D14"] = plan
     old = admit(h, "D14", plan, "T1")
-    new_plan = h.planner.patch(plan, {"failing_subgoals": ["S1"], "missing_deps": []})
+    new_plan, _ = h.planner.patch(plan, {"failing_subgoals": ["S1"], "missing_deps": []})
     h.plans["D14"] = new_plan
     old.state = TaskState.FAILED
     old.failure = "X"

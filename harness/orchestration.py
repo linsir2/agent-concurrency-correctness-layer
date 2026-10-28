@@ -36,6 +36,11 @@ def _edge_endpoints(edge) -> tuple:
     return edge[0], edge[1]
 
 
+# S13b §2.3：前驱闸门与 ready 重建必须共用**同一套终态定义**（此前一处只认
+# DONE、另一处认 DONE+CANCELLED → alias 修复后两边判定分裂）。
+PREDECESSOR_SATISFIED = frozenset({TaskState.DONE, TaskState.CANCELLED})
+
+
 def _has_cycle(edges) -> bool:
     """DFS 三色环检测（§2.5）：有向图存在后向边 → `True`。"""
     adj: dict = {}
@@ -93,6 +98,9 @@ class Planner:
     def __init__(self, harness) -> None:
         self.h = harness
         self._counter = itertools.count(1)
+        # 供 `resolve_alias(old_id)`（无 plan 参数调用）兜底；有 plan 时以
+        # plan["_id_aliases"] 为准，避免跨 run 串味。
+        self._id_aliases: dict[str, str] = {}
 
     def plan(self, run_id: str, tasks: list[dict]) -> dict:
         plan = {"run_id": run_id, "version": 1, "tasks": {}, "edges": []}
@@ -114,6 +122,47 @@ class Planner:
             }
         self.h.event_log.append(EventKind.PLAN_CREATED, run_id, {"tasks": list(plan["tasks"])})
         return plan
+
+    def resolve_alias(self, old_id: str, plan: dict | None = None) -> str:
+        """`old_id` → 稳定 `logical_subgoal_id`（**一跳解析**，不做链式递归）。
+
+        值**永远**是 `logical_subgoal_id`（不是下一个 task id）：这样
+        `missing_deps` 直接复用 `add_logical_edge`（含环检测）也不会因 id 链
+        造出环（S13b K-65）。有 `plan` 时读该 plan 的 `_id_aliases`，否则退回
+        Planner 级累积表（兼容单参数调用）。
+        """
+        aliases = None
+        if plan is not None:
+            aliases = plan.get("_id_aliases")
+        if not isinstance(aliases, dict):
+            aliases = self._id_aliases
+        return aliases.get(old_id, old_id)
+
+    def task_for(self, plan: dict | None, task_id: str) -> dict | None:
+        """旧 id / 稳定 subgoal id → **当前 plan 版本**下的唯一 task。
+
+        S13b §2.3：同一 `logical_subgoal_id` 在多次 patch 后可能对应多个
+        历史 task（T1 / T1' / T1''），`setdefault` 只保留首个会解析到陈旧分支。
+        这里按「当前版本优先、否则取 plan_version 最大者」挑选。
+        """
+        tasks = (plan or {}).get("tasks", {}) or {}
+        stable = self.resolve_alias(task_id, plan)
+        direct = tasks.get(task_id)
+        candidates: list[dict] = []
+        if isinstance(direct, dict):
+            candidates.append(direct)
+        if stable:
+            for task in tasks.values():
+                if (isinstance(task, dict) and task is not direct
+                        and task.get("logical_subgoal_id") == stable):
+                    candidates.append(task)
+        if not candidates:
+            return None
+        current = (plan or {}).get("version")
+        current_c = [t for t in candidates
+                     if t.get("plan_version") == current]
+        pool = current_c or candidates
+        return max(pool, key=lambda t: int(t.get("plan_version", 0) or 0))
 
     def add_logical_edge(self, plan: dict, from_id: str, to_id: str) -> None:
         """加逻辑边（§2.5）：先落边再做 DFS 环检测；**含环的边不落盘**。"""
@@ -137,11 +186,15 @@ class Planner:
                     return dict(mp) if isinstance(mp, dict) else {}
         return {}
 
-    def patch(self, plan: dict, diagnosis: dict) -> dict:
+    def patch(self, plan: dict, diagnosis: dict) -> tuple[dict, dict]:
         """文档 §8.1：诊断 → PlanPatch（复用 logical_subgoal_id）。
 
+        **纯函数**（S13b §2.3 P0-5）：只产出 `(new_plan, event_draft)`，不 append
+        事件；由 `Harness.replan()` 用 `append_batch` 与「计数落盘」同帧提交。
+
         D6：任务改名（T1→T1'）后，边仍写旧 id；此处记录 `旧 id → logical_subgoal_id`
-        别名，供 `_predecessors_done` 兜底解析，避免后继永久 `PREDECESSOR_NOT_DONE`。
+        别名，供 `_predecessors_done` / `rebuild_ready_set` / `_finalize` 三处
+        统一解析，避免后继永久 `PREDECESSOR_NOT_DONE`。
         """
         new_plan = copy.deepcopy(plan)
         new_plan["version"] = plan["version"] + 1
@@ -150,7 +203,9 @@ class Planner:
         for tid, task in new_plan["tasks"].items():
             if task["logical_subgoal_id"] in diagnosis.get("failing_subgoals", []):
                 new_tid = f"{tid}'"
+                # 值保持稳定 logical id（不做 id 链）：一跳解析天然无环
                 id_aliases[tid] = task["logical_subgoal_id"]
+                self._id_aliases[tid] = task["logical_subgoal_id"]
                 task["task_id"] = new_tid
                 task["state"] = TaskState.PLANNED
                 task["plan_version"] = new_plan["version"]
@@ -159,11 +214,16 @@ class Planner:
                 task["plan_version"] = new_plan["version"]
                 remade[tid] = task
         new_plan["tasks"] = remade
+        # S13b §2.3：走 add_logical_edge（含 `_has_cycle`）而非裸 append
         for dep in diagnosis.get("missing_deps", []):
-            new_plan["edges"].append({"from": dep["from"], "to": dep["to"], "kind": "LOGICAL"})
-        self.h.event_log.append(EventKind.PLAN_PATCHED, plan["run_id"],
-                                {"version": new_plan["version"]})
-        return new_plan
+            self.add_logical_edge(new_plan, dep["from"], dep["to"])
+        event_draft = {
+            "kind": EventKind.PLAN_PATCHED,
+            "subject": plan["run_id"],
+            "payload": {"version": new_plan["version"]},
+            "run_id": plan["run_id"],
+        }
+        return new_plan, event_draft
 
 
 class SlotTracker:
@@ -310,30 +370,22 @@ class Dispatcher:
             for tool, path in required.items())
 
     def _predecessors_done(self, plan: dict, task_id: str) -> bool:
-        """§2.5 前驱闸门：所有指向 `task_id` 的边，其 `src` 必须已 DONE/CANCELLED。
+        """§2.5 前驱闸门：所有指向 `task_id` 的边，其 `src` 必须已终态。
 
-        - `src` 不在 `plan["tasks"]` 中 → 先按 `logical_subgoal_id` 兜底匹配
-          （D6：patch 把任务改名 T1→T1'，但边仍写旧 id，旧 id 需能解析到 remake 任务）；
-        - 兜底仍失败 → 视为未完成（保守拒绝）；
-        - 状态用 `TaskState`（str 枚举）比较，兼容字符串写法。
+        S13b §2.3 P0-4：`src` 先按当前 plan 版本直接匹配；不命中时走
+        `Planner.task_for`（alias 一跳解析到稳定 `logical_subgoal_id`，再取
+        **当前版本**的唯一 task）——不是 `setdefault` 保留首个历史 task。
+        终态定义与 `RebuildReadySet` 共用 `PREDECESSOR_SATISFIED`。
         """
-        tasks = plan.get("tasks", {}) or {}
-        aliases = plan.get("_id_aliases", {}) or {}
-        by_subgoal: dict = {}
-        for t in tasks.values():
-            subgoal = t.get("logical_subgoal_id") if isinstance(t, dict) else None
-            if subgoal:
-                by_subgoal.setdefault(subgoal, t)
         for edge in plan.get("edges", []) or []:
             src, dst = _edge_endpoints(edge)
             if dst != task_id:
                 continue
-            src_task = tasks.get(src)
-            if src_task is None:                    # D6：旧 id → 按子目标兜底匹配 remake 任务
-                subgoal = aliases.get(src)
-                src_task = by_subgoal.get(subgoal) if subgoal else None
-            state = src_task.get("state") if isinstance(src_task, dict) else None
-            if state not in (TaskState.DONE, TaskState.CANCELLED):
+            src_task = self.h.planner.task_for(plan, src)
+            if src_task is None:
+                return False                    # 无法解析 → 保守拒绝
+            state = src_task.get("state")
+            if state not in PREDECESSOR_SATISFIED:
                 return False
         return True
 
@@ -348,6 +400,10 @@ class Dispatcher:
         acb = ACB(id=f"A-{run_id}-{task['task_id']}-{self._next_attempt()}",
                   run_id=run_id, task_id=task["task_id"],
                   logical_subgoal_id=task["logical_subgoal_id"])
+        # S13b D10：记录准入时的 plan 版本 —— `_finalize` / `_drain_scheduler`
+        # 按 `(run_id, task_id, plan_version)` 解析「当前版本唯一 ACB」，
+        # 避免 replan 后旧代际 ACB 被误跑（双跑）。
+        acb.spec["plan_version"] = int(task.get("plan_version", 1) or 1)
         if token is not None:                 # 显式 token 绑定到 ACB（§5.9）
             acb.capability = token
 
@@ -514,15 +570,30 @@ class ReconcileLoop:
         self.h = harness
 
     def rebuild_ready_set(self, run_id: str) -> list[str]:
-        """从 PlanStore 重建 ready 集（不依赖内存）。"""
+        """从 PlanStore 重建 ready 集（不依赖内存）。
+
+        S13b §2.3 P0-4：依赖判定必须读 alias —— 边仍写旧 id（T1），任务已改名
+        （T1'）；`resolve_alias(T1) == S1`，故 `done` 集**同时收录**已终态任务的
+        task_id 与 `logical_subgoal_id`（否则一跳解析到的是 subgoal 而非 task id，
+        无法命中）。终态定义与 `_predecessors_done` 共用 `PREDECESSOR_SATISFIED`。
+        """
         plan = self.h.plans.get(run_id)
         if not plan:
             return []
-        done = {tid for tid, t in plan["tasks"].items() if t["state"] == TaskState.DONE}
+        satisfied: set[str] = set()
+        for tid, task in plan["tasks"].items():
+            if task["state"] in PREDECESSOR_SATISFIED:
+                satisfied.add(tid)
+                subgoal = task.get("logical_subgoal_id")
+                if subgoal:
+                    satisfied.add(subgoal)
         ready = []
         for tid, task in plan["tasks"].items():
-            deps = [e["from"] for e in plan["edges"] if e["to"] == tid]
-            if all(d in done for d in deps) and task["state"] in (TaskState.PLANNED, TaskState.ADMITTED):
+            deps = [src for src, dst in
+                    (_edge_endpoints(e) for e in plan.get("edges", []) or [])
+                    if dst == tid]
+            if all(d in satisfied or self.h.planner.resolve_alias(d, plan) in satisfied
+                   for d in deps) and task["state"] in (TaskState.PLANNED, TaskState.ADMITTED):
                 ready.append(tid)
         return ready
 

@@ -176,7 +176,7 @@ def test_a6_replan_storm_idempotent():
 
     # 重规划：remake 任务复用 logical_subgoal_id
     diagnosis = {"failing_subgoals": ["S1"], "missing_deps": []}
-    new_plan = h.planner.patch(plan, diagnosis)
+    new_plan, _ = h.planner.patch(plan, diagnosis)
     h.plans["A6"] = new_plan
     assert new_plan["tasks"]["T1'"]["logical_subgoal_id"] == "S1"
 

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 import threading
@@ -150,10 +151,15 @@ class Harness:
                  checkpoint_root=None,
                  writer_id: str | None = None,
                  egress_required: bool | None = None,
-                 epoch_scope: str = "global") -> None:
+                 epoch_scope: str = "global",
+                 replan_budget: int = 2) -> None:
         if epoch_scope not in ("run", "global"):
             raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
+        if isinstance(replan_budget, bool) or not isinstance(replan_budget, int) \
+                or replan_budget < 0:
+            raise ValueError(f"非法 replan_budget：{replan_budget!r}（>=0 的整数）")
         self.epoch_scope = epoch_scope
+        self.replan_budget = replan_budget       # S13b §2.3：replan 预算（写前计数）
         self.lease_ms = lease_ms
         self.guard_every = guard_every
         self.aging_max = aging_max
@@ -1623,8 +1629,11 @@ class Harness:
 
         - `_run_one` 不 push、不递归 drain → 无无限递归、无双重 run；
         - `needs_readmit` 的 ACB 不进调度（§5.7）：需先 `requeue_readmit`；
-        - D10：优先按 `acb.id` 精确命中；`acb.id` 未命中时回退按 `task_id` 找
-          ADMITTED 的 ACB（兼容 `_finalize` 推入的 `task_id` 键）；
+        - **D10（S13b P1-5）**：队列键统一 `acb.id`，**删除**「按 task_id 扫第一个
+          ADMITTED」兜底 —— 该兜底在 replan 后同 task_id 出现两个 ADMITTED 时会
+          跑错代际 ACB / 双跑；
+        - 另按 `(run_id, task_id, plan_version)` 过滤陈旧代际（旧 ACB 即使仍
+          ADMITTED 也不跑）；
         - D11：被跳过的键记录原因到 `_drain_skipped`（不再静默 continue）。
         """
         while True:
@@ -1633,11 +1642,7 @@ class Harness:
                 break
             acb = self.acbs.get(key)
             if acb is None:
-                acb = next((a for a in self.acbs.values()
-                            if a.task_id == key and a.state is TaskState.ADMITTED
-                            and not a.needs_readmit), None)
-            if acb is None:
-                self._drain_skipped.append((key, "no_admitted_acb"))
+                self._drain_skipped.append((key, "unknown_acb"))
                 continue
             if acb.needs_readmit:
                 self._drain_skipped.append((key, "needs_readmit"))
@@ -1646,7 +1651,49 @@ class Harness:
                 # PLANNED / 已终态等：按设计不调度，但记录原因（D11）
                 self._drain_skipped.append((key, f"state={acb.state.value}"))
                 continue
+            if not self._is_current_plan_version(acb):
+                self._drain_skipped.append((key, "stale_plan_version"))
+                continue
             self._run_one(acb)
+
+    def _is_current_plan_version(self, acb: ACB) -> bool:
+        """D10：同 `(run_id, task_id)` 存在**更新代际** ADMITTED ACB 时，旧代际不调度。
+
+        只比较同一 task 的兄弟 ACB，而非 plan 里该 task 的 `plan_version` ——
+        未被 patch 改名的任务（如 successors）仍持有 replan 前准入的 ACB，
+        它只有一个 ADMITTED 实例，必须继续可跑（S13-4 执行层）。
+        """
+        siblings = [a for a in self.acbs.values()
+                    if a.run_id == acb.run_id and a.task_id == acb.task_id
+                    and a.state is TaskState.ADMITTED]
+        if len(siblings) <= 1:
+            return True
+        best = max(int(a.spec.get("plan_version", 0) or 0) for a in siblings)
+        return int(acb.spec.get("plan_version", 0) or 0) == best
+
+    def _resolve_current_acb(self, run_id: str, task_id: str,
+                             plan_version: int | None = None) -> ACB | None:
+        """按 `(run_id, dst, plan_version)` 解析**当前版本唯一** ACB（D10）。
+
+        多个同版本 ADMITTED 视为歧义（返回 `None`，由调用方记 `_drain_skipped`），
+        绝不「扫第一个」——那正是 replan 后双跑的根因。
+        """
+        cands = [a for a in self.acbs.values()
+                 if a.run_id == run_id and a.task_id == task_id
+                 and a.state is TaskState.ADMITTED and not a.needs_readmit]
+        if plan_version is not None:
+            exact = [a for a in cands
+                     if int(a.spec.get("plan_version", 0) or 0) == int(plan_version)]
+            if exact:
+                cands = exact
+        if len(cands) == 1:
+            return cands[0]
+        if not cands:
+            return None
+        best = max(int(a.spec.get("plan_version", 0) or 0) for a in cands)
+        newest = [a for a in cands
+                  if int(a.spec.get("plan_version", 0) or 0) == best]
+        return newest[0] if len(newest) == 1 else None
 
     def _safe_save(self, acb: ACB) -> None:
         """落盘（**保证不抛**）：P1-5 —— 非法 staged 内容不得阻断结算/槽位释放。
@@ -1693,14 +1740,38 @@ class Harness:
             # D9：重建 ready 集后真正 push 到调度器（原返回值被丢弃 → 后继永不调度）。
             # 只调度「因本任务完成而新就绪」的后继：早已就绪（无前驱）的任务仍由
             # run_task/dispatch_and_run 显式驱动，避免把非终态任务一并拉起（A2/A11/I12）。
+            #
+            # B-2 ③（S13b P0-4）：边仍写旧 id（T1），任务已改名（T1'）→ 直接
+            # `src == acb.task_id` 永不匹配。改为「task_id 相同 **或** alias 一跳
+            # 解析到本 ACB 的稳定 logical_subgoal_id」。
+            #
+            # D10（S13b P1-5）：队列键统一 `acb.id`；`dst` 按当前 plan 版本解析到
+            # **唯一** ACB，解析不到记 `_drain_skipped`（不静默、不扫第一个）。
             ready = set(self.reconcile.rebuild_ready_set(acb.run_id))
             for edge in plan.get("edges", []) or []:
-                if isinstance(edge, dict):
-                    src, dst = edge.get("from"), edge.get("to")
-                else:
-                    src, dst = edge[0], edge[1]
-                if src == acb.task_id and dst in ready:
-                    self.scheduler.push(dst)
+                src, dst = ((edge.get("from"), edge.get("to"))
+                            if isinstance(edge, dict) else (edge[0], edge[1]))
+                same_task = src == acb.task_id
+                same_subgoal = bool(acb.logical_subgoal_id) and \
+                    self.planner.resolve_alias(src, plan) == acb.logical_subgoal_id
+                if not (same_task or same_subgoal):
+                    continue
+                dst_task = self.planner.task_for(plan, dst)
+                if not isinstance(dst_task, dict):
+                    self._drain_skipped.append((f"{acb.run_id}:{dst}",
+                                                "push_unresolved_task"))
+                    continue
+                dst_tid = dst_task.get("task_id")
+                if dst_tid not in ready:
+                    continue
+                dst_pv = int(dst_task.get("plan_version",
+                                          plan.get("version", 1)) or 1)
+                target = self._resolve_current_acb(acb.run_id, dst_tid, dst_pv)
+                if target is None:
+                    self._drain_skipped.append((f"{acb.run_id}:{dst_tid}",
+                                                "push_no_current_acb"))
+                    continue
+                self.scheduler.push(target.id)
 
     def escalate_quarantined(self, acb: ACB) -> Result:
         """人工 escalate：QUARANTINED → DEAD_LETTER，释放预算并传播 failure（文档 §5.5）。"""
@@ -1834,6 +1905,124 @@ class Harness:
         # S13a P0-3：恢复结束即驱动一次超时结算（否则恢复出的过期审批永不结算）。
         self.tick()
         return acb
+
+    def replan(self, acb: ACB, plan: dict | None = None, *,
+               diagnosis: dict | None = None) -> dict | None:
+        """S13b §2.3 P0-5：有界 replan（write-ahead 计数 → patch → 再准入）。
+
+        顺序固定：**先查预算 → 计数 + 落盘 → patch（纯函数）→ 同帧提交事件 →
+        清理旧节点并再准入**。先落盘计数才能防「崩溃后 replan_count 归零 →
+        无限重规划」。
+
+        Saga 语义（S13b §2.3 / S13-9）：replan **不重跑整棵树**，只重做**未提交**
+        的分支；已提交副作用靠 `effect_journal` + 跨 replan 稳定的
+        `logical_subgoal_id` 去重（`effect_idem_key` 不含 task_id / generation）。
+
+        预算耗尽：`advance(acb, "replan_budget_exhausted")` → DEAD_LETTER，
+        且**不 patch**（`PLAN_PATCHED` 事件数不变、plan.version 不变、
+        `replan_count` 不递增）。
+        """
+        plan = plan if plan is not None else self.plans.get(acb.run_id)
+        if plan is None:
+            return None
+        if acb.replan_count >= self.replan_budget:        # ① 先查预算
+            if advance(acb, "replan_budget_exhausted") == Status.OK:
+                self._dead_letter_after_replan(acb)       # → DEAD_LETTER
+            else:
+                self._safe_save(acb)
+            return None
+        acb.replan_count += 1                             # ② 计数
+        self.checkpoints.save(acb)                        # ③ write-ahead 落盘
+        new_plan, event_draft = self.planner.patch(       # ④ 纯函数 patch
+            plan, diagnosis or {})
+        # ⑤ 同帧提交：新 plan 事件 + 计数（已落盘）原子可见
+        self.event_log.append_batch([event_draft])
+        self.plans[acb.run_id] = new_plan
+        # ⑥ 清理旧节点 + 再准入（P0-6，复用 requeue_readmit 序列）
+        self._readmit_after_replan(acb, new_plan)
+        return new_plan
+
+    def replan_from_quarantine(self, acb: ACB, plan: dict | None = None, *,
+                               diagnosis: dict | None = None) -> dict | None:
+        """S13b §2.3：隔离态走合法边 `escalate` → REPLANNING → 再规划。
+
+        与 `escalate_quarantined` 的旧行为（`replan_budget_exhausted` →
+        DEAD_LETTER，T21 断言不变）并存；本方法只处理「还想再规划」的路径。
+        """
+        if acb.state is not TaskState.QUARANTINED:
+            return None
+        if advance(acb, "escalate") != Status.OK:
+            return None
+        return self.replan(acb, plan, diagnosis=diagnosis)
+
+    def _dead_letter_after_replan(self, acb: ACB) -> None:
+        """预算耗尽后的 DEAD_LETTER 结算（与 `escalate_quarantined` 同序）。"""
+        for rid in list(acb.reservation_ids):
+            self.budget.settle(rid)
+        acb.reservation_ids = []
+        self.slots.release(acb.id)
+        plan = self.plans.get(acb.run_id)
+        # B-2：旧 task_id 可能已被 patch 改名 → 用一跳 alias 解析到当前版本 task
+        task = self.planner.task_for(plan, acb.task_id) if plan else None
+        if not isinstance(task, dict) and plan:
+            task = plan.get("tasks", {}).get(acb.task_id)
+        plan_version = task.get("plan_version", 1) if isinstance(task, dict) else 1
+        task_id = task.get("task_id", acb.task_id) if isinstance(task, dict) \
+            else acb.task_id
+        self.propagate_failure(task_id, plan_version)
+        self._safe_save(acb)
+
+    def _readmit_after_replan(self, acb: ACB, new_plan: dict) -> ACB:
+        """S13b §2.3 P0-6：清理旧节点后再准入（顺序与 `requeue_readmit` 一致）。
+
+        ```
+        release old slot → settle old reservation_ids → remove_node/archive_node
+        → try_admit 新 → 新 ACB；旧节点 consumed>0 时新 min_budget 扣掉已消耗
+        ```
+
+        若只 `try_admit` 而**不清理旧节点**：旧节点 `self_reserved` 不归零 →
+        `root.subtree_reserved` 双份（违反 I5）；`remove_node` 又因 ACTIVE 预留
+        返回 False → 旧节点永久残留、父节点永不归档。
+        """
+        task = self.planner.task_for(new_plan, acb.logical_subgoal_id or acb.task_id)
+        if not isinstance(task, dict):
+            acb.needs_readmit = True
+            self._drain_skipped.append((acb.task_id, "replan_no_task"))
+            self._safe_save(acb)
+            return acb
+        token = self._effective_token(acb)
+        old_node = acb.budget_node
+        old_rids = list(acb.reservation_ids)
+        consumed = int(getattr(old_node, "consumed", 0) or 0) if old_node else 0
+        # ① release old slot
+        self.slots.release(acb.id)
+        # ② settle old reservation_ids
+        for rid in old_rids:
+            self.budget.settle(rid)
+        acb.reservation_ids = []
+        # ③ remove_node / archive_node（ACTIVE 预留已结算 → 可摘除）
+        if old_node is not None:
+            if not self.budget.remove_node(old_node.node_id):
+                self.budget.archive_node(old_node.node_id)
+            acb.budget_node = None
+        # ④ try_admit 新；已消耗部分从新 min_budget 扣除（不重复计账）
+        fresh_task = copy.deepcopy(task)
+        footprint = fresh_task.setdefault("footprint", {})
+        if consumed > 0:
+            footprint["min_budget"] = max(
+                0, int(footprint.get("min_budget", 0) or 0) - consumed)
+        fresh = self.dispatcher.try_admit(
+            fresh_task, acb.run_id, token=token, plan=new_plan)
+        if fresh.state is not TaskState.ADMITTED:
+            acb.needs_readmit = True
+            self._safe_save(acb)
+            return acb
+        fresh.replan_count = acb.replan_count
+        self.acbs.pop(acb.id, None)
+        self.acbs[fresh.id] = fresh
+        self.run_coordinator.register(fresh)
+        self.checkpoints.save(fresh)          # §2.4：再准入成功落盘
+        return fresh
 
     def requeue_readmit(self, acb: ACB) -> ACB:
         """§5.7（K-9）：`needs_readmit` 的 ACB 重新准入（清标记 → 走 dispatcher）。

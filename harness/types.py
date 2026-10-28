@@ -183,6 +183,8 @@ TRANSITIONS: dict[tuple[TaskState, str], TaskState] = {
     (TaskState.QUARANTINED, "escalate"): TaskState.REPLANNING,
     (TaskState.QUARANTINED, "replan_budget_exhausted"): TaskState.DEAD_LETTER,
     (TaskState.REPLANNING, "new_plan"): TaskState.PLANNED,
+    # S13b §2.3 / §4：replan 预算耗尽（REPLANNING 是 replan 的显式入口态）
+    (TaskState.REPLANNING, "replan_budget_exhausted"): TaskState.DEAD_LETTER,
     (TaskState.INADMISSIBLE, "escalate"): TaskState.REPLANNING,
     (TaskState.INADMISSIBLE, "give_up"): TaskState.FAILED,
 }
