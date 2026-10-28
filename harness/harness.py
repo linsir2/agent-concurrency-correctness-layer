@@ -24,6 +24,7 @@ from .egress import EgressGuard
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
 from .llm import LLMClient
+from .ingress import Ingress
 from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
                             RunCoordinator, Scheduler, SlotTracker, _UNSET,
                             classify_verdict)
@@ -173,7 +174,8 @@ class Harness:
                  pool_timeout_s: float = 120.0,
                  claim_lease_ms: int | None = None,
                  aging_ms: int = 0,
-                 aging_max_attempts: int = 3) -> None:
+                 aging_max_attempts: int = 3,
+                 max_redrives: int = 3) -> None:
         if epoch_scope not in ("run", "global"):
             raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
         if isinstance(replan_budget, bool) or not isinstance(replan_budget, int) \
@@ -348,6 +350,11 @@ class Harness:
         self.run_coordinator = RunCoordinator(self)
         self.reconcile = ReconcileLoop(self)
         self.hitl = HITL()
+        # ---- S15 D：生产化（Admin 暂停 / DLQ 重放 / Ingress 幂等）----
+        # pause 只阻止**未开始**的调度，资源保留（可恢复）；与 cancel 不同。
+        self._paused_runs: set[str] = set()
+        self.max_redrives = max(0, int(max_redrives))
+        self.ingress = Ingress(self)
         # S13d §2.5 P0-10：claim 的 fence epoch 接入**写路径**（commit_batch /
         # budget.consume / effects.begin / checkpoints.save）。sync 模式无 claim
         # → 守卫恒为 False（保持既有语义，36 个同步用例零破坏）。
@@ -2600,6 +2607,136 @@ class Harness:
         self.tick(now_ms)
         return len(self._pending_deadlines())
 
+    # ---- S15 D3：Admin pause / resume（持久化、不丢状态）-------------
+    def is_paused(self, run_id: str) -> bool:
+        """该 run 是否处于 Admin 暂停（只阻止**未开始**的任务被调度）。"""
+        return bool(run_id) and run_id in self._paused_runs
+
+    def pause_run(self, run_id: str, *, reason: str = "") -> bool:
+        """暂停一个 run：保留槽位/预算/节点（可恢复），只停止新调度。
+
+        与 `cancel_run` 的区别：cancel **释放资源且不可恢复**；pause 不释放。
+        在途任务**不打断**（避免半提交），让它跑完。
+        返回 `True` = 本次真的从「运行」变为「暂停」；已暂停返回 `False`。
+        """
+        run_id = str(run_id or "")
+        if not run_id or run_id in self._paused_runs:
+            return False
+        self._paused_runs.add(run_id)
+        self.event_log.append(EventKind.RUN_PAUSED, run_id,
+                              {"reason": str(reason or "")}, run_id=run_id)
+        return True
+
+    def resume_run(self, run_id: str) -> bool:
+        """恢复一个被暂停的 run（`True` = 本次真的从「暂停」变为「运行」）。"""
+        run_id = str(run_id or "")
+        if run_id not in self._paused_runs:
+            return False
+        self._paused_runs.discard(run_id)
+        self.event_log.append(EventKind.RUN_RESUMED, run_id, {}, run_id=run_id)
+        return True
+
+    def paused_runs(self) -> list[str]:
+        return sorted(self._paused_runs)
+
+    def _rebuild_pause_state(self) -> None:
+        """从事件流重建暂停集合（**持久真相**，重启后仍暂停）。
+
+        按 seq 顺序应用 `RUN_PAUSED` / `RUN_RESUMED`，后者覆盖前者。
+        """
+        paused: set[str] = set()
+        for ev in self.event_log.all():
+            if ev.kind is EventKind.RUN_PAUSED:
+                paused.add(str(ev.subject))
+            elif ev.kind is EventKind.RUN_RESUMED:
+                paused.discard(str(ev.subject))
+        self._paused_runs = paused
+
+    # ---- S15 D2：DLQ redrive（终态 + 显式重放 + 有界）----------------
+    def redrive_dead_letter(self, acb: ACB) -> ACB | None:
+        """把 `DEAD_LETTER` 重新变成可执行（**造新 ACB**，旧 ACB 仍为终态）。
+
+        - 仅 `DEAD_LETTER` 可 redrive（其他状态返回 `None`，不误用）
+        - `redrive_count >= max_redrives` → 拒绝（**有界**，对齐 SQS redrive 语义）
+        - 走 `requeue_readmit` 同款清理序列：release slot → settle 旧预留 →
+          remove/archive 旧节点
+        - 写 `DLQ_REDRIVEN` 事件（审计：第几次）
+
+        返回新 ACB（`ADMITTED`）；失败返回 `None`。
+        """
+        if acb is None or acb.state is not TaskState.DEAD_LETTER:
+            return None
+        count = int(getattr(acb, "redrive_count", 0) or 0)
+        if count >= self.max_redrives:
+            self._drain_skipped.append((acb.id, "redrive_limit_exceeded"))
+            return None
+        plan = self.plans.get(acb.run_id)
+        task = (plan.get("tasks", {}) or {}).get(acb.task_id) if plan else None
+        if task is None:
+            self._drain_skipped.append((acb.id, "redrive_task_missing"))
+            return None
+
+        with self._transition_lock(acb):
+            old_node = acb.budget_node
+            old_rids = list(acb.reservation_ids or [])
+            self.slots.release(acb.id)
+            fresh = self.dispatcher.try_admit(
+                task, acb.run_id, token=None, plan=plan, replace=True)
+            if fresh.state is not TaskState.ADMITTED:
+                self._drain_skipped.append((acb.id, "redrive_admit_failed"))
+                return None
+            for rid in old_rids:
+                self.budget.settle(rid)
+            acb.reservation_ids = []
+            if old_node is not None:
+                if not self.budget.remove_node(old_node.node_id):
+                    self.budget.archive_node(old_node.node_id)
+                acb.budget_node = None
+            fresh.redrive_count = count + 1
+            fresh.parent_id = acb.parent_id
+            self._adopt_capability(acb, fresh)
+            # 旧 ACB 保持终态（不 superseded 成 CANCELLED，避免改写历史结论）
+            acb.needs_readmit = False
+            self._safe_save(acb)
+            self._safe_save(fresh)
+            self.acbs[fresh.id] = fresh
+            self.run_coordinator.register(fresh)
+            self._register_admission(fresh)
+            self.event_log.append(
+                EventKind.DLQ_REDRIVEN, acb.run_id,
+                {"from_acb_id": acb.id, "to_acb_id": fresh.id,
+                 "attempt": fresh.redrive_count, "task_id": acb.task_id},
+                run_id=acb.run_id)
+            return fresh
+
+    # ---- S15 D4：可观测快照（零依赖，OTel 友好结构）------------------
+    def metrics(self) -> dict:
+        """只读快照：`{"counters": {...}, "gauges": {...}}`。
+
+        从 EventLog 与内存状态派生，**不引入 OTel/Prometheus 依赖**
+        （`dependencies = []` 是硬约束）；使用者可自行映射到自己的指标后端。
+        """
+        counters: dict[str, int] = {}
+        for ev in self.event_log.all():
+            name = ev.kind.value if hasattr(ev.kind, "value") else str(ev.kind)
+            counters[name] = counters.get(name, 0) + 1
+        gauges = {
+            "acbs_total": len(self.acbs),
+            "acbs_nonterminal": sum(
+                1 for a in self.acbs.values() if a.state not in TASK_TERMINAL),
+            "paused_runs": len(self._paused_runs),
+            "dead_letter": sum(
+                1 for a in self.acbs.values()
+                if a.state is TaskState.DEAD_LETTER),
+            "waiting_approval": sum(
+                1 for a in self.acbs.values()
+                if a.state is TaskState.WAITING_APPROVAL),
+            "budget_root_reserved": int(
+                getattr(self.budget.root, "subtree_reserved", 0) or 0),
+            "event_log_tail": self.event_log.tail(),
+        }
+        return {"counters": counters, "gauges": gauges}
+
 
     # ---- S13d §2.5：aging（墙钟 deadline）+ claim fencing --------------
     def _arm_aging(self, acb: ACB) -> None:
@@ -2857,6 +2994,9 @@ class Harness:
             return f"state={acb.state.value}"
         if not self._is_current_plan_version(acb):
             return "stale_plan_version"
+        if self.is_paused(acb.run_id):
+            # S15 D3：Admin 暂停 —— 不执行但**保留**槽位/预算/节点（可恢复）
+            return "run_paused"
         return None
 
     def _is_current_plan_version(self, acb: ACB) -> bool:
@@ -3398,6 +3538,8 @@ class Harness:
         # 孤儿结算留痕）。
         self._reconcile_children_refs(acb)
         self._reconcile_children_pending(acb)
+        # S15 D3：从事件流重建 Admin 暂停态（重启后仍暂停）
+        self._rebuild_pause_state()
         # S13a P0-3：恢复结束即驱动一次超时结算（否则恢复出的过期审批永不结算）。
         # S14 K-69：此处 **persist_scan=False** —— 恢复尚未完成，别的 ACB 可能只
         # 恢复了一半，此时结算它们是错的（S13 评审 R-5）。恢复后的首次 `pump()`
@@ -3705,6 +3847,7 @@ class Harness:
             acb.replan_attempts = int(data.get("replan_attempts", 0) or 0)
             # S13d §2.5：aging 计数跨恢复继承（否则重规划/重准入会无限超时）
             acb.aging_count = int(data.get("aging_count", 0) or 0)
+            acb.redrive_count = int(data.get("redrive_count", 0) or 0)
             # X7：恢复 claim 三字段（观测用）；租约已过期 → 立即视为已释放，
             # 允许重新 claim（本进程的 scheduler 本就没有该 claim）。
             acb.claim_epoch = int(data.get("claim_epoch", 0) or 0)

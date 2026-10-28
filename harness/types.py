@@ -101,6 +101,11 @@ class EventKind(str, Enum):
     COMPENSATION_STARTED = "COMPENSATION_STARTED"
     COMPENSATION_DONE = "COMPENSATION_DONE"
     COMPENSATION_FAILED = "COMPENSATION_FAILED"
+    # ---- S15 D：生产化（Ingress 幂等 / Admin 暂停 / DLQ 重放）----
+    INGRESS_ACCEPTED = "INGRESS_ACCEPTED"    # 幂等键首次受理（指纹随事件持久化）
+    RUN_PAUSED = "RUN_PAUSED"                # Admin 暂停（可恢复，保留资源）
+    RUN_RESUMED = "RUN_RESUMED"              # Admin 恢复
+    DLQ_REDRIVEN = "DLQ_REDRIVEN"            # 死信显式重放（审计）
     PIVOT = "PIVOT"
     PLAN_CREATED = "PLAN_CREATED"
     PLAN_PATCHED = "PLAN_PATCHED"
@@ -387,3 +392,4 @@ class ACB:
     claim_worker: str = ""                # 快照中记录的 worker_id（观测用）
     claim_lease_until_ms: int = 0         # 快照中记录的 claim 租约到期（X7）
     aging_count: int = 0                  # 累计 aging 超时次数（>= N → DEAD_LETTER）
+    redrive_count: int = 0                # S15 D2：死信重放次数（>= max_redrives → 拒绝）

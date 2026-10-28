@@ -429,6 +429,7 @@ class CheckpointStore:
             "superseded": bool(getattr(acb, "superseded", False)),
             # S13d §2.5：累计 aging 超时次数（跨恢复保证「超 N 次 → DEAD_LETTER」）
             "aging_count": int(getattr(acb, "aging_count", 0) or 0),
+            "redrive_count": int(getattr(acb, "redrive_count", 0) or 0),
             # X7：claim 三字段随快照落盘 —— 恢复后能判断「是否有在途 worker」，
             # lease 已过期则立即释放并允许重 claim（见 `Harness._restore_acb`）。
             "claim_epoch": int(claim.get("claim_epoch", 0) or 0),

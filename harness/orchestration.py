@@ -1095,7 +1095,34 @@ class RunCoordinator:
         return acb
 
     def submit_command(self, cmd: dict) -> Status:
-        """命令接口（B1）：Dispatcher/Scheduler/Supervisor 通过它请求状态变更。"""
+        """命令接口（B1）：Dispatcher/Scheduler/Supervisor 通过它请求状态变更。
+
+        S15 D1：至少把 `INGRESS_SUBMIT` 路由到 `Ingress`（原来无条件返回 `OK`
+        的空壳会让「重复请求建重复 Run」静默发生）。其余命令类型仍返回 `OK`
+        —— 它们是 Dispatcher/Scheduler 的内部调用，不经过本入口。
+        """
+        kind = str((cmd or {}).get("kind", ""))
+        if kind == "INGRESS_SUBMIT":
+            return self.h.ingress.submit(
+                idempotency_key=cmd.get("idempotency_key", ""),
+                plan=cmd.get("plan") or {},
+                payload=cmd.get("payload")).status
+        if kind == "PAUSE_RUN":
+            run_id = str(cmd.get("run_id", "") or "")
+            if not run_id:
+                return Status.INVALID_INPUT        # 缺参才是错误
+            if self.h.is_paused(run_id):
+                return Status.OK                   # **幂等**：已暂停 = 目标态
+            self.h.pause_run(run_id, reason=str(cmd.get("reason", "") or ""))
+            return Status.OK
+        if kind == "RESUME_RUN":
+            run_id = str(cmd.get("run_id", "") or "")
+            if not run_id:
+                return Status.INVALID_INPUT
+            if not self.h.is_paused(run_id):
+                return Status.OK                   # **幂等**：已运行 = 目标态
+            self.h.resume_run(run_id)
+            return Status.OK
         return Status.OK
 
 
