@@ -38,6 +38,7 @@ from .orchestration import (
     RunCoordinator,
     Scheduler,
     SlotTracker,
+    _tenant_of_node_id,
     classify_verdict,
 )
 from .policy import (
@@ -256,6 +257,9 @@ class Harness:
         self.aging_max_attempts = int(aging_max_attempts)
         # claim 租约 TTL 必须覆盖「单 action 上界」：至少 >= 资源租约 `lease_ms`，
         # 否则一个慢 action 期间 claim 就会过期 → 第二个 worker 合法重 claim。
+        if int(lease_ms) <= 0:
+            raise ValueError(
+                f"非法 lease_ms：{lease_ms!r}（必须 > 0；ttl<=0 等于关闭租约过期 → fencing 失效）")
         claim_ttl = lease_ms if claim_lease_ms is None else int(claim_lease_ms)
         if claim_ttl < int(lease_ms):
             raise ValueError(
@@ -397,6 +401,12 @@ class Harness:
         self.poison_after_failures = max(0, int(poison_after_failures))
         self.drain_timeout_s = float(drain_timeout_s)
         self._draining = False
+        # S21 K-100：本部署的最大租约时长（秒）——墓碑窗口的量纲依据。
+        # 必须**向上取整**且覆盖 claim 租约：`lease_ms=1500` 的真实租约是 1.5s，
+        # 若向下取整成 1s，墓碑会在旧持有者租约仍有效时被忘记 → fencing 被削弱。
+        _max_ttl_ms = max(int(self.lease_ms), int(self.claim_lease_ms))
+        self.max_lease_ttl_s = max(1, -(-_max_ttl_ms // 1000))
+        self._claim_window_exceeded = 0
         self.ingress = Ingress(self)
         # S13d §2.5 P0-10：claim 的 fence epoch 接入**写路径**（commit_batch /
         # budget.consume / effects.begin / checkpoints.save）。sync 模式无 claim
@@ -1605,12 +1615,15 @@ class Harness:
     def dispatch_and_run(self, plan: dict, task_id: str, decisions, *,
                          required_tools: set[str] | None = None,
                          crash_at=None, token=None) -> ACB:
-        """唯一生产入口：try_admit → 注册 plan/acb → run_task → 返回 acb。"""
+        """唯一生产入口：注册 plan → try_admit → 注册 acb → run_task → 返回 acb。"""
         run_id = plan["run_id"]
+        # S21 K-97：plan 必须在准入**之前**登记 —— `_tenant_of`/`_tier_of` 会读
+        # `h.plans[run_id]` 取 run 级 `tenant`/`tier`；先准入后登记会让 plan 级
+        # tenant 静默失效（任务挂到 `run` 下）。
+        self.plans[run_id] = plan
         acb = self.dispatcher.try_admit(plan["tasks"][task_id], run_id,
                                         required_tools=required_tools,
                                         token=token, plan=plan)
-        self.plans[run_id] = plan
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
         if acb.state is not TaskState.ADMITTED:
@@ -2175,7 +2188,10 @@ class Harness:
                         slot = True
                         node = self.budget.create_node(
                             f"B-{child_id}", slice_limits,
-                            parent_id=parent_node.node_id, run_id=run_id)
+                            parent_id=parent_node.node_id, run_id=run_id,
+                            # S21 K-97：子节点标签必须与**实际挂载点**一致，
+                            # 否则子任务的预留不计入租户计量。
+                            tenant=_tenant_of_node_id(parent_node.node_id))
                         if node is None:
                             failure = "SPAWN_BUDGET_UNAVAILABLE"
                         else:
@@ -2562,6 +2578,11 @@ class Harness:
                     self._record_approval(acb, "timeout", "APPROVAL_TIMEOUT")
             self.intents.revoke_all(acb.id)  # 释放租约
             self._finalize(acb)              # 结算预算 / 释放槽位
+        # S21 K-99：惰性回收过期租约（与 aging/HITL 共用同一驱动面）
+        try:
+            self.intents.reap_expired(now)
+        except Exception:  # noqa: BLE001  # 回收失败不影响超时结算
+            pass
         # S13d §2.5 / B-4：aging（墙钟）与 HITL 超时共用**唯一**驱动面；
         # 扫描入口在 ReconcileLoop（`scan_deadlines`），便于观测/替换。
         self.reconcile.scan_deadlines(now)
@@ -2840,6 +2861,21 @@ class Harness:
         self.event_log.append(EventKind.RUN_PURGED, run_id, {}, run_id=run_id)
         return True
 
+    def claim_window_s(self) -> int:
+        """有界墓碑集合的**总覆盖窗口** = `tombstone_max × max_lease_ttl_s`（K-100）。
+
+        **为什么必须用租约时长而不是固定窗口**：若部署把 `lease_ms` 调大
+        （例如 600s），而窗口按固定 30s 记，则窗口会**小于**租约时长 →
+        残留 fencing 风险从「可忽略」变成「真实」。公式随部署自动适配。
+
+        **强制点在哪**：真正保证不复活旧 worker 的是 Raft 副本里的**逐墓碑
+        年龄判定**（`now - 入墓时刻 >= max_lease_ttl_s` 才允许忘记，见
+        `_ReplicatedBudget.prune`）；本函数给出的是「满员墓碑集合能覆盖多久」
+        的诊断量，供运维核对部署参数是否落在设计假设内。
+        """
+        tombstone_max = int(getattr(self.budget, "claim_tombstone_max", 1024))
+        return max(1, tombstone_max * int(self.max_lease_ttl_s))
+
     def prune_budget(self, *, max_age_s: float | None = None,
                      now_ms: int | None = None) -> int:
         """S19 K-88：剪掉「已终结 + 无人引用 + 超过保留期」的预算预留条目。
@@ -2855,27 +2891,64 @@ class Harness:
                 continue
             live_ids.add(acb.id)
             live.update(acb.reservation_ids or ())
-        # S20 K-94：同时传 live_acb_ids（Raft 副本据此把已剪 ACB 的 claim 转为墓碑）
-        try:
-            return self.budget.prune(now_s, live, max_age_s=max_age_s,
-                                     live_acb_ids=live_ids)
-        except TypeError:
-            # 单机 BudgetManager 没有该参数 → 退回旧签名（不影响既有语义）
-            return self.budget.prune(now_s, live, max_age_s=max_age_s)
+        # S21 K-100：墓碑的**年龄窗口**随命令下发（`max_lease_ttl_s`）——由
+        # Raft 副本按「入墓已满该时长」判定能否忘记，避免复活仍活着的旧 worker。
+        # 单机后端接收后忽略。拒绝淘汰的次数回读到 `_claim_window_exceeded`。
+        removed = self.budget.prune(now_s, live, max_age_s=max_age_s,
+                                    live_acb_ids=live_ids,
+                                    max_lease_ttl_s=float(self.max_lease_ttl_s))
+        self._claim_window_exceeded = int(
+            getattr(self.budget, "claim_window_exceeded", 0) or 0)
+        return removed
 
     # ---- S20 阶段三：多租户（**配额隔离**，非安全隔离）----------------
     def ensure_tenant(self, tenant: str, quota: int, *,
-                      parent: str = "run"):
+                      parent: str = "run", min_share: float = 0.0):
         """确保存在 `tenant:<t>` 预算节点（幂等）。挂在它下面的节点共享受配额约束。
 
+        `min_share>0` 时再建 `tenant:<t>:reserved`（优先级份额池）。
+
+        **失败零残留**：份额/配额先校验再建节点；配置冲突（同名节点已存在但
+        quota/parent/share 不同）**显式抛错**，绝不静默返回旧节点。
+
         **诚实边界**：这只有**配额**隔离；同进程仍共享内存（安全隔离靠 egress/沙箱）。
-        自动把 `plan["tenant"]` 接到准入的接线见 K-97（未做）。
+        `plan["tenant"]` 已由 K-97 自动接到准入（见 `Dispatcher._resolve_parent_budget`）。
         """
         tid = str(tenant or "")
         if not tid:
             return None
-        return self.budget.create_node(f"tenant:{tid}", int(quota), parent,
-                                       tenant=tid)
+        if ":" in tid:
+            # `tenant:<t>` 的解析靠 `:` 分隔；租户名含 `:` 会让归属/计量错位。
+            raise ValueError(f"非法 tenant 名：{tid!r}（不得含 ':'）")
+        # 显式拒绝小数：`int()` 静默截断会让「6.9 变成 6」看起来成功。
+        if int(quota) != quota:
+            raise ValueError(f"quota={quota!r} 必须是整数")
+        if min_share is not None and int(min_share) != min_share:
+            raise ValueError(f"min_share={min_share!r} 必须是整数")
+        quota = int(quota)
+        share = int(min_share or 0)
+        # ① 先校验（在建任何节点之前）—— 非法份额不得留下半成品。
+        if quota <= 0:
+            raise ValueError(f"quota={quota} 必须 > 0")
+        if share < 0 or share > quota:
+            raise ValueError(
+                f"min_share={share} 必须满足 0 <= share <= quota={quota}")
+        if parent != "run" and self.budget._nodes.get(parent) is None:
+            raise ValueError(f"父预算节点不存在：{parent!r}")
+        # ② 建租户节点；同名但配置不同 → create_node 返回 None → 显式拒绝。
+        node = self.budget.create_node(f"tenant:{tid}", quota, parent, tenant=tid)
+        if node is None:
+            raise ValueError(
+                f"tenant:{tid} 已存在但 quota/parent 不一致（不会静默沿用旧配置）")
+        if share > 0:
+            # 预留子节点：已知档位（premium/standard/developer）挂它，
+            # 其他/未知档位回落共享池（超额借用）。
+            rnode = self.budget.create_node(f"tenant:{tid}:reserved", share,
+                                            f"tenant:{tid}", tenant=tid)
+            if rnode is None:
+                raise ValueError(
+                    f"tenant:{tid}:reserved 已存在但 min_share 不一致（不会静默沿用旧配置）")
+        return node
 
     # ---- S20 阶段三：计量（**从事件派生**，天然幂等）------------------
     def usage_report(self, *, tenant: str | None = None) -> dict:
@@ -4241,7 +4314,8 @@ class Harness:
                         nid = p.get("node_id")
                         node = budget.create_node(
                             nid, int(p.get("limits", 0) or 0),
-                            parent_id=p.get("parent_id") or "run")
+                            parent_id=p.get("parent_id") or "run",
+                            tenant=str(p.get("tenant", "") or ""))
                         if node is None:
                             raise ValueError(
                                 f"budget replay: create_node({nid!r}) failed")

@@ -25,7 +25,8 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
                  max_concurrent: int = 100,
                  checkpoints=None, checkpoint_root=None,
                  poison_after_failures: int = 3,
-                 drain_timeout_s: float = 5.0) -> Harness:
+                 drain_timeout_s: float = 5.0,
+                 lease_ms: int = 60_000) -> Harness:
     """默认 Harness + 通配能力 token（D13：deny-by-default 下的测试夹具）。
 
     安全用例必须用**不装 default_token** 的 `Harness()` 自行断言拒绝。
@@ -48,7 +49,8 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
                 max_concurrent=max_concurrent,
                 checkpoints=checkpoints, checkpoint_root=checkpoint_root,
                 poison_after_failures=poison_after_failures,
-                drain_timeout_s=drain_timeout_s)
+                drain_timeout_s=drain_timeout_s,
+                lease_ms=lease_ms)
     if probe is not None:
         h.effects._probe = probe
     if toolgw is not None:

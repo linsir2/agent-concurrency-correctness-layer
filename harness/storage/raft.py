@@ -603,14 +603,22 @@ if _HAS_PYSYNCOBJ:
             # S20 K-94：已剪 ACB 的 claim 墓碑（**有界 LRU**）。裸删会让旧 worker
             # 复活（`claims.get` 回 0 → 任何 epoch 都通过）。
             self.claim_tombstones = {}
+            # S21 K-100：墓碑的**入墓时刻**（s），淘汰按「年龄 ≥ 最大租约时长」
+            # 判定 —— 只有旧 worker 的租约必然过期后，忘记其 epoch 才安全。
+            self.claim_tombstone_at = {}
             self.claim_tombstone_max = 1024
+            # 因「无足够老的墓碑」而拒绝淘汰的次数（fail-safe 可观测）。
+            self.claim_window_exceeded = 0
 
         @replicated
         def create_node(self, node_id: str, limits: int,
-                        parent_id: str, run_id: str) -> None:
+                        parent_id: str, run_id: str, tenant: str = "") -> None:
             # 审查 P1-4：`create_node` 在「同名但 limits 不同」时返回 None。
             # 必须回传该结果，否则调用方以为改成功（实际仍是旧节点）。
-            node = self.bm.create_node(node_id, limits, parent_id, run_id=run_id)
+            # S21 K-97：`tenant` 也必须随命令复制 —— 否则各副本的
+            # `node.tenant` 标签不同 → 计量归集发散。
+            node = self.bm.create_node(node_id, limits, parent_id,
+                                       run_id=run_id, tenant=tenant)
             self.last_ok = node is not None
             self.version += 1
 
@@ -674,12 +682,18 @@ if _HAS_PYSYNCOBJ:
 
         @replicated
         def prune(self, now: float, live_rids: tuple | None,
-                  retention_s: float, live_acb_ids: tuple | None = None) -> None:
+                  retention_s: float, live_acb_ids: tuple | None = None,
+                  max_lease_ttl_s: float = 0.0,
+                  tombstone_max: int = 1024) -> None:
             """S19 K-88：`now` / `live_rids` / **生效保留期**都随命令复制 → 确定。
 
             **为什么传 `retention_s` 而不是让副本自己读 `_tombstone_ttl_s`**：
             ttl 是本地配置，不是复制状态；若两副本配置不同，同一命令会得出
             不同结果 → 状态机发散。由调用方算好再复制，才是确定性 RSM。
+
+            **同理**（S21 K-100）：墓碑上限 `tombstone_max` 也随命令复制，
+            **绝不在副本内读 `self.claim_tombstone_max`** —— 否则各副本淘汰
+            数量不同 → 状态机发散。
             """
             self.removed = int(self.bm.prune(
                 now, live_rids, retention_s=retention_s))
@@ -690,11 +704,31 @@ if _HAS_PYSYNCOBJ:
                     if aid in live_ids:
                         continue
                     self.claim_tombstones[aid] = int(self.claims.pop(aid))
-                # 有界：按插入顺序挤出最旧（dict 保序）
-                overflow = len(self.claim_tombstones) - int(
-                    self.claim_tombstone_max)
-                for old in list(self.claim_tombstones)[:max(0, overflow)]:
-                    self.claim_tombstones.pop(old, None)
+                    self.claim_tombstone_at[aid] = float(now)
+                # S21 K-100：**按年龄**淘汰，而不是纯 LRU。只有「入墓已满
+                # `max_lease_ttl_s`」的墓碑才能被忘记 —— 此刻旧 worker 的租约
+                # 必然已过期，复活其 epoch 也不会通过租约校验。若容量超限但
+                # 没有足够老的墓碑 → **不淘汰**（宁可暂时超界，也不削弱 fencing），
+                # 并计数 `claim_window_exceeded`。
+                cap = int(tombstone_max)
+                excess = len(self.claim_tombstones) - cap
+                if excess > 0:
+                    ttl = float(max_lease_ttl_s)
+                    evicted = 0
+                    for aid in list(self.claim_tombstones):   # dict 保序：最旧在前
+                        if evicted >= excess:
+                            break
+                        # 旧版本（S20）墓碑没有入墓时刻 → 首次见到时补记，
+                        # 否则 `get(aid, now)` 会让它永远「太年轻」、永不淘汰。
+                        born = float(self.claim_tombstone_at.setdefault(
+                            aid, float(now)))
+                        if ttl > 0 and float(now) - born < ttl:
+                            continue                          # 还太年轻 → 不可忘记
+                        self.claim_tombstones.pop(aid, None)
+                        self.claim_tombstone_at.pop(aid, None)
+                        evicted += 1
+                    if evicted < excess:
+                        self.claim_window_exceeded += 1
             self.version += 1
 else:                                                     # pragma: no cover
     class _ReplicatedBudget:                              # type: ignore[no-redef]
@@ -752,10 +786,14 @@ class RaftBudgetManager:
 
     # ---- 共识路径（写）-------------------------------------------
     def create_node(self, node_id: str, limits: int,
-                    parent_id: str = "run", run_id: str = ""):
-        """建节点（共识）。**同名不同 limits → 返回 None**（不静默返回旧节点）。"""
+                    parent_id: str = "run", run_id: str = "",
+                    tenant: str = ""):
+        """建节点（共识）。**同名不同 limits → 返回 None**（不静默返回旧节点）。
+
+        S21 K-97：`tenant` 作为命令参数随共识复制（各副本标签一致）。
+        """
         self._bump_and_wait(self._replica.create_node, node_id, int(limits),
-                            parent_id, run_id)
+                            parent_id, run_id, str(tenant or ""))
         if not bool(getattr(self._replica, "last_ok", False)):
             return None
         return self._bm._nodes.get(node_id)
@@ -820,11 +858,13 @@ class RaftBudgetManager:
 
     def prune(self, now: float, live_rids=None, *,
               max_age_s: float | None = None,
-              live_acb_ids=None) -> int:
-        """S19/S20：三栅栏剪枝 + claim 墓碑清理（参数全部随命令复制）。
+              live_acb_ids=None,
+              max_lease_ttl_s: float = 0.0) -> int:
+        """S19/S20/S21：三栅栏剪枝 + claim 墓碑清理（参数全部随命令复制）。
 
         `live_rids=None` → **fail-safe 不剪**（K-95）；`live_acb_ids=None` →
-        不动 claims（同样 fail-safe）。
+        不动 claims（同样 fail-safe）。`max_lease_ttl_s` 决定墓碑**可被忘记**
+        的最短年龄（K-100），必须随命令复制，否则各副本淘汰结果发散。
         """
         if live_rids is None and live_acb_ids is None:
             return 0
@@ -836,8 +876,20 @@ class RaftBudgetManager:
             self._replica.prune, float(now),
             None if live_rids is None else rids, retention,
             None if live_acb_ids is None else tuple(
-                sorted(str(a) for a in live_acb_ids)))
+                sorted(str(a) for a in live_acb_ids)),
+            float(max_lease_ttl_s),
+            int(getattr(self._replica, "claim_tombstone_max", 1024) or 1024))
         return int(getattr(self._replica, "removed", 0) or 0)
+
+    @property
+    def claim_tombstone_max(self) -> int:
+        """S21 K-100：墓碑上限（诊断/下发用；副本内**不**再读它做淘汰）。"""
+        return int(getattr(self._replica, "claim_tombstone_max", 1024) or 1024)
+
+    @property
+    def claim_window_exceeded(self) -> int:
+        """S21 K-100：因「无足够老的墓碑」而拒绝淘汰的累计次数。"""
+        return int(getattr(self._replica, "claim_window_exceeded", 0) or 0)
 
     def remaining(self, node_id: str) -> int:
         return self._bm.remaining(node_id)

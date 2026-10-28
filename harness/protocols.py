@@ -109,6 +109,10 @@ class IntentRegistry(Protocol):
     def compatible(self, dep_id: str, agent_id: str, kind: str = "CONTRACT") -> bool:
         ...
 
+    def reap_expired(self, now_ms: int | None = None) -> int:
+        """回收已失效（`valid=False` 或 epoch 不匹配）的租约（K-99）。"""
+        ...
+
     # ---- S15 C1：epoch 接缝（fencing 必需）----
     def get_epoch(self) -> int:
         ...
@@ -148,7 +152,7 @@ class BudgetManager(Protocol):
         ...
 
     def reserve(self, node_id: str, amount: int, *,
-                reservation_id: Optional[str] = None) -> Reservation | None:
+                reservation_id: str | None = None) -> Reservation | None:
         ...
 
     def consume(self, reservation_id: str, amount: int = 1, *,
@@ -173,8 +177,13 @@ class BudgetManager(Protocol):
         ...
 
     def prune(self, now: float, live_rids=(), *,
-              max_age_s: float | None = None) -> int:
-        """三栅栏剪枝（状态/引用/时间）；剪前折账（S19 K-88）。"""
+              max_age_s: float | None = None,
+              live_acb_ids=None, max_lease_ttl_s: float = 0.0) -> int:
+        """三栅栏剪枝（状态/引用/时间）；剪前折账（S19 K-88）。
+
+        `live_acb_ids` / `max_lease_ttl_s` 供 Raft 后端剪 claim 墓碑（S20 K-94 /
+        S21 K-100）；单机后端忽略。
+        """
         ...
 
     # ---- S15 C1：事件溯源 / 归档 / 不变量 ----

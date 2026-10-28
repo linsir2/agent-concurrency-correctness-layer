@@ -48,6 +48,23 @@ def _edge_endpoints(edge) -> tuple:
 # `required_coverage` 表达，而不是把整条下游分支静默吊死。
 PREDECESSOR_SATISFIED = frozenset({TaskState.DONE, TaskState.DONE_PARTIAL})
 
+# S21 优先级份额：只有**已登记档位**才享受预留池；未登记/拼错的档位一律
+# 回落租户共享池（超额借用）。这样「tier 拼错」不会意外吃到预留额度。
+_RESERVED_TIERS = frozenset({"premium", "standard", "developer"})
+
+
+def _tenant_of_node_id(node_id: str) -> str:
+    """从预算节点 id 反推归属租户：`tenant:<t>[:...]` → `<t>`；否则空串。
+
+    **为什么按父节点反推而不是用声明的 tenant**：声明了 tenant 但节点不存在时，
+    任务实际挂在 `"run"` 下（未被配额隔离）。若仍把 `node.tenant` 标成该租户，
+    计量会把「未隔离的用量」记到租户头上。标签必须与**实际挂载点**一致。
+    """
+    if not node_id.startswith("tenant:"):
+        return ""
+    parts = node_id.split(":", 2)
+    return parts[1] if len(parts) > 1 else ""
+
 
 def _has_cycle(edges) -> bool:
     """DFS 三色环检测（§2.5）：有向图存在后向边 → `True`。"""
@@ -134,20 +151,28 @@ class Planner:
         for spec in tasks:
             task_id = spec.get("task_id", f"T{next(self._counter)}")
             subgoal = spec.get("logical_subgoal_id") or f"S-{task_id}"
+            footprint = {
+                "committed": set(spec.get("committed", [])),
+                "contingent": set(spec.get("contingent", [])),
+                "min_budget": spec.get("min_budget", 10),
+                "logical_deps": spec.get("logical_deps", []),
+                # S13c §2.4 P0-8：父预算挂点与子份额**不得丢弃**（否则
+                # 恒为 "run" → 多级预算树不可达；`child_alloc` 缺失会让父
+                # limits 只剩 retry_budget+1，任何正常 child 都放不下）。
+                "parent_budget": spec.get("parent_budget", "run"),
+                "child_alloc": spec.get("child_alloc", 0),
+            }
+            # S21 K-97：租户/档位随 spec 落到 footprint（缺省不写入 → 无
+            # tenant 时 footprint 与旧版**逐字节相同**）。准入据此把任务
+            # 挂到 `tenant:<t>[:reserved]` 下。
+            if spec.get("tenant"):
+                footprint["tenant"] = str(spec["tenant"])
+            if spec.get("tier"):
+                footprint["tier"] = str(spec["tier"])
             plan["tasks"][task_id] = {
                 "task_id": task_id,
                 "logical_subgoal_id": subgoal,
-                "footprint": {
-                    "committed": set(spec.get("committed", [])),
-                    "contingent": set(spec.get("contingent", [])),
-                    "min_budget": spec.get("min_budget", 10),
-                    "logical_deps": spec.get("logical_deps", []),
-                    # S13c §2.4 P0-8：父预算挂点与子份额**不得丢弃**（否则
-                    # 恒为 "run" → 多级预算树不可达；`child_alloc` 缺失会让父
-                    # limits 只剩 retry_budget+1，任何正常 child 都放不下）。
-                    "parent_budget": spec.get("parent_budget", "run"),
-                    "child_alloc": spec.get("child_alloc", 0),
-                },
+                "footprint": footprint,
                 "merge_policy": spec.get("merge_policy") or {},
                 "state": TaskState.PLANNED,
                 "plan_version": 1,
@@ -535,9 +560,6 @@ class Dispatcher:
             if not self._predecessors_done(eff_plan, task["task_id"]):
                 return self._deny(acb, "PREDECESSOR_NOT_DONE")
 
-        node = None
-        resv = None
-        declared: list[str] = []
         committed = False                           # 哨兵：副作用全部完成才置 True
         with self.h.budget.suppressed():            # 准入事务：失败零事件残留
             committed = self._try_admit_commit(
@@ -553,6 +575,75 @@ class Dispatcher:
         else:
             self.h.budget.discard_pending()         # 失败 → 丢弃草稿
         return acb
+
+    def _plan_of(self, acb: ACB) -> dict:
+        """当前 ACB 所属 run 的 plan（准入时已在 `h.plans` 中）。"""
+        return self.h.plans.get(acb.run_id) or {}
+
+    def _tenant_of(self, acb: ACB, task: dict) -> str:
+        """租户解析（**唯一来源**）：spec → footprint → task → plan 顶层。
+
+        生产用法是 `plan["tenant"]`（run 级归属）；任务级 `tenant` 也支持，
+        由 `Planner.plan` 落到 `footprint`。四处都读是为了兼容手工构造的
+        plan（不经 Planner）。
+        """
+        spec = acb.spec or {}
+        footprint = task.get("footprint") or {}
+        return str(spec.get("tenant")
+                   or footprint.get("tenant")
+                   or task.get("tenant")
+                   or self._plan_of(acb).get("tenant") or "")
+
+    def _tier_of(self, acb: ACB, task: dict) -> str:
+        """档位解析（与 `_tenant_of` 同序）：决定挂 reserved 还是 shared。
+
+        **规范化**（去空白 + 小写）：`"Premium"` 与 `"premium"` 等价，避免
+        大小写差异把 premium 任务静默降级到共享池。
+        """
+        spec = acb.spec or {}
+        footprint = task.get("footprint") or {}
+        return str(spec.get("tier")
+                   or footprint.get("tier")
+                   or task.get("tier")
+                   or self._plan_of(acb).get("tier") or "").strip().lower()
+
+    def _resolve_parent_budget(self, acb: ACB, task: dict) -> str:
+        """S21 K-97：预算父节点解析。
+
+        优先级（**无 tenant 时与现状逐字节相同**）：
+          ① `footprint.parent_budget` 显式指定 → 用它
+          ② 解析出 `tenant` **且** `tenant:<t>` 节点存在 → 用它
+             （不存在 → 退回 `"run"`：不静默建节点，避免「拼错的 tenant
+             把任务挂到根上还看起来正常」）
+          ③ 否则 → `"run"`
+        """
+        # 注意解析顺序：`footprint.parent_budget` 由 `Planner.plan` 默认填成
+        # `"run"`，所以**不能**「有值就返回」——否则 tenant 永远轮不到。
+        # 只有**显式非默认**的值才优先。
+        explicit = (task.get("footprint") or {}).get("parent_budget")
+        if explicit and str(explicit) != "run":
+            return str(explicit)
+        tenant = self._tenant_of(acb, task)
+        if tenant:
+            tid = f"tenant:{tenant}"
+            if self.h.budget._nodes.get(tid) is not None:
+                return tid
+        return "run"
+
+    def _tier_parent(self, acb: ACB, task: dict) -> str:
+        """S21 优先级份额：**已知档位** → 预留池；超额/未知档位 → 租户共享池。
+
+        只有父节点确实是租户节点（`tenant:<t>`）时才探测 `tenant:<t>:reserved`；
+        **未知档位一律回落共享池** —— 这正是「超额借用」：预留池未登记时，
+        任务与普通任务同池竞争。
+        """
+        base = self._resolve_parent_budget(acb, task)
+        tier = self._tier_of(acb, task)
+        if base.startswith("tenant:") and tier in _RESERVED_TIERS:
+            rid = f"{base}:reserved"
+            if self.h.budget._nodes.get(rid) is not None:
+                return rid
+        return base
 
     def _try_admit_commit(self, acb: ACB, task: dict, required_tools,
                           eff_plan: dict | None) -> bool:
@@ -584,10 +675,12 @@ class Dispatcher:
                 self._deny(acb, "INVALID_INPUT")
                 return False
             limits = min_budget + child_alloc + acb.retry_budget + 1
+            parent_id = self._tier_parent(acb, task)
             node = self.h.budget.create_node(
                 f"B-{acb.id}", limits,
-                parent_id=task["footprint"].get("parent_budget", "run"),
-                run_id=acb.run_id)
+                parent_id=parent_id,
+                run_id=acb.run_id,
+                tenant=_tenant_of_node_id(parent_id))
             if node is None:
                 self._deny(acb, "BUDGET_UNAVAILABLE")
                 return False

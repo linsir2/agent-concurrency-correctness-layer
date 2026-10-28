@@ -75,6 +75,8 @@ claim_tombstone_max: int = 1024      # 上限（可配）
 - `consume` 判据：`epoch < max(claims.get(aid,0), tombstones.get(aid,0))` → 拒绝
 - `prune`：活集合外的 acb → **先写墓碑**（同时把最旧的挤出，LRU）再删 claims
 - **有界性**：`|claims| ≤ 活 ACB 数`，`|tombstones| ≤ claim_tombstone_max`
+  （S21 K-100 起改为**稳态有界**：墓碑只有「入墓满 `max_lease_ttl_s`」才可淘汰，
+  容量不足时宁可**暂时超界**也不削弱 fencing，超界量在一个租约时长内自动收敛）
 - **残余风险**（如实记录为 K-100）：被挤出 LRU 的 acb 若还有**极旧** worker 存活，
   其低 epoch 会被接受。缓解：ACB id 含 attempt 计数且不复用；实际窗口远大于
   任何租约时长（`lease_ms` 默认 60s）。
@@ -135,7 +137,7 @@ def usage_report(self, *, tenant: str | None = None) -> dict:
 |---|---|---|
 | S20-1 | **K-95 fail-safe** | `prune(now)` 不传 `live_rids` → 返回 0 **且不删**；传空集合才删 |
 | S20-2 | **K-94 claims 清理** | ACB 终态后 `prune_budget()` → 该 acb 的 claim 被删；**仍在活的 acb 的 claim 保留** |
-| S20-3 | K-94 负对照 | **删 claims 后旧 worker 仍被墓碑拒绝**（否则 fencing 被抹）；墓碑有界（≤ `claim_tombstone_max`） |
+| S20-3 | K-94 负对照 | **删 claims 后旧 worker 仍被墓碑拒绝**（否则 fencing 被抹）；墓碑有界（≤ `claim_tombstone_max`；S21 K-100 起为**稳态有界**） |
 | S20-4 | **K-96 连通性复核** | 3 节点就绪后 `verify_connected()` 通过；模拟 peer 不可达 → 抛错并列出 peer |
 | S20-5 | **多租户配额** | 两 tenant 各配额 10；A 用满 10 后 B 仍可预留（互不侵占）；`ensure_tenant` 幂等 |
 | S20-6 | 多租户隔离负对照 | A 超配额 → 拒绝；B 的 `subtree_reserved` 不受影响 |

@@ -527,6 +527,10 @@ class BudgetManager:
             cur = self._nodes.get(node_id)
             if cur is not None:
                 if cur.limits == limits and cur.parent is self._nodes.get(parent_id):
+                    # S21 K-97：补齐 tenant 标签（旧数据/重放早退时不能丢标签，
+                    # 否则 `usage_report` 归集归零）。tenant 是命令参数 → 各副本一致。
+                    if tenant and not cur.tenant:
+                        cur.tenant = tenant
                     return cur
                 return None
             parent = self._nodes.get(parent_id)
@@ -538,7 +542,10 @@ class BudgetManager:
             self._emit(EventKind.BUDGET_NODE_CREATED, node_id,
                        {"node_id": node_id, "parent_id": parent_id, "limits": limits,
                         "budget_epoch": self._epoch_for(node.run_id or None),
-                        "run_id": node.run_id})
+                        "run_id": node.run_id,
+                        # S21 K-97：tenant 必须落事件，否则重放/恢复后
+                        # `node.tenant` 丢失 → `usage_report` 归集归零。
+                        "tenant": node.tenant})
             return node
 
     def remove_node(self, node_id: str, *, owner: str = "") -> bool:
@@ -936,8 +943,13 @@ class BudgetManager:
 
     def prune(self, now: float, live_rids=None, *,
               max_age_s: float | None = None,
-              retention_s: float | None = None) -> int:
+              retention_s: float | None = None,
+              live_acb_ids=None, max_lease_ttl_s: float = 0.0) -> int:
         """剪掉「已终结 + 无人引用 + 超过保留期」的预留条目（S19 K-88）。
+
+        `live_acb_ids` / `max_lease_ttl_s` 是 **Raft 后端专用**参数（claim 墓碑
+        的引用栅栏与年龄窗口，S20/S21）；单机没有 claim 墓碑，接收后忽略 ——
+        这样调用方（`Harness.prune_budget`）可以用**同一签名**驱动两种后端。
 
         **三个栅栏全部满足才剪**（缺一不可）：
 

@@ -127,6 +127,37 @@ class IntentRegistry:
             lease.expires_at = cur.expires_at
             return True
 
+    def reap_expired(self, now_ms: int | None = None) -> int:
+        """回收**已失效**的租约（K-99）。
+
+        删除条件（二者任一）：
+          ① `not lease.valid` —— `revoke`/`IntentRegistry.bump_epoch` 置的失效终态；
+          ② `lease.epoch != 当前 epoch` —— **epoch 失效**。全局 `Harness.bump_epoch`
+             走 `set_epoch`，只推进 epoch、不逐个置 `valid=False`；若只看 ①，
+             这些 `is_valid` 已为 False 的租约将**永不回收** → 无界增长。
+
+        **不要求「已过期」**：`expires_at==0`（永不过期）的失效租约同样要回收。
+        `valid=True` **且 epoch 匹配** 的租约一律不删（哪怕已过期）：那是
+        「持有者只是没续期」的诊断证据，`is_valid` 仍会拒它。
+
+        注意：这只解决**孤儿回收**（不再有活持有者）。跨进程唯一写已由
+        Raft 单写者 + `flock` 保证（S10/S16），**不需要复制租约状态**（K-103）。
+        `now_ms` 仅为兼容签名/可注入时间；失效判定不依赖它。
+        """
+        removed = 0
+        with self._lock:
+            for lid in list(self._leases):
+                lease = self._leases[lid]
+                # epoch 匹配且 valid → 仍有效，绝不删
+                if lease.valid and lease.epoch == self._epoch_for(lease.run_id or None):
+                    continue
+                self._leases.pop(lid, None)
+                lst = self._active.get(lease.resource)
+                if lst:
+                    self._active[lease.resource] = [l for l in lst if l.lease_id != lid]
+                removed += 1
+        return removed
+
     def renew_for(self, acb) -> bool:
         """guard 中调用：续期该 agent 的所有未过期有效租约（v1.10 修复）。"""
         with self._lock:
