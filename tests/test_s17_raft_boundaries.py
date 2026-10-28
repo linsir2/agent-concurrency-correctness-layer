@@ -70,17 +70,24 @@ def test_s17_1_deterministic_rid_across_replicas():
 
         # 绑定副本（写入等待的那一个）必须是权威的
         assert int(bm._replica._seq) == 2
-        assert "R1" in dict(getattr(bm._replica, "_resv", {}))
+        assert "R1" in dict(bm._bm._reservations), (
+            "S18 起账本在真实 BudgetManager 里（不再是扁平 _resv）")
 
         # 复制是**异步**的：其余副本需等待收敛（不能立刻断言三者同步）
         assert bm._cluster.wait_until(
             lambda: all(int(getattr(n, "_seq", 0)) == 2
                         for n in bm._cluster.nodes), 20.0), (
             f"副本未收敛：{[int(getattr(n, '_seq', 0)) for n in bm._cluster.nodes]}")
-        resv_maps = [dict(getattr(n, "_resv", {})) for n in bm._cluster.nodes]
+        def _ledger(node):
+            return sorted(
+                (rid, ent[1].node_id, int(ent[1].amount), ent[1].state)
+                for rid, ent in node.bm._reservations.items())
+
+        resv_maps = [_ledger(n) for n in bm._cluster.nodes]
         assert resv_maps[0] == resv_maps[1] == resv_maps[2], (
             "收敛后各副本账本必须完全一致（含确定性 rid）")
-        assert resv_maps[0]["R1"][1] == 10 and resv_maps[0]["R2"][1] == 20
+        assert [(rid, amt) for rid, _nid, amt, _st in resv_maps[0]] == [
+            ("R1", 10), ("R2", 20)]
     finally:
         bm.close()
 
@@ -129,9 +136,11 @@ def test_s17_2_raft_budget_does_not_overspend():
         ok2 = bm.reserve("n1", 6)      # 6+6 > 10 → 拒绝
         assert ok1 is not None
         assert ok2 is None
-        assert bm._reserved_of("n1") == 6
-        assert bm.check("n1", 4) is True
-        assert bm.check("n1", 5) is False
+        assert bm._bm._nodes["n1"].self_reserved == 6
+        # `check` 的真实语义：该节点**任一** ACTIVE 预留余额 >= amount
+        assert bm.check("n1", 6) is True, "R1 余额 6 应够付 6"
+        assert bm.check("n1", 7) is False, "R1 余额 6 不够付 7"
+        assert bm._bm._nodes["n1"].remaining == 4
     finally:
         bm.close()
 
@@ -144,9 +153,9 @@ def test_s17_2_release_returns_capacity():
         bm.create_node("n1", 10)
         r = bm.reserve("n1", 8)
         assert r is not None
-        assert bm._reserved_of("n1") == 8
+        assert bm._bm._nodes["n1"].self_reserved == 8
         bm.release(r.reservation_id)
-        assert bm._reserved_of("n1") == 0
+        assert bm._bm._nodes["n1"].self_reserved == 0
         assert bm.reserve("n1", 10) is not None
     finally:
         bm.close()

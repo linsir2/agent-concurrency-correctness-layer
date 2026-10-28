@@ -147,6 +147,31 @@ class BudgetManager:
         self._epoch_source = None
 
     # ------------------------------------------------------------------ #
+    # 序列化（S18 K-87：让 `BudgetManager` 能作为 Raft 复制状态）
+    # ------------------------------------------------------------------ #
+    def __getstate__(self) -> dict:
+        """去掉**不可序列化**的运行期成员（锁 / 外部句柄）。
+
+        为什么需要：pysyncobj 用 pickle 序列化整个复制对象；`threading.RLock`
+        不可 pickle（`TypeError: cannot pickle '_thread.RLock' object`）。
+        复制状态只需要**账本数据**（`_nodes` / `_reservations` / `_epoch` 等），
+        锁与外部句柄在 `__setstate__` 中重建。
+        """
+        state = dict(self.__dict__)
+        state.pop("_lock", None)
+        state.pop("event_log", None)          # 副本内应保持 None（不 emit）
+        state.pop("_epoch_store", None)       # 外部 epoch 存储，由装配方重新注入
+        state.pop("_epoch_source", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+        self.event_log = None
+        self._epoch_store = None
+        self._epoch_source = None
+
+    # ------------------------------------------------------------------ #
     # 内部工具
     # ------------------------------------------------------------------ #
     def set_run_id(self, run_id: str) -> str:
@@ -522,7 +547,7 @@ class BudgetManager:
             stack.extend(cur.children)
         return out
 
-    def archive_node(self, node_id: str) -> bool:
+    def archive_node(self, node_id: str, *, now: float | None = None) -> bool:
         """终态摘除（§5.3）：子树内无 ACTIVE 预留才可归档。
 
         ① 整个子树的 `consumed` 折入父级（永久账不丢），并同步父级
@@ -557,12 +582,15 @@ class BudgetManager:
                 folded_consumed = total_consumed
             else:
                 folded_consumed = 0
-            now = int(time.time())
+            # S18 K-87：`now` 可注入 —— Raft 副本必须使用**同一条命令里的**
+            # 时间（由 leader 在提交时决定），否则各副本 tombstone 过期时间不同
+            # → 状态发散（gc 时机不同，最终账目不同）。
+            stamp = int(time.time() if now is None else now)
             for n in subtree:
                 for rid in list(n.reservations):
                     resv = n.reservations[rid]
                     resv.state = "ARCHIVED"
-                    resv.expires_at = now + int(self._tombstone_ttl_s)
+                    resv.expires_at = stamp + int(self._tombstone_ttl_s)
                 self._nodes.pop(n.node_id, None)
             self._emit(EventKind.BUDGET_ARCHIVED, node_id,
                        {"node_id": node_id, "folded_consumed": folded_consumed,

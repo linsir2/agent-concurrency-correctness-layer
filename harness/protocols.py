@@ -171,7 +171,7 @@ class BudgetManager(Protocol):
     def budget_events(self, run_id: str | None = None) -> list[Event]:
         ...
 
-    def archive_node(self, node_id: str) -> bool:
+    def archive_node(self, node_id: str, *, now: float | None = None) -> bool:
         ...
 
     def remove_node(self, node_id: str) -> bool:

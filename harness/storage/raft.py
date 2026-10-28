@@ -19,7 +19,9 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 
+from ..budget import BudgetManager
 from ..event_log import _draft, _event, _EventLogBase
 from ..types import Event
 
@@ -220,6 +222,45 @@ class RaftCluster:
         lead = self.leader()
         return int(getattr(lead, "raftCurrentTerm", 0) or 0) if lead else 0
 
+    @classmethod
+    def from_addrs(cls, node_factory, *, addrs: list[str],
+                   data_dir: str | None = None,
+                   tick_interval: float = 0.002) -> RaftCluster:
+        """**外部地址集群**（S18 K-83）：部署时传入真实 `host:port` 列表。
+
+        校验：≥3 个地址、无重复、形如 `host:port`（端口为整数）、`data_dir`
+        （若给）可写。**不发起任何连接** —— 连接由 pysyncobj 自己建立。
+
+        诚实边界：跨机 / 网络分区 / 时钟漂移**未**在本仓库验证（沙箱不可测）。
+        """
+        if not isinstance(addrs, list) or len(addrs) < 3:
+            raise ValueError(f"Raft 至少 3 个地址（当前 {len(addrs or [])}）")
+        if len(set(addrs)) != len(addrs):
+            raise ValueError(f"地址重复：{addrs}")
+        for addr in addrs:
+            host, _, port = str(addr).rpartition(":")
+            if not host or not port.isdigit() or not (0 < int(port) < 65536):
+                raise ValueError(f"地址格式应为 host:port：{addr!r}")
+
+        cls_ = cls.__new__(cls)
+        cls_._tick_interval = tick_interval
+        cls_._stop = threading.Event()
+        cls_.addrs = list(addrs)
+        cls_.nodes = []
+        for idx, addr in enumerate(addrs):
+            partners = [a for a in addrs if a != addr]
+            if data_dir:
+                conf = raft_conf(
+                    journal_file=f"{data_dir}/node{idx}.journal",
+                    full_dump_file=f"{data_dir}/node{idx}.dump")
+            else:
+                conf = raft_conf()
+            cls_.nodes.append(node_factory(addr, partners, conf))
+        cls_._thread = threading.Thread(target=cls_._run, daemon=True,
+                                       name="raft-ticker")
+        cls_._thread.start()
+        return cls_
+
     def compact(self) -> None:
         """对全部节点触发日志压缩（S17 K-86；配合 `fullDumpFile` 落快照）。"""
         for nd in self.nodes:
@@ -249,6 +290,15 @@ if _HAS_PYSYNCOBJ:
         def append_records(self, recs: list[dict]) -> None:
             for rec in recs:
                 self.records.append(dict(rec, seq=len(self.records) + 1))
+
+        @replicated
+        def barrier(self) -> None:
+            """S18 K-82：**读穿日志**的一步 —— 写一条 no-op 日志项。
+
+            它一旦提交，就证明「当前 leader 在提交这一刻仍是 leader（quorum 已确认）」，
+            等价于 Raft ReadIndex 协议里的「为本次读做一轮心跳确认」。
+            """
+            self.barrier_count = int(getattr(self, "barrier_count", 0)) + 1
 else:                                                   # pragma: no cover
     class _ReplicatedLog:                               # type: ignore[no-redef]
         def __init__(self, *a, **kw) -> None:
@@ -345,7 +395,38 @@ class RaftEventLog(_EventLogBase):
 
     def has(self, subject: str, kind) -> bool:
         self._check_read()
+        if self._require_leader:
+            self._wait_applied_commit()
         return super().has(subject, kind)
+
+    # ---- S18 K-82：线性一致读（读穿日志）---------------------------
+    def barrier(self) -> None:
+        """等一条 no-op 日志提交 → 之后的本地读是**线性一致**的。
+
+        为什么必须这样：pysyncobj 不暴露 ReadIndex（无「针对本次读的 quorum
+        确认」API），`hasQuorum` 只是布尔、不能复用旧确认。写一条 no-op 日志是
+        唯一能在**不改外部库**前提下正确实现的方式（Ongaro 论文 §6.4 列出的
+        代价：每次读多一条日志写入）。
+        """
+        before = int(getattr(self._replica, "barrier_count", 0) or 0)
+        self._replica.barrier()
+        if not self._cluster.wait_until(
+                lambda: int(getattr(self._replica, "barrier_count", 0)) > before,
+                self._timeout):
+            raise RaftUnavailable(f"barrier {self._timeout}s 内未提交")
+        # 审查 P0-1：barrier 只等计数器不够 —— 必须把**已提交但尚未索引**的记录
+        # 同步进本地 `_events`，否则随后的 `all()/replay()` 仍看到旧视图。
+        with self._lock:
+            self._sync_applied()
+
+    @contextmanager
+    def linearizable(self):
+        """上下文：`with log.linearizable(): log.all()` → 线性一致读。
+
+        显式开启（默认不自动 barrier），避免「每次读都写日志」的写放大。
+        """
+        self.barrier()
+        yield self
 
     # ---- 写路径 ---------------------------------------------------
     def append(self, kind, subject: str, payload=None, producer: str = "",
@@ -430,75 +511,80 @@ class RaftEpochSource:
 
 
 # =====================================================================
-# S17 K-81：Raft 预算（确定性 id 来自**复制状态里的计数器**）
+# S18 K-87：Raft 预算 = **真 BudgetManager 的 RSM**（树 / 归档 / gc / 不变量）
 # =====================================================================
 if _HAS_PYSYNCOBJ:
     class _ReplicatedBudget(SyncObj):                     # pragma: no cover
-        """预算的复制状态机。
+        """预算的复制状态机 —— 内部**直接持有真实的 `BudgetManager`**。
 
-        **为什么 id 用复制计数器而不是 `uuid4`**：RSM 要求每个副本对同一命令
-        产生**相同**结果。`uuid4()` 会各副本不同 → 状态发散 → `release(rid)`
-        在 follower 上永远匹配不到 → 预算泄漏（S16 K-81 的根因）。
+        S17 的实现是「扁平账本」（只有 `limits/reserved/resv` 三个 dict），
+        后果：`subtree_reserved` 语义丢失、`archive_node` 折叠永久账（I5c）
+        与 `check_invariants` 只能在 leader 本地跑 → **各副本不一致**。
 
-        计数器 `_seq` 本身是复制状态的一部分 → 所有副本按相同顺序应用相同命令
-        → `f"R{n}"` 必然一致，且**重启后由 journal/快照恢复**继续单调。
+        S18 改为：把 `BudgetManager` 整个作为复制状态（它有 `__getstate__`
+        去掉 `RLock`，可被 pysyncobj 序列化到 journal/快照）。
+        于是「树 / 归档折叠 / gc / 不变量」全部成为共识路径的确定性结果。
+
+        **确定性前提**：`now`（归档/gc 用的时间）必须由**命令参数**传入，
+        不能各副本自己取 `time.time()`。`reservation_id` 由复制计数器分配。
         """
 
         def __init__(self, addr, partners, conf) -> None:
             super().__init__(addr, partners, conf=conf)
+            self.bm = BudgetManager(event_log=None)   # 静默：不 emit 事件
             self.version = 0
             self._seq = 0
-            self._limits: dict[str, int] = {}
-            self._reserved: dict[str, int] = {}
-            self._resv: dict[str, list] = {}
             self.last_rid = ""
+            self.last_ok = False
 
         @replicated
-        def create_node(self, node_id: str, limits: int) -> None:
-            self._limits.setdefault(str(node_id), int(limits))
+        def create_node(self, node_id: str, limits: int,
+                        parent_id: str, run_id: str) -> None:
+            # 审查 P1-4：`create_node` 在「同名但 limits 不同」时返回 None。
+            # 必须回传该结果，否则调用方以为改成功（实际仍是旧节点）。
+            node = self.bm.create_node(node_id, limits, parent_id, run_id=run_id)
+            self.last_ok = node is not None
             self.version += 1
 
         @replicated
         def reserve(self, node_id: str, amount: int) -> None:
             self._seq += 1
             rid = f"R{self._seq}"
-            lim = int(self._limits.get(str(node_id), 0))
-            used = int(self._reserved.get(str(node_id), 0))
-            if int(amount) <= 0 or used + int(amount) > lim:
-                self.last_rid = ""            # 拒绝：不分配 id（但仍占一条日志）
-            else:
-                self._reserved[str(node_id)] = used + int(amount)
-                self._resv[rid] = [str(node_id), int(amount), "ACTIVE", 0]
-                self.last_rid = rid
+            resv = self.bm.reserve(node_id, amount, reservation_id=rid)
+            self.last_rid = resv.reservation_id if resv is not None else ""
             self.version += 1
 
         @replicated
-        def consume(self, rid: str, amount: int = 1) -> None:
-            ent = self._resv.get(str(rid))
-            if ent and ent[2] == "ACTIVE":
-                ent[3] = int(ent[3]) + int(amount)
+        def consume(self, rid: str, amount: int) -> None:
+            self.bm.consume(rid, amount)
             self.version += 1
 
         @replicated
         def release(self, rid: str) -> None:
-            ent = self._resv.get(str(rid))
-            if ent and ent[2] in ("ACTIVE", "SETTLED"):
-                node_id = ent[0]
-                back = int(ent[1]) - int(ent[3])
-                self._reserved[node_id] = max(
-                    0, int(self._reserved.get(node_id, 0)) - back)
-                ent[2] = "RELEASED"
+            self.bm.release(rid)
             self.version += 1
 
         @replicated
         def settle(self, rid: str) -> None:
-            ent = self._resv.get(str(rid))
-            if ent and ent[2] == "ACTIVE":
-                node_id = ent[0]
-                back = int(ent[1]) - int(ent[3])
-                self._reserved[node_id] = max(
-                    0, int(self._reserved.get(node_id, 0)) - back)
-                ent[2] = "SETTLED"
+            self.bm.settle(rid)
+            self.version += 1
+
+        @replicated
+        def archive_node(self, node_id: str, now: float) -> None:
+            # 审查 P0-3：必须把**实际结果**记下来回传 —— Harness 依据 True 清空
+            # `acb.budget_node`；若归档被拒（仍有 ACTIVE 预留）却返回 True，
+            # 会造成节点/预留泄漏。
+            self.last_ok = bool(self.bm.archive_node(node_id, now=now))
+            self.version += 1
+
+        @replicated
+        def remove_node(self, node_id: str) -> None:
+            self.last_ok = bool(self.bm.remove_node(node_id))
+            self.version += 1
+
+        @replicated
+        def gc(self, now: float) -> None:
+            self.removed = int(self.bm.gc(now))
             self.version += 1
 else:                                                     # pragma: no cover
     class _ReplicatedBudget:                              # type: ignore[no-redef]
@@ -506,47 +592,24 @@ else:                                                     # pragma: no cover
             require_pysyncobj()
 
 
-class _NodeView:
-    """`RaftBudgetManager` 的节点只读视图（供 `root`/`_nodes` 兼容既有读法）。"""
-
-    __slots__ = ("consumed", "limits", "node_id", "self_reserved")
-
-    def __init__(self, node_id: str, limits: int, self_reserved: int,
-                 consumed: int = 0) -> None:
-        self.node_id = node_id
-        self.limits = limits
-        self.self_reserved = self_reserved
-        self.consumed = consumed
-
-    @property
-    def subtree_reserved(self) -> int:
-        return self.self_reserved
-
-    @property
-    def remaining(self) -> int:
-        return max(0, self.limits - self.self_reserved)
-
-
 class RaftBudgetManager:
-    """`BudgetManager` 的 Raft 后端（**只把 reserve 串行化点交给共识**）。
+    """`BudgetManager` 的 Raft 后端（**真 RSM**：连树与归档都走共识）。
 
-    一致性范围（诚实声明）：
-    - **集群一致**：`create_node` / `reserve` / `consume` / `release` / `settle`
-      （走 Raft，quorum 提交后才返回）；查询读本地已应用副本。
-    - **leader 本地（不保证集群一致）**：`archive_node` / `remove_node` / `gc` /
-      `check_invariants` / `apply_budget_event` / `budget_events` /
-      `suppressed` / `flush_pending` —— 委托给内嵌的 `BudgetManager` 镜像。
-    - **明确不可用**：`set_epoch` / `bump_epoch`（epoch 由共识 term 推进，K-85）。
+    一致性范围（S18 起）：
+    - **集群一致**：`create_node` / `reserve` / `consume` / `release` / `settle` /
+      `archive_node` / `remove_node` / `gc` —— 全部经 quorum 提交；
+      读直接取本地已应用副本的 `BudgetManager`（树、账目、不变量都真实）。
+    - **仍不可用**：`set_epoch` / `bump_epoch`（epoch 由共识 term 推进，K-85）。
+
+    与 S17 的关键差别：S17 的 `archive/gc/check_invariants` 是「leader 本地」，
+    现在它们是共识结果 → 可以在**任意副本**上跑 `check_invariants()` 并一致。
     """
 
     def __init__(self, *, base_port: int, nodes: int = 3,
                  cluster: RaftCluster | None = None,
                  timeout: float = 20.0,
                  data_dir: str | None = None) -> None:
-        super().__init__()
         require_pysyncobj()
-        from ..budget import BudgetManager  # 局部导入避免循环
-
         self._timeout = timeout
         self._cluster = cluster or RaftCluster(
             _ReplicatedBudget, base_port=base_port, nodes=nodes,
@@ -556,94 +619,117 @@ class RaftBudgetManager:
         if not self._cluster.wait_ready(timeout):
             raise RaftUnavailable(
                 f"Raft 集群 {timeout}s 内未就绪（端口 {base_port}）")
-        # 非共识路径（归档/gc/不变量/事件）的本地镜像；**不参与**复制的判定
-        self._local = BudgetManager(event_log=None)
 
-    # ---- 内部：等待复制生效 ---------------------------------------
-    def _bump_and_wait(self, fn, *args, **kw) -> None:
+    # ---- 内部 -----------------------------------------------------
+    @property
+    def _bm(self) -> BudgetManager:
+        """本地已应用副本的**真实**预算管理器（树/账目/不变量）。"""
+        return self._replica.bm
+
+    def _bump_and_wait(self, fn, *args) -> None:
         before = int(getattr(self._replica, "version", 0))
-        fn(*args, **kw)
+        fn(*args)
         if not self._cluster.wait_until(
                 lambda: int(getattr(self._replica, "version", 0)) > before,
                 self._timeout):
             raise RaftUnavailable(
                 f"预算操作 {getattr(fn, '__name__', fn)} {self._timeout}s 内未提交")
 
-    # ---- 共识路径 ------------------------------------------------
+    def _now(self) -> float:
+        """命令参数用的时间戳（**由调用方决定并复制**，各副本一致）。"""
+        import time as _t
+        return float(int(_t.time()))
+
+    # ---- 共识路径（写）-------------------------------------------
     def create_node(self, node_id: str, limits: int,
-                    parent_id: str = "run") -> _NodeView:
-        """建节点（**走共识**，保证所有副本 limits 一致）。"""
-        self._bump_and_wait(self._replica.create_node, node_id, limits)
-        return self._view(node_id)
+                    parent_id: str = "run", run_id: str = ""):
+        """建节点（共识）。**同名不同 limits → 返回 None**（不静默返回旧节点）。"""
+        self._bump_and_wait(self._replica.create_node, node_id, int(limits),
+                            parent_id, run_id)
+        if not bool(getattr(self._replica, "last_ok", False)):
+            return None
+        return self._bm._nodes.get(node_id)
 
     def reserve(self, node_id: str, amount: int, *,
                 reservation_id: str | None = None):
-        """预留（**走共识**）。返回的 `reservation_id` 由**复制计数器**决定。
-
-        `reservation_id` 入参被**忽略**并告警式记录：Raft 下 id 必须由共识
-        分配，否则副本发散（这正是 K-81 的教训）。
-        """
-        from ..budget import Reservation
-
-        self._bump_and_wait(self._replica.reserve, node_id, amount)
+        """预留（**走共识**）。id 由复制计数器分配；入参 `reservation_id` 被忽略
+        （Raft 下 id 必须由共识分配，否则副本发散 —— K-81 的教训）。"""
+        self._bump_and_wait(self._replica.reserve, node_id, int(amount))
         rid = str(getattr(self._replica, "last_rid", "") or "")
         if not rid:
             return None
+        from ..budget import Reservation
+
         return Reservation(rid, node_id, int(amount))
 
     def consume(self, reservation_id: str, amount: int = 1, *,
                 acb=None) -> int:
-        self._bump_and_wait(self._replica.consume, reservation_id, amount)
+        """消费（共识）。
+
+        **审查 P0-2 的处置**：`claim_epoch` fencing 目前**没有**被复制进预算状态机，
+        而 `BudgetManager.consume` 的 `claim_guard` 在副本里恒为空 → 若静默接受
+        `acb`，等于**悄悄丢掉 fencing**。这里选择 **fail-closed**：带 claim 的
+        调用直接拒绝，而不是假装成功（K-89）。
+        """
+        epoch = int(getattr(acb, "claim_epoch", 0) or 0) if acb is not None else 0
+        if epoch:
+            raise RaftUnavailable(
+                "RaftBudgetManager 尚未复制 claim fencing（K-89）：拒绝带 claim 的"
+                " consume，请改用单机 BudgetManager 或在 pool 模式下禁用本后端")
+        self._bump_and_wait(self._replica.consume, reservation_id, int(amount))
         return int(amount)
 
     def release(self, reservation_id: str) -> int:
-        before = self._reserved_of(self._rid_owner(reservation_id))
+        node = self._bm._reservations.get(reservation_id)
+        before = int(getattr(node[1], "amount", 0)) if node else 0
         self._bump_and_wait(self._replica.release, reservation_id)
-        return max(0, before - self._reserved_of(self._rid_owner(reservation_id)))
+        return before
 
     def settle(self, reservation_id: str) -> int:
-        before = self._reserved_of(self._rid_owner(reservation_id))
+        node = self._bm._reservations.get(reservation_id)
+        before = int(getattr(node[1], "amount", 0)) if node else 0
         self._bump_and_wait(self._replica.settle, reservation_id)
-        return max(0, before - self._reserved_of(self._rid_owner(reservation_id)))
+        return before
 
-    # ---- 读面（本地已应用副本）-----------------------------------
-    def _limits_of(self, node_id: str) -> int:
-        return int((getattr(self._replica, "_limits", {}) or {}).get(node_id, 0))
+    def archive_node(self, node_id: str, *, now: float | None = None) -> bool:
+        """归档（**走共识**）；`now` 由调用方决定并随命令复制（保证确定性）。"""
+        stamp = self._now() if now is None else float(now)
+        self._bump_and_wait(self._replica.archive_node, node_id, stamp)
+        return bool(getattr(self._replica, "last_ok", False))
 
-    def _reserved_of(self, node_id: str) -> int:
-        return int((getattr(self._replica, "_reserved", {}) or {}).get(node_id, 0))
+    def remove_node(self, node_id: str, *, owner: str = "") -> bool:
+        self._bump_and_wait(self._replica.remove_node, node_id)
+        return bool(getattr(self._replica, "last_ok", False))
 
-    def _rid_owner(self, rid: str) -> str:
-        ent = (getattr(self._replica, "_resv", {}) or {}).get(rid)
-        return str(ent[0]) if ent else ""
+    def gc(self, now: float) -> int:
+        self._bump_and_wait(self._replica.gc, float(now))
+        return int(getattr(self._replica, "removed", 0) or 0)
 
-    def _view(self, node_id: str) -> _NodeView:
-        return _NodeView(node_id, self._limits_of(node_id),
-                         self._reserved_of(node_id))
-
+    # ---- 读面（本地已应用副本的**真实**账本）-----------------------
     @property
-    def root(self) -> _NodeView:
-        return self._view("run")
+    def root(self):
+        return self._bm.root
 
     @property
     def _nodes(self) -> dict:
-        limits = dict(getattr(self._replica, "_limits", {}) or {})
-        return {nid: self._view(nid) for nid in limits}
+        return self._bm._nodes
 
     @property
     def _reservations(self) -> dict:
-        resv = dict(getattr(self._replica, "_resv", {}) or {})
-        return {rid: (self._view(ent[0]), ent) for rid, ent in resv.items()}
+        return self._bm._reservations
 
     def check(self, node_id: str, amount: int = 0) -> bool:
-        return self._reserved_of(node_id) + int(amount) <= self._limits_of(node_id)
+        return self._bm.check(node_id, amount)
 
     def check_reservations(self, reservation_ids, amount: int = 1) -> bool:
-        return all(self._rid_owner(rid) for rid in reservation_ids)
+        return self._bm.check_reservations(reservation_ids, amount)
 
-    def _subtree_nodes(self, node: object) -> list:
-        """本实现是**扁平**账本（无父子链）→ 子树即自身。"""
-        return [node]
+    def _subtree_nodes(self, node) -> list:
+        return self._bm._subtree_nodes(node)
+
+    def check_invariants(self, *, cross_process: bool = False) -> None:
+        """在**任意副本**上校验（S18 起是集群一致的，不再是 leader 本地）。"""
+        self._bm.check_invariants(cross_process=cross_process)
 
     # ---- 明确不可用（共识拥有）-----------------------------------
     def set_epoch(self, epoch: int, *, emit: bool = True) -> None:
@@ -652,37 +738,37 @@ class RaftBudgetManager:
     def bump_epoch(self, run_id: str | None = None) -> int:
         raise EpochNotBumpable("Raft 的预算 epoch 由共识 term 推进（S17 K-85）")
 
-    # ---- 非共识路径（**显式**声明；委托本地镜像，不保证集群一致）------
-    # 注意：Python 3.12+ 的 `runtime_checkable` 用**静态**属性查找，
-    # 动态 `__getattr__` **不满足** `isinstance(x, Protocol)`（实测 3.14）。
-    # 因此这些成员必须显式定义，不能靠 `__getattr__` 兜底。
+    # ---- 事件面：副本内 `event_log=None` → 均为 no-op（显式声明）----
     def apply_budget_event(self, ev) -> None:
-        """非共识路径：由本地镜像处理（仅用于重放/测试，不参与复制判定）。"""
-        self._local.apply_budget_event(ev)
+        self._bm.apply_budget_event(ev)
 
     def budget_events(self, run_id=None):
-        return self._local.budget_events(run_id)
-
-    def archive_node(self, node_id: str) -> bool:
-        return self._local.archive_node(node_id)
-
-    def remove_node(self, node_id: str) -> bool:
-        return self._local.remove_node(node_id)
-
-    def check_invariants(self) -> None:
-        self._local.check_invariants()
-
-    def gc(self, now_s: float) -> int:
-        return self._local.gc(now_s)
+        return self._bm.budget_events(run_id)
 
     def suppressed(self):
-        return self._local.suppressed()
+        return self._bm.suppressed()
 
     def discard_pending(self) -> None:
-        self._local.discard_pending()
+        self._bm.discard_pending()
 
     def flush_pending(self) -> list:
-        return self._local.flush_pending()
+        return self._bm.flush_pending()
+
+    # ---- 与 Harness/checkpoint 的装配面（审查 P0-5）-----------------
+    # `checkpoint._build_payload` 会读 `budget._lock` / `budget.root`；
+    # `Harness.recover` 会调 `budget._reset_baseline()`。缺这些会让「装到 Harness
+    # 即 AttributeError」——契约测试只查 hasattr 发现不了。
+    @property
+    def _lock(self):
+        return self._bm._lock
+
+    @property
+    def _last_budget_seq(self) -> int:
+        return int(getattr(self._bm, "_last_budget_seq", 0) or 0)
+
+    def _reset_baseline(self) -> None:
+        """恢复基线（委托本地副本；**不**广播 —— 各副本各自恢复自己的镜像）。"""
+        self._bm._reset_baseline()
 
     def close(self) -> None:
         if self._owns_cluster:
