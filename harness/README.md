@@ -88,6 +88,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s23_openai_agents.py` | S23 OpenAI Agents：guardrail 顺序、schema 去 root、`tool_call_id` 必填 fail-closed、dispositions、共享 cwd 模式（`importorskip`） |
 | `tests/test_s23_ag2.py` | S23 AG2：`on_tool_execution` 短路、`serialized_arguments` 注入、stale→CONFLICT、预算 WAIT、未声明透传（`importorskip`） |
 | `tests/test_s23_sidecar.py` | S23 HTTP sidecar：鉴权（401/403）、幂等重放、stale 409、411/413/501、404/410、agent 不可冒名、tick 回收 |
+| `tests/test_s23_example.py` | S23 示例冒烟：`examples/three_agents/run.py` 的 naive 丢写 vs RSC 保全、HTTP 401/409/403 |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

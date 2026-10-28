@@ -185,10 +185,10 @@ idempotency_key = sha256(f"{tenant}|{agent_id}|{resource}|{intent_key}")
 | **S23-2** OpenAI 适配器 | `rsc_agent`（guardrail + root 注入 + schema 去 root） | ✅ [openai_agents.py](harness/integrations/openai_agents.py)，9 用例 |
 | **S23-3** AG2 适配器 | `rsc_middleware`（`on_tool_execution` 短路） | ✅ [ag2.py](harness/integrations/ag2.py)，7 用例 |
 | **S23-4** HTTP sidecar | stdlib server + 6 端点 + 每 agent 密钥 + 体积/并发上限 | ✅ [http_sidecar.py](harness/integrations/http_sidecar.py)，14 用例 |
-| **S23-5** 打包/示例/文档 | extras（`crewai`/`openai-agents`/`ag2`/`integrations`）+ README/文档 | ✅ extras 与文档；示例与 conformance 脚本留到下一轮 |
+| **S23-5** 打包/示例/文档 | extras（`crewai`/`openai-agents`/`ag2`/`integrations`）+ `examples/three_agents/`（naive 丢写 vs RSC 保全 + HTTP + 预算）+ `check_s23_conformance` | ✅ 示例可跑；一致性核对 **80/80** |
 
-**门禁**：主环境（3.14）**732 passed / 3 skipped / 4 xfailed**（3 个框架文件 `importorskip`）；
-3.12 venv **39 passed**（4 个 S23 文件全跑）；`ruff check .` 0 errors。
+**门禁**：主环境（3.14）**733 passed / 3 skipped / 4 xfailed**（3 个框架文件 `importorskip`）；
+3.12 venv **39 passed**（4 个 S23 文件全跑）；`ruff check .` 0 errors；S23 核对 **80/80**。
 
 **统一 6 场景**（沿用 S22）：并发写冲突、同键重试同收据、同键异内容 CONFLICT、
 租约过期旧 token 被拒、预算耗尽 WAIT + reaper 回收、协调器不可达 fail-closed。
