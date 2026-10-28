@@ -2,11 +2,11 @@
 
 | 项目 | 内容 |
 |---|---|
-| 版本 | **v1.1（已按两路对抗评审修订）** |
+| 版本 | **v1.2（实现完成 + 五轮评审修订）** |
 | 日期 | 2026-10-27 |
 | 上游 | [S12 v1.2](s12-kernel-enforcement-and-core.md) §6（K-57）、[milestones.md](milestones.md) MS4/MS10、[设计规范](multi-agent-harness-design-final.md) §5.2⑦ |
 | 分波 | **S13-0** schema+契约 → **S13a** HITL → **S13b** replan → **S13c** spawn_child → **S13d** Scheduler |
-| 修订 | v1.0 → v1.1：修 7 P0 + 9 P1（§7） |
+| 修订 | v1.0 → v1.1 修 7 P0 + 9 P1（§7）；v1.1 → v1.2 实施 + 五轮评审共修 **4 P0 + 16 P1 + 8 P2**（§8） |
 
 ---
 
@@ -377,3 +377,64 @@ class Claim:
 | K-64 | `INADMISSIBLE` 需 `readmit` 边或 DLQ 兜底，否则 Run 不 finalize |
 | K-65 | alias 只做**一跳解析**（值 = 稳定 logical id），不做 id 链（避免环） |
 | K-66 | pool 模式仅承接**非 worker** 调用方；worker 内嵌套一律内联 |
+
+---
+
+## 8. 实现结果（v1.1 → v1.2）
+
+按 v1.1 分 5 批实施（S13-0 + a → b → c → d → 跨波次终审修复），每批后独立评审 + 修复。
+
+### 8.1 交付
+
+| 波 | 交付 |
+|---|---|
+| **S13-0** | ACB 增 `hitl_pending`/`replan_count`/`replan_attempts`/`parent_id`/`children_ids`/`children_pending`/`hitl_outcome`/`aging_count`/`claim_epoch`/`claim_worker`/`claim_lease_until_ms`/`superseded`；payload 全 `.get` 兼容旧格式；`capability` 转 dict（含 `parent_id`/`parent_scope`/`digest`）；`schema_version` 写进 payload 并成为实际消费者 |
+| **S13a** | HITL **三态**（`_UNSET`/denied/timeout）+ 键 `(run_id, approval_id)` + `Harness.tick()` 显式驱动 + 恢复不置 RUNNING + `_finalize` 跳过等待态 slot release + 统一 `APPROVAL_RESOLVED` 审计事件 |
+| **S13b** | `resolve_alias` **plan-scoped 一跳**（删全局回退）+ 三处消费点统一 + `task_for` + `patch` 纯函数化 + write-ahead 计数（`count`/`attempts` 分离）+ `_readmit_after_replan` 复用 `requeue_readmit` 清理序列 + `_resolve_current_acb` 扩为「解析+准入」 |
+| **S13c** | `attenuate_token`（分级序 + 维度语义包含）+ lineage 冻结 `parent_scope`/`digest` + `child_alloc` 预分配（**禁止双重预留**）+ 两阶段落盘（`children_pending` → `children_ids`）+ 取消级联（内存快路径 ∪ 持久化 ∪ `parent_id` 反向索引）+ 有界（depth 写进 spec、fanout 只计未终态）+ `ResultEnvelope`（`DONE_PARTIAL` 真实产生路径） |
+| **S13d** | `scheduler_mode` 默认 `sync`（**36 个同步用例零破坏**）+ pool 嵌套内联（thread-local，防死锁）+ `CrashInjected` 重抛 + `Claim`（执行上下文 epoch，非共享字段）+ aging 接线（`aging_ms` 墙钟，`INADMISSIBLE` + `readmit` 边 + 超 N 次 `DEAD_LETTER`） |
+
+### 8.2 验证
+
+| 门禁 | 结果 |
+|---|---|
+| pytest 全量 | **475 passed + 4 xfailed**（连跑 5 轮全绿；基线 384 → 475，+91） |
+| 覆盖率 | **83.06%**（门禁通过） |
+| bench | `--n 30` exit 0；`report_check` 一致 |
+| 36 个同步路径用例 | 全绿（39 item） |
+
+### 8.3 五轮评审共修 **4 P0 + 16 P1 + 8 P2**
+
+**单波评审**：S13a 1 P0（审批判词 fail-open：`{"approved":"false"}` 被当批准）+ 8 P1；S13b 1 P0（replan 复用旧 token → 生产 100% 失败）+ 6 P1 + 4 P2；S13c 3 P0（两阶段落盘孤儿 / 级联根指针漏取消 / `DONE_PARTIAL` 过早产生且非终态）+ 7 P1。
+
+**跨波次终审**（单波评审看不到的交互）：**2 P0 + 3 P1 + 3 P2**：
+
+| # | 问题 | 修法 |
+|---|---|---|
+| **X1 P0** | **pool + tick 并发 → 审批门被彻底绕过**（三重叠加）：`_claim_locked` 把 `fence_epoch` 写回**共享 ACB 对象** → 旧 worker `_claim_fenced` 恒 False；`_finalize` 不 revoke claim；`runtime.run` 只在入口查终态、单 decision 末尾**无条件置 DONE** → 实测 tick 判 `FAILED(APPROVAL_TIMEOUT)` 后 worker 改成 DONE | epoch 改用**执行上下文副本** + 撤销水位；`_finalize` 先释放 claim；tick 前 `supervisor_note_crash`；`runtime.run` 每 action 后与置 DONE 前复查终态 |
+| **X2 P0** | `DONE_PARTIAL` 进了 `TASK_TERMINAL` 但**未进 `PREDECESSOR_SATISFIED`** → 下游永久阻塞、Run 不 finalize | 加入 `PREDECESSOR_SATISFIED`（选 a：部分完成 = 有产出未全覆盖，下游可继续；更严约束应由 `required_coverage` 表达） |
+| X3 P1 | `_replace_child_ref` 复用旧 ref 且在 `save(fresh)` 之前 → 父指向旧子快照 → 重启后永远 pending、取消漏新子 | 先 `save(fresh)` 再回填；父不在内存走 `update_children` |
+| X4 P1 | `_run_one_inline` 不 claim 子 → 子被队列重 claim 即**双跑** | 内联以父 worker 身份 claim 子 + `claim_scope` |
+| X6 P1 | 跨 run 子 + 父 `children_ids` 缺失（老 checkpoint）→ **静默漏取消** | `parent_id → {child}` 反向索引（`refs_all` 反扫） |
+| X5/X7/X8 P2 | replan save 在 `try` 外不回滚 / claim 字段未持久化 / `_safe_save` 吞 `FencingRejected` 且 `effects.begin` 返回 `""` 仍 confirm | 全部修 |
+
+### 8.4 文档与实现的差异（回写）
+
+| 文档 v1.1 | 实现 |
+|---|---|
+| §2.2 `reconcile.scan_deadlines()` 扫 HITL | 实际 `tick()` 自扫 HITL；`scan_deadlines` 只管 aging |
+| §2.3 `_id_aliases` 剪枝（P1-3） | **未实现**（全仓无 prune）；改为 plan-scoped 天然不增长 |
+| §2.4 paths/network「交集」 | 改为**维度语义包含**（前缀/CIDR/通配），v1.1 的「集合交集」是假拒绝 |
+| §2.5 `max_data_class` | 改用 `parent_scope`/`digest` 冻结 |
+| §2.5 inline 深度用 `spawn_depth` | 实际 `_MAX_INLINE_DEPTH=8`（独立于 spawn_depth） |
+| §7 P1-3（alias 剪枝） | ❌ 未实现，记为 K-67 |
+
+### 8.5 新增已知边界（v1.2）
+
+| # | 边界 |
+|---|---|
+| K-67 | alias 剪枝未实现（plan-scoped 后天然不跨 plan 增长，但单 plan 内多次 replan 仍累积旧 id 映射） |
+| K-68 | `FileCheckpointStore.update_children` 未接 claim fencing（只拿 `parent_id` 无 ACB 上下文；已在 replan/requeue 入口受约束） |
+| K-69 | `tick()` 需外部反复调用才生效（无后台线程；`run_task` 与 `recover` 会调，长期空闲的等待态需 supervisor 驱动） |
+| K-70 | `DONE_PARTIAL` 视为前驱满足；更严的完整性约束需 plan 声明 `required_coverage`（未实现） |
+| K-71 | pool 模式仅承接非 worker 调用方；worker 内嵌套一律内联（`_MAX_INLINE_DEPTH=8`） |

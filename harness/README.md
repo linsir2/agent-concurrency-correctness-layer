@@ -7,7 +7,7 @@
 ## 运行
 
 ```bash
-cd /workspace && python3 -m pytest tests/ -q     # 384 passed
+cd /workspace && python3 -m pytest tests/ -q     # 475 passed
 ```
 
 无第三方依赖（仅标准库 + pytest）。
@@ -59,6 +59,10 @@ cd /workspace && python3 -m pytest tests/ -q     # 384 passed
 | `tests/test_s11_receipt_index.py` | S11b：收据增量索引（枚举线性 + 索引==全量等价）/ 回扫重置 / fencing 绑 WAL / 干净重启 / WAL generation |
 | `tests/test_s11_egress.py` | S11c/d/e：DNS 钉住 + SSRF 完整 IP 列表（16 参数化）/ 重定向 302 真拒绝 / netns 正负对照 / 模式互斥 / 失败清理 / 降级 fail-closed |
 | `tests/_egress_child.py` | S11 子进程脚本（sandbox/netns 探针，pytest 不收集） |
+| `tests/test_s13_hitl.py` | S13a：HITL 三态（`_UNSET`/deny/timeout）/ 跨进程恢复仍 WAITING / 键不串 / tick 驱动 |
+| `tests/test_s13_replan.py` | S13b：replan alias 三处统一 / 预算事件计数 / 再准入清理 / 同版本双准入 / 覆盖缺口 16 条 |
+| `tests/test_s13_spawn.py` | S13c：能力子集分级序 / 并发 spawn 守恒 / 取消级联（含崩溃后）/ 有界 / 孤儿回收 / `ResultEnvelope` |
+| `tests/test_s13_scheduler.py` | S13d：pool 单所有者 / `CrashInjected` 重抛 / 负对照双跑 / aging 边界 / 嵌套不死锁 / claim 过期 fencing |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |
@@ -67,9 +71,9 @@ cd /workspace && python3 -m pytest tests/ -q     # 384 passed
 | `tests/test_ms8_conformance.py` | MS8 出口：I1/I2/I3/I5/I6/I7/I8 |
 | `tests/test_ms8_spec.py` | MS8 出口：I9/I10/I13 + 资源模型 + 协调协议 + 收据链 |
 
-> **总计 384 个测试**（另 4 个 xfail 为环境能力缺失显式登记）：19 个用例测试 + 365 个里程碑/规范/E2E/覆盖率/基准/持久化/收据/跨进程对账/egress 测试。
+> **总计 475 个测试**（另 4 个 xfail 为环境能力缺失显式登记）：19 个用例测试 + 456 个里程碑/规范/E2E/覆盖率/基准/持久化/收据/跨进程对账/egress 测试。
 > 按里程碑切子集：`pytest -m ms0`（14）、`-m ms1`（15）、`-m ms2`（9）、`-m ms3`（8）、`-m ms4`（16）、`-m e2e`（10）、`-m fault`（5）、`-m sandbox`/`-m netns`/`-m egress`；markers 见 `pyproject.toml`。
-> 覆盖率：`python3 -m pytest --cov=harness --cov-report=json && python3 scripts/check_coverage.py`（整体 85.49%，分模块硬门禁通过）。
+> 覆盖率：`python3 -m pytest --cov=harness --cov-report=json && python3 scripts/check_coverage.py`（整体 83.06%，分模块硬门禁通过）。
 > 基准：`python3 bench/run_bench.py --n 30 --out bench/result.json`（三条件×四负载，约 8s）；报告数值表用 `python3 -m bench.regen_report` 从 `result.json` 重新生成。
 > egress：外部库（`sandlock`/`py-landlock`/`pyroute2`/`mitmproxy`）放 `optional-dependencies`；默认**出站 fail-closed**，生产用 `HARNESS_EGRESS_REQUIRED=1` 或 `egress_required=True` 强制启动即校验。netns/代理为**部署级**（需 root）。
 
