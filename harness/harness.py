@@ -829,6 +829,14 @@ class Harness:
         replica = getattr(self.event_log, "_replica", None)
         if not callable(setter) or not hasattr(replica, "lease"):
             return
+        # S24-P0：租约与事件必须落在**同一个** Raft 集群，否则「提交点复核」
+        # 是对着另一个状态机做的假检查（写入口挡得住，但 TOCTOU 窗口仍在）。
+        store_cluster = getattr(self._lease_store, "cluster", None)
+        log_cluster = getattr(self.event_log, "_cluster", None)
+        if store_cluster is not None and log_cluster is not None \
+                and store_cluster is not log_cluster:
+            raise LeaseUnavailable(
+                "租约与事件日志必须共享同一 Raft 集群（否则提交点没有 fence）")
         setter(lambda: {
             "owner": self._writer_id,
             "instance": self._lease_instance,

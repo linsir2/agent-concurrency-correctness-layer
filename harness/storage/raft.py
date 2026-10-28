@@ -504,16 +504,20 @@ class RaftEventLog(_EventLogBase):
             raise FencingRejected(
                 f"{what}: 旧 epoch 写入被 RSM 拒绝（lease fencing）")
 
-    def set_lease_fence(self, provider) -> None:
+    def set_lease_fence(self, provider, *, cluster=None) -> None:
         """注入「写入 stamp」回调（S24-8）。
 
         要求该集群由 `_ReplicatedLeaseLog` 构建（租约与事件同一 RSM），
         否则拒绝 —— 绝不假装「有 fence」而实际只做了进程内检查。
+        S24-P0：显式传入 `cluster` 时还要求它就是本日志的集群。
         """
         if provider is not None and not hasattr(self._replica, "lease"):
             raise RaftUnavailable(
                 "事件层 lease fencing 需要 _ReplicatedLeaseLog 集群"
                 "（租约与日志必须同一 RSM，否则存在 TOCTOU）")
+        if cluster is not None and cluster is not self._cluster:
+            raise RaftUnavailable(
+                "set_lease_fence 收到另一个 Raft 集群：租约与日志必须共享同一 RSM")
         self._lease_fence = provider
 
     # ---- 读一致性（S17 K-82）--------------------------------------
