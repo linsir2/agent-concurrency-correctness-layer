@@ -21,17 +21,11 @@ python3 examples/semantic_conflict/run.py             # [结论] 我们拦不住
 `examples/semantic_conflict/run.py` 的实际输出（同一仓库、两处互不重叠的改动）：
 
 ```text
-[1] 纯 git：worktree 隔离 + merge
-    基线测试绿=True  合并干净=True  合并后测试绿=False
-    合并输出：["Merge made by the 'ort' strategy.", ' app/feature.py | 5 +++++']
-    pytest：1 error during collection
-
-[2] 我们的 RSC 层：两个 agent 并发提交（不同资源）
-    r1=Receipt  r2=Receipt  出现冲突=False  都拿到收据=True
-    两份内容都合入后，测试绿=False
-
-[3] 门禁雏形：提交前在隔离副本跑测试
-    允许提交=False（应为 False）
+[1] 纯 git      基线绿=True  合并干净=True  合并后绿=False
+                检查：ImportError: cannot import name 'compute_rate'
+[2] 没有 verify A=Receipt  B=Receipt  B.verified=False      ← 缺口
+[3] 配置 verify A=Receipt  B=Deny  code=verify_failed       ← 拦住
+[4] B 改对       B=Receipt  verified=True                   ← 放行
 ```
 
 **这就是问题的核心**：agent-A 把 `compute_rate` 改名，agent-B 新增文件调用旧名字。
@@ -137,14 +131,48 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 
 ---
 
-## 5. 下一步（S24 提案，等你确认）
+## 5. 下一步（S24 提案）
 
-| 轮 | 交付 | 出口条件 |
+| 轮 | 交付 | 状态（2026-10-28） |
 |---|---|---|
-| S24-1 | `session.verify(token, cmd, timeout)`：在 Z3 隔离副本跑命令，结果（退出码/输出摘要）写进收据 | 语义冲突实验从「拦不住」变成「拦住」；两个 agent 并发改名/调用用例 |
-| S24-2 | 适配器接入：CrewAI/OpenAI/AG2 `apply` 前自动跑 `verify`（可配 `verify_cmd`） | 6 场景 + 1 个「测试红 → 拒绝」场景全绿 |
-| S24-3 | 符号级冲突检测（可选）：删除/改名符号仍被引用 → `Conflict(semantic)` | 用 §0 实验做 precision/recall 基线 |
-| S24-4 | merge queue 集成：`apply` 成功后 rebase 到队首再验证 | 3 agent × 10 任务，测吞吐与返工次数 |
+| S24-1 | `session.verify(token, cmd, timeout)`：在「候选副本 + 账本合并视图 + 本次 pending」上跑命令；红/超时/无工作区 → 拒绝提交；结果写进 `spec["rsc_verify"]`，收据带 `verified` | ✅ 已实现（`harness/facade.py`），11 个用例 |
+| S24-2 | 适配器接入：`RscSession(verify_cmd=...)` 后 `apply` 自动先跑验证（无需改适配器代码） | ✅ 已生效；sidecar/MCP 响应新增 `verified` |
+| S24-3 | 符号级冲突检测（可选）：删除/改名符号仍被引用 → `Conflict(semantic)`（不依赖执行） | ⬜ 未做 |
+| S24-4 | merge queue 集成：`apply` 成功后 rebase 到队首再验证 | ⬜ 未做 |
+
+### 5.1 S24-1 实现要点
+
+```python
+session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
+                     verify_cmd=[sys.executable, "check_all.py"],   # 或 "pytest -q"
+                     verify_required=True, verify_timeout_s=120)
+```
+
+- **合并视图**：复制候选工作区（不含 `.git`）→ 叠加账本里已存在资源的最新内容
+  → 叠加本次 `apply` 的 pending 内容。「提交后会是什么样」就验证什么。
+- **不经 shell**：`shlex.split` 后直接 argv，杜绝命令注入。
+- **fail-closed**：无 Z3 工作区 → 拒绝；超时 → 拒绝；已记录失败且未重新验证 → 拒绝；
+  `verify_required=True` 但没给命令 → **构造即 ValueError**（不静默放行）。
+- **不污染**：验证在临时副本里跑，工作区与账本都不改动（有用例）。
+
+### 5.2 实测效果（`examples/semantic_conflict/run.py`）
+
+```text
+[1] 纯 git    合并干净=True  合并后绿=False      ← 无冲突标记，import 炸
+[2] 无 verify A=Receipt  B=Receipt              ← 我们都放行（缺口）
+[3] 有 verify A=Receipt  B=Deny code=verify_failed   ← 拦住
+[4] B 改对     B=Receipt  verified=True         ← 放行
+```
+
+### 5.3 已知边界
+
+| 边界 | 说明 |
+|---|---|
+| 验证的是**文件视图** | 只叠加「路径已存在于候选副本」的账本资源；纯 JSON/非文件资源不参与合并视图 |
+| 不替代 CI | 只跑你给的一条命令；耗时 = 一次全量检查，接受不了就配更快的子集 |
+| 语义冲突的**静态**检测没做 | S24-3；当前只能靠「跑起来」发现 |
+| merge queue 没做 | S24-4；当前没有 rebase 到队首再验的串行化 |
+| 副本复制成本 | 大仓库每次 `apply` 复制一棵树；可用 `verify_cmd=None` + 显式 `verify()` 控制频率 |
 
 **不做**：语义 diff 的全量程序分析、替代 CI、替代 git 合并。
 

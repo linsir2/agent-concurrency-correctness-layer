@@ -1,7 +1,6 @@
-"""S24 调研实验冒烟：语义冲突实验必须跑通且结论成立。
+"""S24 实验冒烟：语义冲突实验必须跑通，且四段结论都成立。
 
-防腐烂：一旦有人给门面加了 verifier 而没更新实验，或 git 行为变化，
-这里会先红。
+防腐烂：一旦有人改坏 verifier 门禁或 git 行为变化，这里会先红。
 """
 
 from __future__ import annotations
@@ -20,10 +19,12 @@ def test_semantic_conflict_experiment_runs():
         check=False)
     assert proc.returncode == 0, proc.stderr[-2000:]
     out = proc.stdout
-    # 前提：文本合并干净、测试红
-    assert "合并干净=True" in out
-    assert "合并后测试绿=False" in out
-    # 关键结论：我们的层不报冲突但也没拦住
-    assert "出现冲突=False" in out and "都拿到收据=True" in out
-    assert "允许提交=False" in out
+    # [1] 文本合并干净，检查红
+    assert "合并干净=True" in out and "合并后绿=False" in out
+    # [2] 没有 verify_cmd 时两张收据都签发（缺口）
+    assert "A=Receipt  B=Receipt" in out
+    # [3] verify_cmd 拦住
+    assert "B=Deny" in out and "code=verify_failed" in out
+    # [4] 修正后放行且 verified
+    assert "verified=True" in out
     assert "[结论]" in out

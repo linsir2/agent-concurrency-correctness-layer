@@ -30,7 +30,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `harness/harness.py` | L5 | 全部 |
 | `harness/spec/` | L2 | MS8（资源模型 / 协调协议 / 收据 / 不变量语料） |
 | `harness/worktree.py` | L1 | S22（Z3 私有工作区） |
-| `harness/facade.py` | L5 | S22（`RscSession` 六动作集成门面） |
+| `harness/facade.py` | L5 | S22/S24（`RscSession` 门面；S24 增加 `verify` 提交前验证） |
 | `harness/integrations/` | 适配 | S22/S23（LangGraph / MCP / CrewAI / OpenAI Agents / AG2 / HTTP sidecar，可选依赖） |
 
 ## 测试
@@ -89,6 +89,8 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s23_ag2.py` | S23 AG2：`on_tool_execution` 短路、`serialized_arguments` 注入、stale→CONFLICT、预算 WAIT、未声明透传（`importorskip`） |
 | `tests/test_s23_sidecar.py` | S23 HTTP sidecar：鉴权（401/403）、幂等重放、stale 409、411/413/501、404/410、agent 不可冒名、tick 回收 |
 | `tests/test_s23_example.py` | S23 示例冒烟：`examples/three_agents/run.py` 的 naive 丢写 vs RSC 保全、HTTP 401/409/403 |
+| `tests/test_s24_verify.py` | S24 Verifier：合并视图拦住语义冲突、红/超时/无工作区拒绝、收据 `verified`、副本不污染 |
+| `tests/test_s24_experiment.py` | S24 实验冒烟：git 合并干净但检查红、无 verify 放行、有 verify 拒绝、修正后放行 |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

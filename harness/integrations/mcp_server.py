@@ -45,7 +45,8 @@ def make_tools(session: RscSession, *, agent_id: str = "mcp-agent") -> dict:
                           agent_id=aid)
         if isinstance(r, Receipt):
             session.finish(tok.token)
-            return {"receipt_id": r.receipt_id, "seq": r.seq, "dedup": r.dedup}
+            return {"receipt_id": r.receipt_id, "seq": r.seq,
+                    "dedup": r.dedup, "verified": r.verified}
         session.abort(tok.token)
         if isinstance(r, Conflict):
             return {"conflict": r.reason}
@@ -59,7 +60,8 @@ def make_tools(session: RscSession, *, agent_id: str = "mcp-agent") -> dict:
         r = session.apply(str(token), writes, idempotency_key=idempotency_key,
                           agent_id=aid)
         if isinstance(r, Receipt):
-            return {"receipt_id": r.receipt_id, "seq": r.seq, "dedup": r.dedup}
+            return {"receipt_id": r.receipt_id, "seq": r.seq,
+                    "dedup": r.dedup, "verified": r.verified}
         if isinstance(r, Conflict):
             return {"conflict": r.reason}
         return {"error": getattr(r, "reason", "apply_failed")}

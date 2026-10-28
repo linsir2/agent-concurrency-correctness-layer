@@ -265,7 +265,8 @@ def build_sidecar(session: RscSession, *, keys: dict[str, str] | None = None,
                                   agent_id=agent)
                 if isinstance(r, Receipt):
                     self._send(200, {"receipt_id": r.receipt_id, "seq": r.seq,
-                                     "dedup": r.dedup})
+                                     "dedup": r.dedup,
+                                     "verified": r.verified})
                 elif isinstance(r, Conflict):
                     self._send(409, {"error": r.reason})
                 elif isinstance(r, Wait):

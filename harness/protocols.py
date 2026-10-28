@@ -240,6 +240,10 @@ class Workspace(Protocol):
     def put(self, resource: str, content) -> Any:
         ...
 
+    # S24：Verifier 需要枚举「账本里已存在哪些资源」来构建合并视图
+    # （`manifest` 是文档 §3.1 的唯一读模型，只读不写）。
+    manifest: dict
+
     def stage(self, acb: ACB, resource: str, content) -> None:
         ...
 

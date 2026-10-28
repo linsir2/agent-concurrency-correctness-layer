@@ -1,6 +1,7 @@
-"""S22：集成门面 `RscSession` —— 宿主只依赖这 6 个动作。
+"""S22/S24：集成门面 `RscSession` —— 宿主只依赖这几个动作。
 
-设计见 `docs/s22-implementation-plan.md` §12.2（评审修订版）：
+设计见 `docs/s22-implementation-plan.md` §12.2（评审修订版）与
+`docs/s24-gap-analysis-and-repositioning.md` §5（S24-1 Verifier 门禁）：
 
 - **token = agent 会话**：`begin` 一次、多次 `apply`、`finish`/`abort` 一次；
   Z3 worktree 全程复用（`Token.worktree`）。
@@ -12,6 +13,8 @@
   未钉住的资源在 `gate` 处**硬拒绝**（fail-closed），绝不静默 last-write-wins。
 - token 索引落盘（`state_dir`），`resolve` 用 `latest_ref_for_acb` +
   `_restore_acb(bump_epoch=False)`（C5 的消费者）+ TTL 校验。
+- **S24 Verifier**：`verify(token, cmd)` 在「候选工作区副本 + 账本合并视图」上
+  执行命令；红则不得提交。这是「文本不冲突但合起来跑不通」的唯一拦截点。
 
 异常映射：只把已知的基础设施异常转成 `Deny`（fail-closed），其余原样抛。
 """
@@ -20,7 +23,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
+import shutil
+import subprocess
+import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -65,6 +73,7 @@ class Receipt:
     receipt_id: str
     seq: int
     dedup: bool = False
+    verified: bool = False          # S24：提交前 Verifier 是否跑过且通过
 
 
 @dataclass(frozen=True)
@@ -82,20 +91,56 @@ _KNOWN_EXC = ("RaftUnavailable", "NotLeader", "FencingRejected",
               "ReceiptConflict", "InvariantError")
 _WAIT_REASONS = ("BUDGET_EXHAUSTED", "NO_SLOT", "PREDECESSOR_NOT_DONE",
                  "UPSTREAM_FAILED")
+_VERIFY_TAIL_CHARS = 1200        # 回传给宿主的输出上限（防日志爆炸）
+
+
+def _norm_cmd(cmd) -> list[str] | None:
+    """把 `"pytest -q"` / `["pytest", "-q"]` 归一为 argv（**不经 shell**）。"""
+    if cmd is None:
+        return None
+    if isinstance(cmd, str):
+        argv = shlex.split(cmd)
+    elif isinstance(cmd, (list, tuple)):
+        argv = [str(x) for x in cmd]
+    else:
+        raise TypeError(f"verify_cmd 必须是 str 或 list，得到 {type(cmd).__name__}")
+    if not argv:
+        raise ValueError("verify_cmd 不能为空")
+    return argv
+
+
+def _safe_rel(root: str, rel: str) -> str | None:
+    """把 `rel` 解析到 `root` 内；逃逸（`..`/绝对路径/符号链接）→ None。"""
+    try:
+        base = os.path.realpath(root)
+        target = os.path.realpath(os.path.join(root, rel))
+    except (OSError, ValueError):
+        return None
+    if target == base or not target.startswith(base + os.sep):
+        return None
+    return target
 
 
 class RscSession:
-    """六动作门面：`begin / apply / gate / finish / abort / snapshot`。"""
+    """门面：`begin / apply / gate / verify / finish / abort / snapshot`。"""
 
     def __init__(self, harness: Harness, *, tenant: str | None = None,
                  token_ttl_ms: int = 120_000, min_budget: int = 1,
                  worktrees: WorktreeManager | None = None,
-                 state_dir: str | None = None) -> None:
+                 state_dir: str | None = None,
+                 verify_cmd=None, verify_required: bool = False,
+                 verify_timeout_s: float = 120.0) -> None:
         self.h = harness
         self.tenant = str(tenant or "")
         self.token_ttl_ms = max(1, int(token_ttl_ms))
         self.min_budget = max(1, int(min_budget))
         self.worktrees = worktrees
+        self.verify_cmd = _norm_cmd(verify_cmd)
+        self.verify_required = bool(verify_required)
+        self.verify_timeout_s = max(1.0, float(verify_timeout_s))
+        if self.verify_required and self.verify_cmd is None:
+            # fail-closed：要求验证却没给命令，等于「静默放行」
+            raise ValueError("verify_required=True 时必须提供 verify_cmd")
         self._lock = threading.RLock()
         self._op_locks: dict[str, threading.RLock] = {}
         self._index: dict[str, dict] = {}
@@ -245,6 +290,11 @@ class RscSession:
                 except (TypeError, ValueError) as exc:
                     return Deny(f"bad_content:{type(exc).__name__}")
             batch.append(Write(str(resource), content))
+        # S24-1：Verifier 门禁 —— 提交前必须过验证（自动或显式记录）。
+        blocked = self._verify_gate(token, acb,
+                                    [(w.resource, w.content) for w in batch])
+        if blocked is not None:
+            return blocked
         try:
             res = self.h.commit_batch(acb, batch, idempotency_key=ns_key or None)
         except Exception as exc:
@@ -258,7 +308,8 @@ class RscSession:
             self._resave(acb, token)
             return Receipt(receipt_id=(res.detail.get("receipt_ids") or [""])[0],
                            seq=int(res.detail.get("seq", 0) or 0),
-                           dedup=bool(res.detail.get("dedup")))
+                           dedup=bool(res.detail.get("dedup")),
+                           verified=self._verified(acb))
         if res == Status.CONFLICT:
             detail = res.detail or {}
             if detail.get("reason") == "idempotency_key_reused_with_different_content":
@@ -283,6 +334,118 @@ class RscSession:
             if self.h.workspace.version(resource) != base:
                 return Deny(f"stale_view:{resource}", code="stale_view")
         return Allow()
+
+    # ------------------------------------------------------------ Verifier
+    def verify(self, token: str, cmd=None, *,
+               timeout_s: float | None = None) -> Result:
+        """S24：在**候选工作区副本 + 账本合并视图**上执行命令（不经 shell）。
+
+        为什么要「合并视图」：agent 的工作区是 `begin` 时钉住的旧快照，
+        另一个 agent 之后提交的改动不在里面。只有把账本里**已存在**的资源
+        叠加进来，才能暴露「文本不冲突、合起来跑不通」。
+
+        结果写入 `spec["rsc_verify"]`（随 checkpoint 落盘，供审计）；
+        `verify_cmd` 配置了时，`apply` 会**自动**先跑一遍，红则拒绝提交。
+        """
+        with self._op_lock(token):
+            return self._verify_locked(token, cmd, timeout_s)
+
+    def _verify_locked(self, token, cmd=None, timeout_s=None, pending=None):
+        acb = self.resolve(token)
+        if isinstance(acb, Deny):
+            return Result(Status.DENIED, {"reason": acb.reason,
+                                          "code": acb.code})
+        argv = _norm_cmd(cmd) if cmd is not None else self.verify_cmd
+        if argv is None:
+            return Result(Status.DENIED, {"reason": "verify_cmd_required"})
+        worktree = acb.spec.get("rsc_worktree")
+        if not worktree or not os.path.isdir(str(worktree)):
+            # 没有 Z3 就没有隔离的候选副本 → fail-closed（不跑在主树上）
+            return Result(Status.DENIED, {"reason": "verify_requires_worktree"})
+        timeout = (self.verify_timeout_s if timeout_s is None
+                   else max(1.0, float(timeout_s)))
+        started = time.monotonic()
+        tree = self._verification_tree(str(worktree), pending=pending)
+        try:
+            proc = subprocess.run(argv, cwd=tree, capture_output=True,
+                                  text=True, timeout=timeout, check=False)
+            code = proc.returncode
+            out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        except subprocess.TimeoutExpired:
+            code, out = -1, f"verify_timeout after {timeout}s"
+        except OSError as exc:
+            code, out = -1, f"verify_spawn_failed: {exc}"
+        finally:
+            shutil.rmtree(os.path.dirname(tree), ignore_errors=True)
+        ok = code == 0
+        detail = {"ok": ok, "exit_code": code, "cmd": argv,
+                  "tail": out[-_VERIFY_TAIL_CHARS:],
+                  "duration_ms": int((time.monotonic() - started) * 1000)}
+        acb.spec["rsc_verify"] = dict(detail)
+        self._resave(acb, token)
+        return Result(Status.OK if ok else Status.DENIED, detail)
+
+    def _verification_tree(self, worktree: str, pending=None) -> str:
+        """复制候选工作区（不含 `.git`），叠加「账本合并视图 + 本次待提交内容」。
+
+        顺序很重要：工作区副本 → 账本（他人已提交）→ 本次 pending（后者覆盖前者），
+        得到「提交后会是什么样」的真实视图。
+        """
+        holder = tempfile.mkdtemp(prefix="rsc-verify-")
+        tree = os.path.join(holder, "tree")
+        shutil.copytree(worktree, tree, symlinks=True,
+                        ignore=shutil.ignore_patterns(".git"))
+        for resource in list(self.h.workspace.manifest):
+            self._overlay(tree, resource, self.h.workspace.get(resource))
+        for resource, content in (pending or []):
+            # pending 可能是新文件（本次新增）→ 允许创建
+            self._overlay(tree, str(resource), content, create=True)
+        return tree
+
+    @staticmethod
+    def _overlay(tree: str, resource: str, content, *,
+                 create: bool = False) -> None:
+        """把 `content` 写进副本；`create=False` 时只覆盖**已存在**的路径。"""
+        path = _safe_rel(tree, resource)
+        if path is None or (not create and not os.path.isfile(path)):
+            return
+        if content is DELETE or content is None:
+            return
+        if isinstance(content, bytes):
+            data = content
+        elif isinstance(content, str):
+            data = content.encode("utf-8")
+        else:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except OSError:
+            return
+
+    def _verified(self, acb: ACB) -> bool:
+        return bool((acb.spec.get("rsc_verify") or {}).get("ok"))
+
+    def _verify_gate(self, token: str, acb: ACB, pending=None) -> Deny | None:
+        """提交前门禁：配置了命令就自动跑；否则已有的失败记录也一律拒绝。"""
+        if self.verify_cmd is not None:
+            res = self._verify_locked(token, pending=pending)
+            if res != Status.OK:
+                detail = res.detail or {}
+                if detail.get("reason") in ("verify_cmd_required",
+                                            "verify_requires_worktree"):
+                    return Deny(str(detail["reason"]), code="verify_failed")
+                return Deny(f"verify_failed:{detail.get('exit_code')}",
+                            code="verify_failed")
+            return None
+        record = acb.spec.get("rsc_verify")
+        if record is not None and not record.get("ok"):
+            # 显式 verify 失败过 → 未重新验证通过前不得提交（fail-closed）
+            return Deny("verify_failed_recorded", code="verify_failed")
+        if self.verify_required and not self._verified(acb):
+            return Deny("verify_required", code="verify_failed")
+        return None
 
     def finish(self, token: str, *, outcome: str = "DONE") -> Result:
         with self._op_lock(token):
