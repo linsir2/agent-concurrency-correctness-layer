@@ -21,8 +21,8 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
     (ok if cond else bad).append((name, detail))
 
 
-from harness.budget import BudgetManager            # noqa: E402
-from harness.storage import raft as raft_mod         # noqa: E402
+from harness.budget import BudgetManager
+from harness.storage import raft as raft_mod
 
 # ---------------------------------------------------- K-87
 chk("K-87 BudgetManager 可被 pickle（去掉 RLock）",
