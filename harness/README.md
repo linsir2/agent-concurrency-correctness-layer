@@ -112,6 +112,10 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s24_determinism.py` | S24-10 确定性：同 seed WAL 逐字节相等、换 seed/默认模式必不同、域隔离/单调时钟、拒绝 auth/pool/merge_queue |
 | `tests/test_s24_timer.py` | S24-11 timer：到期才触发、取消、重复调度拒绝、WAL 重启重建、已触发不双触发、tick/pump 收敛、默认关闭无事件 |
 | `tests/test_s24_definitions.py` | S24-11 定义：content hash、同名异内容冲突、未知/异 hash 准入拒绝（零残留）、热更新后旧 ACB 提交被拒 |
+| `tests/test_s24_read_purity.py` | S24-P0：`next_deadline_ms()`/`pump()` 只读（epoch/槽位/WAL 不变）、持久 aging 期限恢复并结算 |
+| `tests/test_s24_verify_pgroup.py` | S24-P0：Verifier 超时杀进程组（孙进程不得存活）、成功路径不变 |
+| `tests/test_s24_lease_fence_identity.py` | S24-P0：事件层 lease fence 必须与租约同集群（错配构造即拒） |
+| `tests/test_s24_docs.py` | S24-P0：文档真值守卫（MS9/MS10、MS5 VerifierRunner、矩阵状态、L4 Trace、语料条数） |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

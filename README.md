@@ -59,8 +59,8 @@
 ## 运行测试
 
 ```bash
-python3 -m pytest tests/ -q                      # 875 passed / 11 skipped / 4 xfailed
-TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 883 passed（TLA 实测）
+python3 -m pytest tests/ -q                      # 851 passed / 14 skipped / 4 xfailed
+TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 859 passed / 6 skipped
 python3 -m harness.spec.corpus --check           # 合规语料无漂移（35 / 0）
 python3 -m harness.diagnose --state-dir <dir>    # 只读诊断，退出码 0/1/2
 python3 -m bench.llm_replay --json               # token 基准回放（n=1，离线）

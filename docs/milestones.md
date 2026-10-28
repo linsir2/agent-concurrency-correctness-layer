@@ -181,7 +181,7 @@ L5 门面      harness（组装 + 端到端）
 | **新增模块** | `workspace.rebase_json` 增强、`planner.add_logical_edge` |
 | **依赖** | MS1、MS4 |
 | **入口条件** | MS4 出口通过 |
-| **出口条件** | `test_u3_batch_migration_json_aware_merge`、`test_u2_parallel_review_conflict_and_rebase`、`test_a10_write_skew_logical_deps`（**必须从 🟡 提升为 ✅**：write skew 被 `logical_deps` 拦截；仍是 🟡 则本里程碑不通过） |
+| **出口条件** | `test_u3_batch_migration_json_aware_merge`、`test_u2_parallel_review_conflict_and_rebase`、`test_a10_write_skew_logical_deps`（**必须从 🟡 提升为 ✅**：write skew 被 `logical_deps` 拦截；仍是 🟡 则本里程碑不通过）；**VerifierRunner**（S24-1 交付 `RscSession.verify`，登记为差异化能力；不改变 MS5 判据） |
 | **扩展点** | merge 策略可由 footprint 的 `merge_policy` 配置 |
 | **承上启下** | MS8 的 L2 规范把 merge 语义写入「协调协议」 |
 | **接线要求（v1.1）** | `CONFLICT`/`REJECT_STALE_READ` 必须接进执行循环（`handle_commit_result`，当前缺失，`runtime` 对非 OK 一律 `FAILED`），否则「冲突 → 语义 rebase」只是文档承诺 |
@@ -297,8 +297,8 @@ MS0 ─▶ MS1 ─▶ MS2 ─┬─▶ MS4 ─▶ MS5 ─┐
 | MS6 | checkpoint, event_log | 物化视图 + 背压 | 被 MS7/MS8 引用 ✅ | ⚠️ `context_view`/`is_backpressured` 仅测试调用；`on_change`/`ack` 无生产调用（MS6 接线） |
 | MS7 | context, budget | 能力模型 | 被 MS10 引用 ✅ | ⚠️ `policy` 在 `runtime` 生产路径，但默认放行（MS7 改 deny-by-default） |
 | MS8 | 全部 | 规范（实现可换） | 被 MS9 引用 ✅ | ⚠️ `spec/receipt` 运行时从不产生收据（MS8 补 I13） |
-| MS9 | 全部 | 分布式后端 | 被 MS10 引用 ✅ | ⏳ 未开工（依赖 D2 接口抽象） |
-| MS10 | 全部 | 生产交付 | 终点（用户） ✅ | ⏳ 未开工 |
+| MS9 | 全部 | 分布式后端 | 被 MS10 引用 ✅ | ✅ 完成（S16）：`RaftEventLog` + 三后端一致性 |
+| MS10 | 全部 | 生产交付 | 终点（用户） ✅ | ✅ 完成（S17）：可观测 + 排空 + DLQ + kill/purge |
 
 > **无死代码的证明**：每个模块至少被 1 个**后续里程碑**的出口条件引用。
 > **但「被里程碑引用」≠「已接线」**：上表右列是代码级复核结果。标 ⚠️ 的模块目前只在测试里被驱动，**必须在对应里程碑内接进执行路径**，否则它们在生产路径上就是死代码。这是 v1.1 新增的**可验收判据**：对应里程碑的「接线要求」行未满足，不得标记完成。

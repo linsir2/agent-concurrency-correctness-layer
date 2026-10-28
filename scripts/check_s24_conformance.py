@@ -378,6 +378,17 @@ for token in ("test_unknown_definition_rejected_before_budget",
               "test_plan_and_admit_pin_definition"):
     chk(f"定义用例 {token}", f"def {token}(" in _det_d)
 
+# ---------------------------------------------------------------- S24-P0 文档守卫
+_docs_proc = subprocess.run(
+    [sys.executable, str(_ROOT / "scripts/check_docs_consistency.py")],
+    capture_output=True, text=True, check=False)
+chk("文档一致性 0 findings", _docs_proc.returncode == 0,
+    _docs_proc.stdout[-200:])
+chk("读取面纯化用例存在", (_ROOT / "tests/test_s24_read_purity.py").exists())
+chk("verify 进程组用例存在", (_ROOT / "tests/test_s24_verify_pgroup.py").exists())
+chk("fence 身份用例存在", (_ROOT / "tests/test_s24_lease_fence_identity.py").exists())
+chk("文档守卫用例存在", (_ROOT / "tests/test_s24_docs.py").exists())
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)

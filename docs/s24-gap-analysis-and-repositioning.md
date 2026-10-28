@@ -12,8 +12,8 @@
 ## 0. 真跑证据（可复现）
 
 ```bash
-python3 -m pytest -q                                  # 828 passed / 11 skipped / 4 xfailed
-TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest -q # 836 passed / 3 skipped（TLA 实测）
+python3 -m pytest -q                                  # 851 passed / 14 skipped / 4 xfailed
+TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest -q # 859 passed / 6 skipped（TLA 实测）
 python3 scripts/check_s23_conformance.py              # 80 / 0
 python3 examples/three_agents/run.py                  # [PASS] naive 丢写 vs RSC 保全
 python3 examples/semantic_conflict/run.py             # [结论] 我们能拦住语义冲突
@@ -345,9 +345,10 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 
 | 位置 | 问题 |
 |---|---|
-| `docs/milestones.md:300-301` | MS9/MS10 仍写「未开工」，与 phase1 完成记录冲突 |
-| `docs/milestones.md` MS5 出口 | 未包含 `VerifierRunner`，却判通过（它是 P2 但被列为差异化能力） |
-| `docs/positioning-and-roadmap.md` §2.4 | 标「语义验证 ✅、worktree 🟡」，与代码相反 |
-| `docs/positioning-and-roadmap.md` 附录 A.2 | 把 Trace 计入 L4 交付，与 design §0.5「L5 不交付」冲突 |
+| `docs/milestones.md:300-301` | ✅ S24-P0 已修：MS9/MS10 改为完成（S16/S17） |
+| `docs/milestones.md` MS5 出口 | ✅ S24-P0 已修：登记 `VerifierRunner`（S24-1），不改变 MS5 判据 |
+| `docs/positioning-and-roadmap.md` §2.4 | ✅ S24-P0 已修：语义验证 🟡、worktree ✅，并附口径说明 |
+| `docs/positioning-and-roadmap.md` 附录 A.2 | ✅ S24-P0 已修：L4 不再计入 Trace（design §0.5） |
 | `harness/spec/invariants.py` | ✅ 已修：I9/I10 的测试指针失效（原 `test_i9_plan_valid` / `test_i10_isolation`），并由语料用例 `test_invariant_test_pointers_exist` 常驻守卫 |
-| `README.md`（已修） | 测试数写 91，实际 810（+8 条 TLA 用例在无 jar 时显式 skip） |
+| `README.md`（已修） | 测试数随环境变化（可选 extras/pysyncobj/TLA jar）；当前快照见 §0 与 README |
+| 文档腐化 | ✅ S24-P0 新增 `scripts/check_docs_consistency.py` + 7 条用例常驻守卫 |

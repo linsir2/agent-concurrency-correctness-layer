@@ -122,3 +122,18 @@
 - 新增测试必须能在**无网络、无 pysyncobj、无 Java** 的默认环境运行；
   依赖外部能力的用例显式 xfail/skip（不假绿）。
 - 默认路径（未开启新参数）事件字节不变；由确定性用例与 conformance 双重守卫。
+
+---
+
+## 5. 实施状态（2026-10-29）
+
+| 步骤 | 状态 | 提交/证据 |
+|---|---|---|
+| P0-1 读取面纯化 + aging 期限恢复 | ✅ | `859378c`；4 用例；实测 `next_deadline_ms()` 后 epoch 0→0、WAL 字节不变 |
+| P0-2 HITL `approval_id` 可重放 | ✅ | `e265356`；同 seed HITL WAL 逐字节相等 |
+| P0-3 Verifier 杀进程组 | ✅ | 孙进程 marker 不再出现；成功路径不变 |
+| P0-4 lease fence 同集群 | ✅ | `f405ba4`；错配构造期 `LeaseUnavailable` |
+| P0-5 文档真值 + 守卫 | ✅ | `scripts/check_docs_consistency.py` + 7 用例；HEAD 0 findings |
+
+> 环境说明：pysyncobj 在本环境重新安装后 raft 用例恢复真跑；TLA jar 需按 README 下载。
+> 主门禁当前快照：**851 passed / 14 skipped / 4 xfailed**；带 TLA jar：**859 / 6 / 4**。

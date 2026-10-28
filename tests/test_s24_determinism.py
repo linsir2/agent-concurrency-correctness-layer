@@ -13,7 +13,6 @@ import itertools
 import pathlib
 
 import pytest
-
 from conftest import decision, hitl
 
 from harness import RscSession

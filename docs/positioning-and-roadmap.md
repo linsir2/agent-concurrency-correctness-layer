@@ -144,9 +144,13 @@
 | agent-coherence | 🟡 | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | Klock | ❌ | ❌ | 🟡 | ❌ | ❌ | ❌ | ❌ | ✅ |
 | agenthold | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | 🟡 |
-| **我们** | **✅** | **✅** | **✅** | **✅** | **✅** | **🟡** | **❌** | **✅** |
+| **我们** | **✅** | **✅** | **✅** | **✅** | **🟡** | **✅** | **❌** | **✅** |
 
 **三个空白带**：①「幂等对账」几乎只有 LIMBO + agent-ledger；②「预算树」只有 Agent Contracts / Alignment Contracts；③**「准入+幂等+预算+语义验证」四者合一 = 完全空白**。
+
+> **语义验证口径（S24 复核）**：我们提供的是「静态符号消失检测 + 提交前可执行
+> Verifier」，**不是**全量语义等价证明，故标 🟡；worktree 已接线（`WorktreeManager`
+> + `RscSession`），标 ✅。
 
 ---
 
@@ -422,7 +426,7 @@
 | L1 内核 | IntentRegistry/WorkspaceManager/EventLog（**仅单机**） | ✅ 强（单调度器） |
 | L2 运行时+记忆 | ContextAssembler/CheckpointStore/EventLog | ✅ 强 |
 | L3 用户态 | ToolGateway（缺 MCP 对接） | 🟡 部分 |
-| L4 治理 | BudgetManager/PolicyEngine/Trace | ✅ 强 |
+| L4 治理 | BudgetManager/PolicyEngine（Trace 不交付，见 design §0.5） | ✅ 强 |
 | L5 互联 | **无** | ❌ 缺失 |
 
 ### A.3 判定
