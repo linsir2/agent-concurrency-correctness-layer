@@ -233,7 +233,7 @@ L5 门面      harness（组装 + 端到端）
 | **新增模块** | `event_log_raft`、`budget_raft`（实现同一接口） |
 | **依赖** | MS8 |
 | **入口条件** | MS8 出口通过 |
-| **出口条件** | 全部 35 个测试在 Raft 后端下仍通过 |
+| **出口条件（v1.3 重述，S16）** | 原「全部 35 个测试在 Raft 后端下仍通过」写于测试只有 35 个时，现 563 个且 500+ 与共识无关 → 重述为可判定四条：① **S15 后端一致性套件**（EventLog 5 组断言）在 `memory`/`wal`/**`raft`** 三后端全过；② `RaftEventLog` 通过 `protocols.EventLog` 契约；③ `Harness(event_log=raft_log)` 跑通 E2E 到 `DONE`；④ 三副本收敛一致（同 seq/同内容）。**未完成**：`budget_raft` 见下方「已知边界」 |
 | **扩展点** | **这是 MS1–MS7 预留的最大扩展点** |
 | **前置条件（v1.2 已按代码复核修正）** | 「实现同一接口」要求先有接口。**实测：`Harness.__init__` 已支持全组件 keyword 注入**（`event_log`/`intents`/`workspace`/`budget`/`checkpoints`/`effects`/`policy`/`context`/`subscriptions`/`clock`/`blobs`），故 v1.1 的「无构造注入、MS9 不得开工」**已过期**。真正缺的只有两件：① 无 `Protocol`/`ABC` 契约声明（`grep` 零命中）→ 无法类型校验替代后端；② 无后端一致性测试套件。二者均为纯 Python，见 S15 大类 C |
 | **承上启下** | MS10 的 HA 前提 |

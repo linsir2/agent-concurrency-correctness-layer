@@ -69,6 +69,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s15_backend_conformance.py` | S15 C3：后端一致性（CheckpointStore 内存/文件 ×7、EventLog 内存/WAL ×5） |
 | `tests/test_s15_ingress.py` | S15 D1：Ingress 幂等（空 key / 重放 / CONFLICT / 跨进程 / 内存态去重负对照） |
 | `tests/test_s15_admin.py` | S15 D2/D3/D4：DLQ redrive（有界 + 真执行）、pause/resume（保留资源 + 持久化 + 幂等）、metrics |
+| `tests/test_s16_raft.py` | S16：Raft 后端（选主 / seq 无空洞 / 并发串行化 / 三副本收敛 / 契约 / replay 过滤 / E2E 装配 / epoch=term / 无库 fail-closed） |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

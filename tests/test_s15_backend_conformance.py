@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import itertools
+import os
+
 import pytest
 
 from harness import ACB, EventKind, FileCheckpointStore, Status, TaskState
@@ -117,11 +120,33 @@ def test_ckpt_missing_ref_returns_none(store):
 # =====================================================================
 # EventLog：内存 vs WAL
 # =====================================================================
-@pytest.fixture(params=["memory", "wal"])
+_RAFT_PORTS = itertools.count(0)
+
+
+def _raft_port() -> int:
+    return 33000 + (os.getpid() % 200) * 20 + next(_RAFT_PORTS) * 12
+
+
+@pytest.fixture(params=["memory", "wal", "raft"])
 def log(request, tmp_path):
+    """**同一套断言跑三套后端**（S16：加入 raft，证明「同一接口」）。"""
     if request.param == "memory":
-        return MemEventLog()
-    return WalEventLog(tmp_path / "wal.log", fsync=True)
+        yield MemEventLog()
+        return
+    if request.param == "wal":
+        yield WalEventLog(tmp_path / "wal.log", fsync=True)
+        return
+    # ---- raft：需 pysyncobj；缺失时显式 xfail（不静默 skip）----
+    try:
+        import pysyncobj  # noqa: F401
+    except ImportError:                                  # pragma: no cover
+        pytest.xfail("raft 环境缺失：pysyncobj 未安装（pip install .[raft]）")
+    from harness.storage.raft import RaftEventLog
+    raft_log = RaftEventLog(base_port=_raft_port())
+    try:
+        yield raft_log
+    finally:
+        raft_log.close()
 
 
 def test_log_append_and_tail(log):

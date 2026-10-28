@@ -75,8 +75,9 @@ for n in ("test_ckpt_save_load_roundtrip", "test_ckpt_latest_pointer_advances",
           "test_ckpt_update_children_cas_consistent", "test_ckpt_epoch_monotonic",
           "test_log_append_and_tail", "test_log_append_batch_atomic_numbers"):
     chk(f"C3 用例存在 {n}", f"def {n}(" in _conf_txt)
-chk("C3 双后端参数化", 'params=["memory", "file"]' in _conf_txt
-    and 'params=["memory", "wal"]' in _conf_txt)
+chk("C3 多后端参数化（checkpoint 双后端 + EventLog 三后端含 raft）",
+    'params=["memory", "file"]' in _conf_txt
+    and 'params=["memory", "wal", "raft"]' in _conf_txt)
 
 # C4：反漂移检查存在且真的扫（用例数 + 负对照）
 _drift = _ROOT / "tests/test_s15_contract_drift.py"

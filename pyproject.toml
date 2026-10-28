@@ -24,6 +24,9 @@ dependencies = []
 dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6"]
 # 内核 LSM（Landlock）强制点：真实 API = `Sandbox(...)` + **子进程** `sandbox.run(argv)`
 sandbox = ["sandlock>=0.1"]
+# MS9 分布式化：Raft 组替换「单写者 seq / reserve」（MIT，2025-02 仍在维护）
+# 未安装 → `RaftEventLog()` 抛 `RaftUnavailable`（fail-closed，不静默降级为单机）
+raft = ["pysyncobj>=0.3.14"]
 # 备选 LSM 绑定（sandlock 不可解析时的降级候选；不自研 seccomp/Landlock）
 landlock-alt = ["py-landlock>=0.1"]
 # L7 代理（只与 netns MODE_B 搭配；单独用不构成强制点，§0.1）
@@ -52,6 +55,7 @@ markers = [
     "sandbox: 子进程沙箱用例（Landlock / sandlock，需内核支持）",
     "netns: 网络命名空间用例（需 CAP_NET_ADMIN，缺失时 xfail 登记）",
     "egress: egress 强制点用例（gate / DNS 钉住 / SSRF）",
+    "raft: MS9 Raft 后端用例（需 pysyncobj；缺失时 xfail 登记，真实端口/选主约 1-2s）",
 ]
 
 [tool.coverage.run]
