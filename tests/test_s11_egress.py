@@ -267,7 +267,7 @@ def test_s11_4_redirect_302_raises_egress_denied(monkeypatch):
     monkeypatch.setattr("harness.egress.resolver.is_forbidden", lambda ip: False)
 
     class _Redirect(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):                        # noqa: N802 - stdlib 约定
+        def do_GET(self):
             self.send_response(302)
             self.send_header("Location",
                              "http://169.254.169.254/latest/meta-data/")
@@ -298,7 +298,7 @@ def test_s11_8_harness_wires_egress_guard_into_llm():
 
 def test_s11_8_llm_post_calls_ensure_before_network(monkeypatch):
     """`llm._post` 入口先 `ensure()`；不可用 → 拒绝出站（不发起连接）。"""
-    import harness.llm as llm
+    from harness import llm
 
     class _Guard:
         def __init__(self) -> None:
@@ -324,7 +324,7 @@ def test_s11_8_llm_post_calls_ensure_before_network(monkeypatch):
 
 def test_s11_8_llm_post_fail_closed_by_default(monkeypatch):
     """未注入 guard → 模块默认 guard（required=None）出站 fail-closed。"""
-    import harness.llm as llm
+    from harness import llm
 
     monkeypatch.setattr(llm, "_default_guard",
                         EgressGuard(probe_fn=_unavailable_status))
@@ -750,9 +750,9 @@ def test_s11_7_create_netns_cleans_up_on_failure(monkeypatch):
                            proxy="127.0.0.1:8080")
 
     joined = [" ".join(c) for c in calls]
-    assert " ".join(["/sbin/ip", "netns", "add", "egress-x"]) in joined
+    assert "/sbin/ip netns add egress-x" in joined
     assert any(line.startswith("/sbin/ip link del") for line in joined), "veth 未清理"
-    assert " ".join(["/sbin/ip", "netns", "del", "egress-x"]) in joined, "netns 未清理"
+    assert "/sbin/ip netns del egress-x" in joined, "netns 未清理"
     assert removed == ["egress-x"], "模式标记未清理"
 
 

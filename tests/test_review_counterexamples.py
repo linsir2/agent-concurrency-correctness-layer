@@ -18,8 +18,17 @@ from __future__ import annotations
 import pytest
 from conftest import _acb, admit, decision, make_harness, seed, stage
 
-from harness import (ACB, EventKind, Harness, Mode, ReceiptConflict, Status,
-                     TaskState, WorkspaceManager, Write)
+from harness import (
+    ACB,
+    EventKind,
+    Harness,
+    Mode,
+    ReceiptConflict,
+    Status,
+    TaskState,
+    WorkspaceManager,
+    Write,
+)
 from harness.checkpoint import FileCheckpointStore
 from harness.context import ContextAssembler
 from harness.event_log import EventLog

@@ -622,9 +622,9 @@ class Harness:
         """
         fd = getattr(wal, "_fd", None)
         cached = getattr(wal, "_cached_end", None)
-        if fd is not None and cached is not None:
-            if os.fstat(fd).st_size == cached:
-                return
+        if (fd is not None and cached is not None
+                and os.fstat(fd).st_size == cached):
+            return
         rescan = getattr(wal, "_rescan_from_disk", None)
         if callable(rescan):
             rescan()
@@ -1344,7 +1344,7 @@ class Harness:
                     self.event_log.notify_events(events)
                 except CrashInjected:                 # S9 §2.1：注入崩溃必须穿透，不得被吞
                     raise
-                except Exception:
+                except Exception:  # noqa: BLE001  # 通知失败不得掩盖提交返回值
                     pass
 
     def _commit_record(self, acb: ACB, w: Write, blob_hash: str,
@@ -1505,7 +1505,7 @@ class Harness:
         源任务，再按「task_id 相同」或「alias 一跳解析到同一 subgoal」匹配边，
         并把后继也 `CANCELLED`（否则 CANCELLED 不再算前驱满足 → 后继永久阻塞）。
         """
-        for run_id, plan in self.plans.items():
+        for plan in self.plans.values():
             task = self.planner.task_for(plan, task_id)
             if not isinstance(task, dict):
                 task = plan.get("tasks", {}).get(task_id)
@@ -1564,7 +1564,8 @@ class Harness:
         if not path or not os.path.exists(path):
             return None
         try:
-            data = loads(open(path, "r", encoding="utf-8").read())
+            with open(path, "r", encoding="utf-8") as fh:
+                data = loads(fh.read())
         except Exception:  # noqa: BLE001
             return None
         return data if isinstance(data, dict) else None
@@ -2469,7 +2470,7 @@ class Harness:
                 continue
             seen.add(cid)
             children.append(child)
-        for cid, info in (getattr(parent_acb, "children_pending", None) or {}).items():
+        for cid in (getattr(parent_acb, "children_pending", None) or {}):
             cid = str(cid)
             if cid in seen:
                 continue
@@ -3812,10 +3813,10 @@ class Harness:
                 # 终态 + QUARANTINED 结算全部预留（文档 §5.5：未消耗部分归还，已消耗留账）
                 for rid in list(acb.reservation_ids):
                     self.budget.settle(rid)
-            if acb.state in TASK_TERMINAL and acb.budget_node is not None:
+            if (acb.state in TASK_TERMINAL and acb.budget_node is not None
+                    and self.budget.archive_node(acb.budget_node.node_id)):
                 # §5.3（K-13）：终态且无 ACTIVE 预留 → 归档（consumed 折入父级）
-                if self.budget.archive_node(acb.budget_node.node_id):
-                    acb.budget_node = None
+                acb.budget_node = None
         self.budget.flush_pending()
         # F5：等待审批**不是**占槽位的理由（否则 `max_concurrent` 下等待中的任务会
         # 饿死其他 run）；统一释放，`_hitl_gate` 批准后重新 `try_acquire`。
@@ -4397,10 +4398,10 @@ class Harness:
                     and acb.id not in snap_active):
                 acb.needs_readmit = True
             # F5：等待态不占槽位（与 `_finalize` 一致）；其它状态恢复即重新占用。
-            if acb.state is not TaskState.WAITING_APPROVAL:
-                if not self.slots.try_acquire(acb.id):
-                    acb.state = TaskState.QUARANTINED
-                    acb.failure = "NO_SLOT"
+            if (acb.state is not TaskState.WAITING_APPROVAL
+                    and not self.slots.try_acquire(acb.id)):
+                acb.state = TaskState.QUARANTINED
+                acb.failure = "NO_SLOT"
             if bump_epoch:
                 self.bump_epoch()
             return acb
@@ -4457,14 +4458,14 @@ class Harness:
         run_limits = data.get("run_limits")
         new_format = ("budget_cursor" in data) or ("run_limits" in data)
 
-        if new_format and run_limits is not None:
-            if int(run_limits) != int(self.budget.root.limits):
-                acb.reservation_ids = []
-                acb.budget_node = None
-                acb.state = TaskState.QUARANTINED
-                acb.needs_readmit = True
-                acb.failure = acb.failure or "RUN_LIMITS_DRIFT"
-                return
+        if (new_format and run_limits is not None
+                and int(run_limits) != int(self.budget.root.limits)):
+            acb.reservation_ids = []
+            acb.budget_node = None
+            acb.state = TaskState.QUARANTINED
+            acb.needs_readmit = True
+            acb.failure = acb.failure or "RUN_LIMITS_DRIFT"
+            return
 
         if not node_id:
             acb.reservation_ids = []
@@ -4481,9 +4482,9 @@ class Harness:
             acb.reservation_ids = list(existing.reservations)
             return
 
-        if new_format and self.budget.budget_events():
-            if self._restore_budget_by_replay(acb, data, node_id):
-                return
+        if (new_format and self.budget.budget_events()
+                and self._restore_budget_by_replay(acb, data, node_id)):
+            return
         self._restore_budget_ledger(acb, data, node_id)
 
     def _replay_budget_events(self, cutoff_epoch: int,

@@ -21,9 +21,9 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
     (ok if cond else bad).append((name, detail))
 
 
-from harness import Harness, protocols                    # noqa: E402
-from harness.budget import BudgetManager, Reservation      # noqa: E402
-from harness.storage import raft as raft_mod               # noqa: E402
+from harness import Harness, protocols
+from harness.budget import BudgetManager, Reservation
+from harness.storage import raft as raft_mod
 
 # ---------------------------------------------------- K-88
 _rs = inspect.getsource(Reservation)

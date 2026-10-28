@@ -18,7 +18,6 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
-from typing import Optional
 
 GENESIS_HASH = "0" * 16
 
@@ -52,9 +51,9 @@ class Receipt:
     resource: str
     version_before: int
     version_after: int
-    effect_id: Optional[str]
-    idem_key: Optional[str]
-    compensation_ref: Optional[str]
+    effect_id: str | None
+    idem_key: str | None
+    compensation_ref: str | None
     prev_receipt_hash: str
     signature: str = ""
     schema_version: int = 1
@@ -90,7 +89,7 @@ class Receipt:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Receipt":
+    def from_dict(cls, data: dict) -> Receipt:
         """从事件 payload 反序列化（`signed` 由 signature 推导，忽略该键）。
 
         P2：容错校验必填字段（`receipt_id`/`run_id`/`task_id`）；缺失 →

@@ -92,7 +92,7 @@ class _NoopScheduler:
     claim 接口（X1/X7）；B3 无 claim 语义 → 全部 no-op，不引入 fencing。
     """
 
-    def push(self, task_id):  # noqa: D401
+    def push(self, task_id):
         return None
 
     def pop(self):
@@ -263,7 +263,7 @@ def _git_merge_file(base: str, ours: str, theirs: str, git: str):
         _write(bp, base); _write(op, ours); _write(tp, theirs)
         t0 = time.perf_counter()
         proc = subprocess.run([git, "merge-file", "-p", op, bp, tp],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
         dt = time.perf_counter() - t0
     return proc.stdout, proc.returncode != 0, dt
 

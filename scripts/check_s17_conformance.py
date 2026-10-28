@@ -22,12 +22,15 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
     (ok if cond else bad).append((name, detail))
 
 
-import harness.observability as obs                       # noqa: E402
-import harness.orchestration as orchestration              # noqa: E402
-from harness import Harness, protocols                    # noqa: E402
-from harness.budget import BudgetManager                   # noqa: E402
-from harness.storage import raft as raft_mod               # noqa: E402
-from harness.types import ACB, EventKind                   # noqa: E402
+import harness.observability as obs
+from harness import (
+    Harness,
+    orchestration,
+    protocols,
+)
+from harness.budget import BudgetManager
+from harness.storage import raft as raft_mod
+from harness.types import ACB, EventKind
 
 # ===================================================== K-81
 sig = inspect.signature(BudgetManager.reserve).parameters

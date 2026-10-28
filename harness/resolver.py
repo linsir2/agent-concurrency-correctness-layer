@@ -11,7 +11,8 @@ base_url 白名单把关。
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Optional, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol
 
 from . import llm
 from .rebase import Conflict
@@ -51,8 +52,8 @@ class LLMResolver:
     `runtime._validate_resolution` 在返回值上统一执行。
     """
 
-    def __init__(self, config: Optional[llm.LLMConfig] = None,
-                 validator: Optional[Callable[[Any], bool]] = None) -> None:
+    def __init__(self, config: llm.LLMConfig | None = None,
+                 validator: Callable[[Any], bool] | None = None) -> None:
         self.config = config
         self.validator = validator
 
@@ -61,7 +62,7 @@ class LLMResolver:
         prompt = self._prompt(acb, resource, conflicts, ctx)
         try:
             text = llm.chat([{"role": "user", "content": prompt}], config=self.config)
-        except Exception:
+        except Exception:  # noqa: BLE001  # 上游失败 → 交回调用方（不重试、不编造）
             return None
         try:
             resolved = json.loads(text)
@@ -71,7 +72,7 @@ class LLMResolver:
             try:
                 if not self.validator(resolved):
                     return None
-            except Exception:
+            except Exception:  # noqa: BLE001  # 校验器异常按「未通过」处理
                 return None
         return resolved
 
@@ -101,4 +102,4 @@ class LLMResolver:
         return "\n".join(lines)
 
 
-__all__ = ["ConflictResolver", "ScriptedResolver", "LLMResolver"]
+__all__ = ["ConflictResolver", "LLMResolver", "ScriptedResolver"]

@@ -21,7 +21,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6"]
+dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6", "ruff>=0.16"]
 # 内核 LSM（Landlock）强制点：真实 API = `Sandbox(...)` + **子进程** `sandbox.run(argv)`
 sandbox = ["sandlock>=0.1"]
 # MS9 分布式化：Raft 组替换「单写者 seq / reserve」（MIT，2025-02 仍在维护）
@@ -41,6 +41,22 @@ egress = ["sandlock>=0.1", "py-landlock>=0.1", "mitmproxy>=10"]
 
 [tool.setuptools.packages.find]
 include = ["harness*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# 显式锁定的「有意为之」偏离；其余保持 ruff 默认规则集（dev extra 固定 ruff>=0.16，
+# 避免不同版本默认集漂移导致 CI 结果不一致）。
+ignore = [
+    # 清理/回收路径（解预留、归档预算节点、落索引、通知订阅者）失败**不得**阻断
+    # 主路径或掩盖返回值 —— 这是 RSC 的既有约定，逐处 try/except/pass 是刻意的。
+    "S110",  # try-except-pass
+    "S112",  # try-except-continue（逐条回收失败时跳过该条）
+]
+# 仍允许在关键处写 `# noqa: S110/S112` 说明「此处刻意吞异常」，不被 RUF100 判为死注释。
+external = ["S110", "S112"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

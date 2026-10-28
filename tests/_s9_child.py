@@ -28,11 +28,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from harness import ACB, Harness, TaskState
 import harness.checkpoint as cp_mod
+from harness import ACB, Harness, TaskState
 from harness.checkpoint import FileCheckpointStore
 from harness.event_log import WalEventLog
-from harness.storage.atomic import fsync_dir
 from harness.storage.blob import FileBlobStore
 
 
@@ -111,7 +110,6 @@ def run_sigkill(args: argparse.Namespace) -> int:
 
     orig_write_new = FileCheckpointStore._write_new   # 真实静态方法
     orig_write_all = cp_mod.write_all
-    orig_link = os.link
     orig_write_pointer = store._write_pointer
     state: dict = {"ref": None, "pointer_calls": 0}
 

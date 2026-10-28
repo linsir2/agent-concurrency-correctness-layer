@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 import pytest
-from conftest import (admit, commit, decision, finish, hitl, make_harness,
-                      seed, stage, state_of, tool)
-from harness import Mode, Status, TaskState, Write, EventKind, TASK_TERMINAL, Harness
+from conftest import (
+    admit,
+    commit,
+    decision,
+    finish,
+    hitl,
+    make_harness,
+    seed,
+    stage,
+    tool,
+)
+
+from harness import TASK_TERMINAL, EventKind, Harness, Mode, Status, TaskState, Write
 from harness.runtime import CrashInjected
 from harness.storage.blob import canonical_bytes
 

@@ -21,18 +21,16 @@ import re
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from .event_log import EventLog
-from .storage._lock import FencingRejected, STORE_ORDER, _FileLock
+from .storage._lock import STORE_ORDER, FencingRejected, _FileLock
 from .storage.atomic import atomic_write, fsync_dir, write_all
 from .storage.codec import CodecError, decode, dumps, encode, loads
 from .types import Action, Event, EventKind
-
 
 _FORMAT_VERSION = 1
 # S13-0 §2.1：payload 增 hitl_pending/hitl_outcome/replan_count/parent_id/
@@ -221,7 +219,7 @@ class CheckpointStore:
             return []
         ids = set((self._run_acbs.get(run_id) or {}).keys())
         # 兜底：直接扫描快照（覆盖「已落盘但清单未更新」的崩溃窗口）
-        for ref, payload in self._store.items():
+        for payload in self._store.values():
             if isinstance(payload, dict) and payload.get("run_id") == run_id:
                 aid = payload.get("acb_id")
                 if aid:
@@ -538,7 +536,7 @@ class FileCheckpointStore(CheckpointStore):
             if meta_path.exists():
                 try:
                     meta = loads(meta_path.read_bytes().decode("utf-8"))
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     raise RuntimeError("store.json 损坏（无法解析）") from exc
                 if not isinstance(meta, dict) or "store_uuid" not in meta:
                     raise RuntimeError("store.json 缺少 store_uuid")
@@ -609,7 +607,7 @@ class FileCheckpointStore(CheckpointStore):
             try:
                 doc = loads(path.read_bytes().decode("utf-8"))
                 if not isinstance(doc, dict):
-                    raise ValueError("ref 文件顶层不是 dict")
+                    raise TypeError("ref 文件顶层不是 dict")
             except Exception:  # noqa: BLE001
                 target = path.with_name(path.name + ".corrupt")
                 os.replace(path, target)
@@ -620,7 +618,7 @@ class FileCheckpointStore(CheckpointStore):
             try:
                 os.replace(path, path.with_name(path.name + ".corrupt"))
                 fsync_dir(path.parent)
-            except OSError:  # noqa: S110  # 隔离失败不阻断启动
+            except OSError:  # 隔离失败不阻断启动
                 pass
         self._rebuild_latest_pointers()
 
@@ -710,7 +708,7 @@ class FileCheckpointStore(CheckpointStore):
     def _read_meta_locked(self) -> dict:
         try:
             meta = loads(self._meta_path.read_bytes().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RuntimeError("store.json 缺失或损坏") from exc
         if not isinstance(meta, dict) or "store_uuid" not in meta:
             raise RuntimeError("store.json 缺少 store_uuid")
@@ -977,14 +975,14 @@ class FileCheckpointStore(CheckpointStore):
         header = {name: doc.get(name) for name in _HEADER_FIELDS}
         try:
             expected_header = _sha256(dumps(header).encode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CheckpointCorrupt(ref, header, "header_checksum") from exc
         if expected_header != doc.get("header_checksum"):
             raise CheckpointCorrupt(ref, header, "header_checksum")
         payload = doc.get("payload")
         try:
             actual = _sha256(dumps(payload).encode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CheckpointCorrupt(ref, header, "payload_checksum") from exc
         if actual != doc.get("payload_checksum"):
             raise CheckpointCorrupt(ref, header, "payload_checksum")
@@ -1000,7 +998,7 @@ class FileCheckpointStore(CheckpointStore):
             raise CheckpointCorrupt(ref, self._header_from_pointers(ref), "missing")
         try:
             return loads(path.read_bytes().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CheckpointCorrupt(ref, {}, "unreadable") from exc
 
     def _header_from_pointers(self, ref: str) -> dict:
@@ -1182,9 +1180,8 @@ class FileCheckpointStore(CheckpointStore):
 
     def _save_payload(self, payload: dict) -> str:
         """按 `save` 的信封/指针语义写一份**已有 payload**（不重建 ACB）。"""
-        with self._thread_lock:
-            with self._flock():
-                return self._save_payload_locked(payload)
+        with self._thread_lock, self._flock():
+            return self._save_payload_locked(payload)
 
     def _save_payload_locked(self, payload: dict) -> str:
         """`_save_payload` 的**锁内**版本。

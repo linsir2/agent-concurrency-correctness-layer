@@ -4,16 +4,17 @@
 用法：`python3 scripts/check_s14_conformance.py`（exit 0 = 全部一致）。
 对应 `docs/s14-boundaries-and-ms8-closure.md` §2–§4 与 §9.1。
 """
-import inspect, re, sys, os
+import inspect
+import os
 import pathlib
+import sys
+
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT)); sys.path.insert(0, str(_ROOT / 'tests'))
-import harness
 from harness import Harness, TaskState
-from harness.harness import _MAX_INLINE_DEPTH
-from harness.orchestration import Planner, PREDECESSOR_SATISFIED
-from harness.types import TRANSITIONS, ResultEnvelope
 from harness.checkpoint import CheckpointStore, FileCheckpointStore
+from harness.orchestration import PREDECESSOR_SATISFIED, Planner
+from harness.types import TRANSITIONS, ResultEnvelope
 
 ok, bad = [], []
 def chk(name, cond, detail=""):
@@ -69,7 +70,7 @@ chk("K-70 写明 UPSTREAM_INSUFFICIENT 终态", "UPSTREAM_INSUFFICIENT" in (Resu
 chk("K-70 未实现严格化（宽松默认仍在）", TaskState.DONE_PARTIAL in PREDECESSOR_SATISFIED)
 
 # --- 文档对齐
-ms = open(str(_ROOT / 'docs/milestones.md'), encoding='utf-8').read()
+ms = (_ROOT / 'docs/milestones.md').read_text(encoding='utf-8')
 chk("MS8 分级已更新（v1.2 复核）", "覆盖强度（v1.2 已按代码复核修正）" in ms)
 chk("MS9 前置已更新（注入已存在）", "已支持全组件 keyword 注入" in ms)
 chk("MS10 已按实况更新（S15+S17 已达成出口）",
@@ -78,7 +79,7 @@ chk("MS10 已按实况更新（S15+S17 已达成出口）",
 # --- 测试文件与用例名
 for f in ("tests/test_s14_boundaries.py", "tests/test_s14_i12.py"):
     chk(f"测试文件存在 {f}", os.path.exists(str(_ROOT / f)))
-tb = open(str(_ROOT / 'tests/test_s14_boundaries.py'), encoding='utf-8').read()
+tb = (_ROOT / 'tests/test_s14_boundaries.py').read_text(encoding='utf-8')
 for n in ["test_s14_1_unrecovered_waiting_is_settled_by_tick",
           "test_s14_1_negative_control_memory_only_tick_misses_persisted",
           "test_s14_2_tick_is_a_fixed_point","test_s14_3_pump_reports_remaining_until_zero",
@@ -90,7 +91,7 @@ for n in ["test_s14_1_unrecovered_waiting_is_settled_by_tick",
           "test_s14_8_patch_materializes_edges_to_canonical_ids",
           "test_s14_9_prune_keeps_alias_referenced_by_active_acb"]:
     chk(f"用例存在 {n}", f"def {n}(" in tb)
-ti = open(str(_ROOT / 'tests/test_s14_i12.py'), encoding='utf-8').read()
+ti = (_ROOT / 'tests/test_s14_i12.py').read_text(encoding='utf-8')
 for n in ["test_s14_10_starved_task_leaves_admitted_within_bounded_pumps",
           "test_s14_10_negative_control_without_aging_stays_admitted"]:
     chk(f"用例存在 {n}", f"def {n}(" in ti)

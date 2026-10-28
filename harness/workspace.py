@@ -13,14 +13,13 @@ import copy
 import threading
 from dataclasses import dataclass
 
-from .types import EventKind, Mode, Result, Status, Write
 from .event_log import EventLog
 from .intent_registry import IntentRegistry
 from .rebase import DELETE, MISSING, merge3
 from .storage.atomic import atomic_delete
-from .storage.blob import (BlobCorrupt, InMemoryBlobStore, _BYTES_PREFIX,
-                           canonical_bytes)
+from .storage.blob import _BYTES_PREFIX, BlobCorrupt, InMemoryBlobStore, canonical_bytes
 from .storage.codec import decode, loads
+from .types import EventKind, Mode, Result, Status, Write
 
 
 class WorkspaceVersionStore:
@@ -181,8 +180,7 @@ class WorkspaceManager:
                 version = int(payload.get("version", 0) or 0)
             except (TypeError, ValueError):
                 continue
-            if version > best:
-                best = version
+            best = max(best, version)
         return best
 
     def _effective_version(self, resource: str) -> int:

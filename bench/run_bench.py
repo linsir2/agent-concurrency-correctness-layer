@@ -33,7 +33,6 @@ import platform
 import random
 import shutil
 import statistics
-import subprocess
 import sys
 import threading
 import time
@@ -44,11 +43,10 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from harness import EventKind, Harness  # noqa: E402
-
-from bench import conditions as C  # noqa: E402
-from bench import metrics as M  # noqa: E402
-from bench.workloads import WORKLOADS, freeze  # noqa: E402
+from bench import conditions as C
+from bench import metrics as M
+from bench.workloads import WORKLOADS
+from harness import EventKind
 
 CONDITIONS = {"B1": C.run_b1, "B2": C.run_b2, "B3": C.run_b3}
 DEFAULT_SEED = 20261027

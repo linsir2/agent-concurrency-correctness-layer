@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-from conftest import admit, decision, finish, make_harness
-from harness import CapabilityToken, Harness, TaskState
+from conftest import admit, decision, make_harness
+
+from harness import CapabilityToken, Harness
 
 
 def test_capability_denied_blocks_tool():

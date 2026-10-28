@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from conftest import admit, commit, decision, make_harness, seed, stage
-from harness import Status, TaskState, Write
-from harness.spec import (GENESIS_HASH, INVARIANTS, INVARIANT_IDS, ResourceKind,
-                          ResourceSpec, build_receipt, decide, receipt_hash,
-                          verify_chain)
+from conftest import admit, make_harness, seed, stage
+
+from harness.spec import (
+    INVARIANT_IDS,
+    ResourceKind,
+    ResourceSpec,
+    build_receipt,
+    decide,
+    receipt_hash,
+    verify_chain,
+)
 
 
 def test_spec_resource_model():

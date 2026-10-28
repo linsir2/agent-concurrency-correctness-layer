@@ -15,9 +15,9 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Optional
 from urllib.parse import urlsplit
 
 from .egress import EgressDenied, EgressGuard, build_opener
@@ -54,7 +54,7 @@ def validate_base_url(base_url: str) -> None:
             f"（防密钥/内容外泄到非官方端点）")
 
 
-def load_env_file(path: Optional[str] = None) -> dict:
+def load_env_file(path: str | None = None) -> dict:
     """只读加载 `.env`（默认仓库根 `.env`）到 `os.environ`，**不覆盖**已有变量。
 
     返回实际解析出的键值（无论是否已存在）。文件不存在 → 返回空 dict。
@@ -93,7 +93,7 @@ class LLMConfig:
     backoff_s: float = 0.5
 
     @classmethod
-    def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "LLMConfig":
+    def from_env(cls, env: Mapping[str, str] | None = None) -> LLMConfig:
         source = os.environ if env is None else env
         key = (source.get(ENV_KEY) or "").strip()
         if not key:
@@ -113,8 +113,8 @@ class LLMConfig:
 
 
 def _post(url: str, payload: dict, headers: dict, timeout_s: float, *,
-          egress: Optional[EgressGuard] = None,
-          opener: Optional[urllib.request.OpenerDirector] = None) -> dict:
+          egress: EgressGuard | None = None,
+          opener: urllib.request.OpenerDirector | None = None) -> dict:
     """真实网络分支：**必须**先过 egress 强制点，再走钉住 + 禁重定向的 opener。
 
     - `ensure()` 在入口调用：无强制点 → `EgressUnavailable`（拒绝出站，fail-closed）；
@@ -138,7 +138,7 @@ def _post(url: str, payload: dict, headers: dict, timeout_s: float, *,
         raise
 
 
-_default_guard: Optional[EgressGuard] = None
+_default_guard: EgressGuard | None = None
 
 
 def _default_egress() -> EgressGuard:
@@ -149,7 +149,7 @@ def _default_egress() -> EgressGuard:
     return _default_guard
 
 
-def configure_egress(guard: Optional[EgressGuard]) -> None:
+def configure_egress(guard: EgressGuard | None) -> None:
     """注入/覆盖模块级默认 guard（`Harness` 会注入自己的 guard）。"""
     global _default_guard
     _default_guard = guard
@@ -158,9 +158,9 @@ def configure_egress(guard: Optional[EgressGuard]) -> None:
 class LLMClient:
     """把 egress guard 与配置绑在一起的客户端（`Harness.llm` 使用）。"""
 
-    def __init__(self, config: Optional[LLMConfig] = None, *,
-                 egress: Optional[EgressGuard] = None,
-                 opener: Optional[urllib.request.OpenerDirector] = None) -> None:
+    def __init__(self, config: LLMConfig | None = None, *,
+                 egress: EgressGuard | None = None,
+                 opener: urllib.request.OpenerDirector | None = None) -> None:
         self.config = config
         self.egress = egress if egress is not None else _default_egress()
         # 见 `_post`：默认 None = 钉住 + 禁代理；仅受限环境显式覆盖。
@@ -168,7 +168,7 @@ class LLMClient:
 
     def chat(self, messages: Iterable[Mapping[str, str]], *,
              temperature: float = 0.0,
-             max_tokens: Optional[int] = None) -> str:
+             max_tokens: int | None = None) -> str:
         cfg = self.config or LLMConfig.from_env()
         validate_base_url(cfg.base_url)
         url = f"{cfg.base_url}/chat/completions"
@@ -184,7 +184,7 @@ class LLMClient:
             "Authorization": f"Bearer {cfg.api_key}",
         }
 
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         for attempt in range(cfg.max_retries + 1):
             try:
                 data = _post(url, payload, headers, cfg.timeout_s,
@@ -204,11 +204,11 @@ class LLMClient:
 
 
 def chat(messages: Iterable[Mapping[str, str]], *,
-         config: Optional[LLMConfig] = None,
+         config: LLMConfig | None = None,
          temperature: float = 0.0,
-         max_tokens: Optional[int] = None,
-         egress: Optional[EgressGuard] = None,
-         opener: Optional[urllib.request.OpenerDirector] = None) -> str:
+         max_tokens: int | None = None,
+         egress: EgressGuard | None = None,
+         opener: urllib.request.OpenerDirector | None = None) -> str:
     """调用 chat/completions，返回首条回复文本。
 
     仅用于阶段二的真实模型接入；阶段一 demo 默认走 scripted fake。

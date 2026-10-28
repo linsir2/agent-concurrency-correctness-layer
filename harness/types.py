@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 
 class Status(str, Enum):
@@ -67,7 +67,7 @@ class Result:
         return hash(self.status)
 
 
-def ok(detail: Optional[dict] = None) -> Result:
+def ok(detail: dict | None = None) -> Result:
     return Result(Status.OK, detail or {})
 
 
@@ -221,7 +221,7 @@ TRANSITIONS: dict[tuple[TaskState, str], TaskState] = {
 CANCELLABLE = frozenset(set(TaskState) - set(TASK_TERMINAL))
 
 
-def advance(acb: "ACB", event: str) -> Result:
+def advance(acb: ACB, event: str) -> Result:
     """状态机**唯一**写入口（D10）。非法转移返回 INVALID_INPUT（不新增错误码）。"""
     src = acb.state
     if event == "cancel":
@@ -280,7 +280,7 @@ class Write:
     resource: str
     content: Any = None
     version_before: int = 0
-    applied_hash: Optional[str] = None
+    applied_hash: str | None = None
     compensated: bool = False
     pivot: bool = False
 
@@ -289,15 +289,15 @@ class Write:
 class Action:
     """Agent 决策的一个动作（文档 §5.3）。"""
     kind: str                       # stage | commit | tool | request_hitl | finish
-    resource: Optional[str] = None
+    resource: str | None = None
     content: Any = None
     writes: list = field(default_factory=list)
-    tool: Optional[str] = None
+    tool: str | None = None
     args: Any = None
     cost: int = 1
     # S11a §2.3：显式 egress 维度（向后兼容，默认 None = 该维度不约束）
-    network: Optional[str] = None
-    data_class: Optional[str] = None
+    network: str | None = None
+    data_class: str | None = None
 
 
 @dataclass
@@ -360,23 +360,23 @@ class ACB:
     reservation_ids: list[str] = field(default_factory=list)
     needs_readmit: bool = False       # 恢复时无预算信息 → 由调用方重新 try_admit
     leases: list = field(default_factory=list)
-    deadline: Optional[int] = None
+    deadline: int | None = None
     step: int = 0
     heartbeat_at: int = 0
     turn_seq: int = 0
-    aging_deadline: Optional[int] = None
-    failure: Optional[str] = None
-    result_ref: Optional[str] = None
+    aging_deadline: int | None = None
+    failure: str | None = None
+    result_ref: str | None = None
     hitl_result: Any = None
     retried: int = 0
     no_progress_steps: int = 0
-    last_action_sig: Optional[str] = None
+    last_action_sig: str | None = None
     retry_budget: int = 3
     rebase_attempts: int = 0          # 冲突 rebase 已尝试次数（跨调用累加，§5.5）
     last_committed_seq: int = 0       # §2.4：per-ACB 已提交事件序号（recover 去重水位校验）
     trace_id: str = ""
     span_id: str = ""
-    parent: "ACB | None" = None
+    parent: ACB | None = None
     children: list = field(default_factory=list)
     # ---- S13-0 §2.1：一次性 schema 迁移（均用 `.get()` 读，兼容旧 checkpoint）----
     hitl_pending: dict | None = None      # {"approval_id","deadline_ms","plan_version"}

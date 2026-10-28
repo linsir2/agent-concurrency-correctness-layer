@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-from conftest import admit, commit, decision, finish, make_harness, seed, stage, tool
-from harness import Mode, Status, TaskState, Write
+from conftest import admit, make_harness, seed, tool
+
+from harness import Status, TaskState, Write
 
 
 def test_i1_single_writer_commit():

@@ -15,11 +15,11 @@ from collections.abc import Callable
 from typing import Any
 
 from .orchestration import classify_verdict
-from .rebase import (MISSING, MergeResult, _kind, _merge_object, _strict_eq,
-                     merge3)
+from .rebase import MISSING, MergeResult, _kind, _merge_object, _strict_eq, merge3
 from .spec.receipt import GENESIS_HASH
 from .types import (
     ACB,
+    TASK_TERMINAL,
     Action,
     Decision,
     EventKind,
@@ -27,13 +27,11 @@ from .types import (
     ReceiptConflict,
     Result,
     Status,
-    TASK_TERMINAL,
     TaskState,
     Write,
     advance,
     ok,
 )
-
 
 _HANDLERS: dict[str, Callable] = {}
 
@@ -114,10 +112,10 @@ class AgentRuntime:
                 # 绝不覆盖 failure、绝不继续后续 action。仅当**本动作自身**把
                 # ACB 置为终态且 failure 与返回值一致（BUDGET_EXHAUSTED /
                 # HITL 拒绝）时沿用 st，避免把自身终态误报成 SEMANTIC_REJECTED。
-                if acb.state in TASK_TERMINAL:
-                    if not (isinstance(st, (Status, Result))
-                            and acb.failure in (st.value,)):
-                        return self.h._terminal_status(acb)
+                if (acb.state in TASK_TERMINAL
+                        and not (isinstance(st, (Status, Result))
+                                 and acb.failure in (st.value,))):
+                    return self.h._terminal_status(acb)
                 if st in (Status.OK, Status.VALID):      # D13b：本 turn 有进展
                     progressed = True
                 if st in (Status.CANCELLED, Status.APPROVAL_TIMEOUT, Status.DENIED):
@@ -219,9 +217,7 @@ class AgentRuntime:
         if network and not resolved.allows_network(network):
             return False
         data_class = action.data_class
-        if data_class and not resolved.allows_data_class(data_class):
-            return False
-        return True
+        return not data_class or resolved.allows_data_class(data_class)
 
     def _do_action(self, acb: ACB, action: Action, i: int) -> Result:
         """§2.1：查表派发 + 归一化（裸 `Status` → `Result`）+ 异常映射。

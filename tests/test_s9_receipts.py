@@ -22,8 +22,12 @@ import harness.harness as harness_module
 from harness import ACB, EventKind, Harness, Status, Write
 from harness.event_log import WalEventLog
 from harness.runtime import CrashInjected
-from harness.spec.receipt import (build_receipt, receipt_hash, verify_chain,
-                                  verify_chain_detailed)
+from harness.spec.receipt import (
+    build_receipt,
+    receipt_hash,
+    verify_chain,
+    verify_chain_detailed,
+)
 
 
 # ---------------------------------------------------------------- helpers

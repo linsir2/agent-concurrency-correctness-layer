@@ -12,10 +12,17 @@ from __future__ import annotations
 import threading
 
 import pytest
-
 from conftest import _acb, admit, make_harness, seed
-from harness import (Harness, IntentRegistry, Mode, Status, WalEventLog,
-                     WorkspaceManager, Write)
+
+from harness import (
+    Harness,
+    IntentRegistry,
+    Mode,
+    Status,
+    WalEventLog,
+    WorkspaceManager,
+    Write,
+)
 from harness.clock import ManualClock
 from harness.storage.blob import FileBlobStore
 
@@ -122,7 +129,7 @@ def test_ms1_lock_order_no_deadlock():
             barrier.wait(timeout=5)
             results.append(h.commit_batch(
                 acb, [Write(order[0], content=1), Write(order[1], content=1)]))
-        except BaseException as e:
+        except BaseException as e:  # noqa: BLE001  # 线程内捕获一切，交由主线程断言
             errors.append(e)
 
     ts = [threading.Thread(target=worker, args=(("a", "b"),)),

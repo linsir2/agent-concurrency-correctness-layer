@@ -13,12 +13,21 @@ from __future__ import annotations
 import threading
 
 import pytest
-
-import harness.runtime as runtime_module
 from conftest import admit, commit, decision, finish, stage, tool
 
-from harness import (ACB, Action, EventKind, Harness, ManualClock, Result,
-                     Status, TaskState, Write, advance)
+import harness.runtime as runtime_module
+from harness import (
+    ACB,
+    Action,
+    EventKind,
+    Harness,
+    ManualClock,
+    Result,
+    Status,
+    TaskState,
+    Write,
+    advance,
+)
 from harness.runtime import CrashInjected
 from harness.storage._lock import FencingRejected
 from harness.types import TASK_TERMINAL
@@ -397,9 +406,8 @@ def test_s13_x5_replan_write_ahead_fenced_rolls_back_memory_count():
 
     patched_before = [e for e in h.event_log.all()
                       if e.kind is EventKind.PLAN_PATCHED]
-    with h.claim_scope(acb, c1.fence_epoch):
-        with pytest.raises(FencingRejected):
-            h.replan(acb, plan, diagnosis={"failing_subgoals": ["S1"]})
+    with h.claim_scope(acb, c1.fence_epoch), pytest.raises(FencingRejected):
+        h.replan(acb, plan, diagnosis={"failing_subgoals": ["S1"]})
 
     assert acb.replan_count == 0                       # 内存回滚
     assert acb.replan_attempts == 1                    # 尝试数永不回滚

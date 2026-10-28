@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import threading
 import uuid
-from typing import Callable, Iterable, Optional
+from collections.abc import Callable, Iterable
 
 from .clock import Clock, SystemClock
 from .storage._lock import WAL_ORDER, _FileLock, wal_lock_path
@@ -58,7 +58,7 @@ def _event(rec: dict) -> Event:
 
 
 class _EventLogBase:
-    def __init__(self, clock: Optional[Clock] = None) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
         self._clock = clock or SystemClock()
         self._events: list[Event] = []
         self._by_subject: dict[str, list[Event]] = {}
@@ -92,7 +92,7 @@ class _EventLogBase:
     def notify_events(self, events: list[Event]) -> None:
         self._notify(events)
 
-    def replay(self, subject: Optional[str] = None, from_seq: int = 0, *,
+    def replay(self, subject: str | None = None, from_seq: int = 0, *,
                run_id: str | None = None) -> Iterable[Event]:
         """按 `(resource, version)` 单调投递（文档 §5.6）。
 
@@ -134,7 +134,7 @@ class _EventLogBase:
 class EventLog(_EventLogBase):
     """内存实现（默认）。"""
 
-    def __init__(self, clock: Optional[Clock] = None) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
         super().__init__(clock)
         self._lock = threading.RLock()
         self._seq = 0
@@ -181,7 +181,7 @@ class WalEventLog(_EventLogBase):
       append 前**同一 flock 内**复验（`Wal.append_frame`）。
     """
 
-    def __init__(self, path, clock: Optional[Clock] = None,
+    def __init__(self, path, clock: Clock | None = None,
                  fsync: bool = True) -> None:
         super().__init__(clock)
         # eventlog._lock：全序末位（进程内，无跨进程语义）
@@ -212,7 +212,7 @@ class WalEventLog(_EventLogBase):
         return self._fencing_lock is not None and self._fencing_reader is not None
 
     @property
-    def truncated_at(self) -> Optional[int]:
+    def truncated_at(self) -> int | None:
         return self._wal.truncated_at
 
     def append(self, kind, subject: str, payload=None, producer: str = "",

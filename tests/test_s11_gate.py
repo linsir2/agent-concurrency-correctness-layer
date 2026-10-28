@@ -13,7 +13,16 @@ from __future__ import annotations
 import pytest
 from conftest import make_harness
 
-from harness import ACB, Action, CapabilityToken, Harness, Result, Status, TaskState, Write
+from harness import (
+    ACB,
+    Action,
+    CapabilityToken,
+    Harness,
+    Result,
+    Status,
+    TaskState,
+    Write,
+)
 from harness import runtime as runtime_mod
 
 

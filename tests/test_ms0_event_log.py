@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import threading
 
-from harness import EventLog, EventKind
+from harness import EventKind, EventLog
 
 
 def test_event_log_seq_monotonic_under_concurrency():

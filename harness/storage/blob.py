@@ -13,7 +13,6 @@ from typing import Any, Protocol
 from .atomic import atomic_write
 from .codec import to_bytes
 
-
 _BYTES_PREFIX = b"\x00BYTES\x00"   # 魔数前缀：JSON 输出不会以 \x00 开头
 
 

@@ -47,8 +47,8 @@ def _primary_table(summary: dict) -> str:
      5 serialization | 6 wasted`。
     """
     lines = [
-        "| 负载 | 条件 | `lost_update_rate` | `conflict_rate_detected` "
-        "| `conflict_rate_silent` | `serialization_rate` | `wasted_work` |",
+        ("| 负载 | 条件 | `lost_update_rate` | `conflict_rate_detected` "
+         "| `conflict_rate_silent` | `serialization_rate` | `wasted_work` |"),
         "|---|---|---|---|---|---|---|",
     ]
     for wl in ("C0", "C1", "C2", "C3"):
@@ -115,7 +115,7 @@ def _scalability_table(secondary: dict) -> str:
         wall = pt.get("wall_ms") or pt.get("wall") or 0.0
         if base is None:
             base = wall if wall else 1.0
-        lines.append("| {} | {} ms | {:.2f} |".format(n, _fmt(wall), (wall / base) if base else 0.0))
+        lines.append(f"| {n} | {_fmt(wall)} ms | {(wall / base) if base else 0.0:.2f} |")
     return "\n".join(lines)
 
 
@@ -130,7 +130,7 @@ def _recovery_table(secondary: dict) -> str:
     ]
     lines = ["| 相位 | 耗时 |", "|---|---|"]
     for name, value in rows:
-        lines.append("| {} | {} ms |".format(name, _fmt(value or 0.0)))
+        lines.append(f"| {name} | {_fmt(value or 0.0)} ms |")
     return "\n".join(lines)
 
 
@@ -174,7 +174,7 @@ def regen(result_path: Path, report_path: Path) -> None:
 
     text = re.sub(
         re.escape(BEGIN) + r"<!-- (\w+) -->\n.*?" + re.escape(END),
-        _replace, text, flags=re.S,
+        _replace, text, flags=re.DOTALL,
     )
     report_path.write_text(text, encoding="utf-8")
 

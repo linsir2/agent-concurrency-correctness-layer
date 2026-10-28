@@ -18,10 +18,10 @@ import traceback
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
 
-import conftest as _c  # noqa: E402
-from conftest import _acb, admit, decision, make_harness, seed  # noqa: E402
+import conftest as _c
+from conftest import _acb, admit, decision, make_harness, seed
 
-from harness import (  # noqa: E402
+from harness import (
     ACB,
     EventKind,
     Harness,
@@ -29,8 +29,8 @@ from harness import (  # noqa: E402
     TaskState,
     Write,
 )
-from harness.checkpoint import FileCheckpointStore  # noqa: E402
-from harness.runtime import CrashInjected  # noqa: E402
+from harness.checkpoint import FileCheckpointStore
+from harness.runtime import CrashInjected
 
 
 def _count(h, kind):
@@ -294,7 +294,7 @@ def main(argv):
                     fn(Path(d))
             else:
                 fn()
-        except BaseException:
+        except BaseException:  # noqa: BLE001  # 逐条复现：失败继续跑下一条
             failed.append(num)
             print(f"[FAIL] 条目{num}: {fn.__doc__.strip()}")
             traceback.print_exc()

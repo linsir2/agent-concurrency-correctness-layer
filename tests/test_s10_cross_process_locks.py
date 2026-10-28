@@ -325,7 +325,7 @@ def test_s10_10_no_circular_import(module):
     """S10-10：`_FileLock` 下沉后无循环导入（子进程独立 import 断言）。"""
     proc = subprocess.run([sys.executable, "-c", f"import {module}"],
                           cwd=str(REPO_ROOT), capture_output=True, text=True,
-                          timeout=60)
+                          timeout=60, check=False)
     assert proc.returncode == 0, f"import {module} 失败：{proc.stderr}"
     assert "ImportError" not in proc.stderr
     assert "circular import" not in proc.stderr.lower()
@@ -353,17 +353,13 @@ def test_s10_11_reverse_acquisition_raises_lock_order_violation(tmp_path):
     store_lock = _FileLock(tmp_path / "store.lock", order=STORE_ORDER)
     receipts_lock = _FileLock(tmp_path / "receipts.lock", order=RECEIPTS_ORDER)
 
-    with store_lock():
-        with pytest.raises(LockOrderViolation):
-            with receipts_lock():
-                pass
+    with store_lock(), pytest.raises(LockOrderViolation), receipts_lock():
+        pass
 
     # 正序（receipts → wal → store）不抛
     wal_lock = _FileLock(tmp_path / "wal.lock", order=WAL_ORDER)
-    with receipts_lock():
-        with wal_lock():
-            with store_lock():
-                pass
+    with receipts_lock(), wal_lock(), store_lock():
+        pass
 
 
 # ================================================================ 终审 7-2

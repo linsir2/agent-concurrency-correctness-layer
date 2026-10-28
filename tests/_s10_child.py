@@ -27,8 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from harness import ACB, EventKind, Harness, Status, Write  # noqa: E402
-from harness.event_log import WalEventLog  # noqa: E402
+from harness import ACB, Harness, Status, Write
+from harness.event_log import WalEventLog
 
 SECRET = "s10b-cross-process-secret"
 WRITER_ID = "s10-6-shared-writer"

@@ -21,15 +21,19 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import harness.checkpoint as cp  # noqa: E402
-from harness import ACB, EventKind, EventLog, Harness, Write  # noqa: E402
-from harness.checkpoint import FileCheckpointStore, atomic_write  # noqa: E402
-from harness.spec.receipt import (GENESIS_HASH, Receipt,  # noqa: E402
-                                  ReceiptMalformed, build_receipt,
-                                  receipt_hash)
-from harness.storage.atomic import fsync_dir, write_all  # noqa: E402
-from harness.storage.blob import BlobCorrupt, FileBlobStore  # noqa: E402
-from harness.storage.codec import dumps, loads  # noqa: E402
+import harness.checkpoint as cp
+from harness import ACB, EventKind, EventLog, Harness, Write
+from harness.checkpoint import FileCheckpointStore, atomic_write
+from harness.spec.receipt import (
+    GENESIS_HASH,
+    Receipt,
+    ReceiptMalformed,
+    build_receipt,
+    receipt_hash,
+)
+from harness.storage.atomic import fsync_dir, write_all
+from harness.storage.blob import BlobCorrupt, FileBlobStore
+from harness.storage.codec import dumps, loads
 
 
 def _acb(acb_id="A", gen=1):
@@ -184,9 +188,9 @@ def p2_3():
     print("P2-3 latest 指针无单调 CAS + 32bit hash + 不校验 acb_id")
 
     print(f"[BEFORE] 旧指针 hash sha256[:8]  = "
-          f"{hashlib.sha256('X'.encode()).hexdigest()[:8]}（32bit，~7 万 ACB 50% 碰撞）")
+          f"{hashlib.sha256(b'X').hexdigest()[:8]}（32bit，~7 万 ACB 50% 碰撞）")
     print(f"[AFTER]  新指针 hash sha256[:16] = "
-          f"{hashlib.sha256('X'.encode()).hexdigest()[:16]}（64bit）")
+          f"{hashlib.sha256(b'X').hexdigest()[:16]}（64bit）")
 
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
@@ -254,8 +258,9 @@ def p2_4():
 def p2_5():
     print("=" * 72)
     print("P2-5 dedup 检查在 scope 锁外 → 非原子（旧：链分叉；新：临界区内）")
-    from contextlib import nullcontext
     import threading
+    from contextlib import nullcontext
+
     import harness.harness as hm
 
     def run(use_nullcontext: bool) -> bool:

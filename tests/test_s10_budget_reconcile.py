@@ -214,7 +214,7 @@ def test_s10_4_tree_integrity_epoch_expiry(tmp_path):
     # epoch 过期：bump → 旧 epoch 的账被 fence（真实路径，不删任何文件）
     h1.bump_epoch("lease_expired")
     a2 = admit(h1, "R", plan, "T2")               # epoch 1
-    ref2 = h1.checkpoints.save(a2)
+    h1.checkpoints.save(a2)
     log.close()
 
     log2 = WalEventLog(wal)
@@ -234,7 +234,7 @@ def test_s10_4_tree_integrity_epoch_expiry(tmp_path):
     planb = _two_acb_plan(hb, "RB")
     b1 = admit(hb, "RB", planb, "T1")
     admit(hb, "RB", planb, "T2")
-    refb = hb.checkpoints.save(b1)
+    hb.checkpoints.save(b1)
     logb.close()
 
     logb2 = WalEventLog(wal_b)
@@ -263,7 +263,7 @@ def test_s10_5_global_reconciliation_equations(tmp_path):
     acb = ACB(id="A-S105", run_id="R", task_id="T1")
     acb.budget_node = h1.budget._nodes["C1"]
     acb.reservation_ids = [r1.reservation_id]
-    ref = h1.checkpoints.save(acb)
+    h1.checkpoints.save(acb)
     log.close()
 
     log2 = WalEventLog(wal)
@@ -376,7 +376,7 @@ def test_s10_budget_event_payload_shape(tmp_path):
     """预算事件 payload 必含 node_id/rid/amount/consumed/state/limits/parent_id/epoch。"""
     root = tmp_path / "cp"
     h = Harness(run_limits=1000, checkpoint_root=str(root))
-    node = h.budget.create_node("B", 100)
+    h.budget.create_node("B", 100)
     resv = h.budget.reserve("B", 10)
     assert h.budget.consume(resv.reservation_id, 3) == Status.OK
     kinds = _budget_event_kinds()

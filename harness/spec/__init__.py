@@ -8,16 +8,33 @@
 **规范与实现分离**：本包只定义契约，不依赖 `harness` 实现（可被任何实现引用）。
 """
 
+from .invariants import INVARIANT_IDS, INVARIANTS
+from .protocol import Die, Grant, Wait, decide
+from .receipt import (
+                      GENESIS_HASH,
+                      Receipt,
+                      build_receipt,
+                      receipt_hash,
+                      verify_chain,
+                      verify_chain_detailed,
+)
 from .resources import RESOURCE_KINDS, ResourceKind, ResourceSpec, resource_kind
-from .protocol import Grant, Wait, Die, decide
-from .receipt import (GENESIS_HASH, Receipt, build_receipt, receipt_hash,
-                      verify_chain, verify_chain_detailed)
-from .invariants import INVARIANTS, INVARIANT_IDS
 
 __all__ = [
-    "RESOURCE_KINDS", "ResourceKind", "ResourceSpec", "resource_kind",
-    "Grant", "Wait", "Die", "decide",
-    "GENESIS_HASH", "Receipt", "build_receipt", "receipt_hash", "verify_chain",
-    "verify_chain_detailed",
-    "INVARIANTS", "INVARIANT_IDS",
+                      "GENESIS_HASH",
+                      "INVARIANTS",
+                      "INVARIANT_IDS",
+                      "RESOURCE_KINDS",
+                      "Die",
+                      "Grant",
+                      "Receipt",
+                      "ResourceKind",
+                      "ResourceSpec",
+                      "Wait",
+                      "build_receipt",
+                      "decide",
+                      "receipt_hash",
+                      "resource_kind",
+                      "verify_chain",
+                      "verify_chain_detailed",
 ]

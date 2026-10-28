@@ -13,8 +13,19 @@ from __future__ import annotations
 
 import pytest
 
-from harness import (ACB, EventKind, EventLog, ManualClock, Result, RunState,
-                     Status, TASK_TERMINAL, RUN_TERMINAL, TaskState, advance)
+from harness import (
+    ACB,
+    RUN_TERMINAL,
+    TASK_TERMINAL,
+    EventKind,
+    EventLog,
+    ManualClock,
+    Result,
+    RunState,
+    Status,
+    TaskState,
+    advance,
+)
 
 pytestmark = pytest.mark.ms0
 

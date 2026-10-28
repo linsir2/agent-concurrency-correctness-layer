@@ -119,7 +119,8 @@ class RscSession:
         if not self._index_path or not os.path.isfile(self._index_path):
             return
         try:
-            raw = _loads(open(self._index_path, "r", encoding="utf-8").read())
+            with open(self._index_path, "r", encoding="utf-8") as fh:
+                raw = _loads(fh.read())
         except Exception:  # noqa: BLE001
             return
         if isinstance(raw, dict):

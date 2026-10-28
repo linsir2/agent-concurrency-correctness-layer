@@ -22,7 +22,6 @@ from __future__ import annotations
 import threading
 
 import pytest
-
 from conftest import decision, finish, tool
 
 from harness import ACB, CapabilityToken, EventKind, Harness, Scope, Status, TaskState
@@ -564,7 +563,7 @@ def test_s13_c1_pending_ref_none_cancel_finds_child_by_id():
 def test_s13_c1_missing_child_snapshot_settles_orphan_budget_not_silently():
     """C1：子快照不存在但父节点的 ACTIVE 预留存在 → 孤儿结算 + 事件留痕。"""
     h = _bare_with_token(run_limits=100)
-    plan, parent = _parent_plan(h, "SPO", min_budget=2, child_alloc=20)
+    _plan, parent = _parent_plan(h, "SPO", min_budget=2, child_alloc=20)
     cid = "A-SPO-C-orphan"
     info = {"task_id": "C", "min_budget": 2, "slice": 6,
             "run_id": "SPO", "logical_subgoal_id": "S-C", "depth": 1,
@@ -854,7 +853,7 @@ def test_result_envelope_all_cancelled_is_not_done_partial():
 def test_result_envelope_missing_child_requires_reconciliation():
     """C3：`children_ids` 有、内存/快照都没有 → NEEDS_RECONCILIATION（绝不 DONE）。"""
     h = _bare_with_token(run_limits=100)
-    plan, parent = _parent_plan(h, "SPENV2", min_budget=2, child_alloc=20)
+    _plan, parent = _parent_plan(h, "SPENV2", min_budget=2, child_alloc=20)
     parent.children_ids = [("A-ghost", None)]
 
     env = h.result_envelope(parent)

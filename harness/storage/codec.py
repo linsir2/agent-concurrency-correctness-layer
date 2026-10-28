@@ -19,7 +19,6 @@ from typing import Any
 
 from ..rebase import DELETE
 
-
 _DELETE_TAG = {"__type__": "DELETE"}
 _BYTES_TYPE = "bytes"
 
@@ -71,7 +70,7 @@ def _decode(v: Any) -> Any:
                     and isinstance(v["data"], str)):
                 try:
                     return base64.b64decode(v["data"].encode("ascii"), validate=True)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     raise CodecError("bytes tag 非法") from exc
             raise CodecError(f"未知 __type__ tag：{tag!r}")
         return {key: _decode(value) for key, value in v.items()}

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import pytest
-
 from conftest import admit, decision, finish, make_harness
 
 from harness import ACB, Harness, Status, TaskState

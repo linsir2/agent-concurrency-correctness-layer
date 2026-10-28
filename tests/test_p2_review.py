@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from conftest import _acb, make_harness, seed
 
 from harness import ACB, EventKind, Harness, Mode, ReceiptConflict, Status, Write
@@ -254,8 +253,7 @@ def test_p2_7_blob_get_validates_content_hash(tmp_path):
 
 def test_p2_7_missing_blob_isolated_not_silent(tmp_path):
     """P2-7：重建遇缺失 blob → 隔离（记入 `isolated_resources`），不静默。"""
-    from harness import WorkspaceManager
-    from harness import IntentRegistry
+    from harness import IntentRegistry, WorkspaceManager
 
     log = WalEventLog(str(tmp_path / "wal.log"))
     ws = WorkspaceManager(log, IntentRegistry())

@@ -18,7 +18,6 @@ import dataclasses
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any
 
 from harness import Action, Decision, Write
 

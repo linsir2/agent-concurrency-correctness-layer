@@ -16,7 +16,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 
 # ---------------------------------------------------------------- §3.1 数据结构
@@ -100,7 +100,7 @@ class DeleteResource:
         return (_delete_singleton, ())
 
 
-def _delete_singleton() -> "DeleteResource":
+def _delete_singleton() -> DeleteResource:
     return DELETE
 
 
@@ -169,12 +169,12 @@ def _coerce_policy(v: Any) -> MergePolicy:
     return _POLICY_ALIASES.get(key, MergePolicy.PIVOT)
 
 
-def _resolve_policy(path: str, policy: Optional[dict]) -> Optional[MergePolicy]:
+def _resolve_policy(path: str, policy: dict | None) -> MergePolicy | None:
     """§3.2 解析规则：最长前缀优先；同长度歧义 → PIVOT；无命中 → None（按类型缺省）。"""
     if not policy:
         return None
     best_len = -1
-    best_policy: Optional[MergePolicy] = None
+    best_policy: MergePolicy | None = None
     for k, v in policy.items():
         key = "" if k is None else str(k)
         if key == "":
@@ -215,7 +215,7 @@ def _strict_in(x: Any, seq) -> bool:
 
 
 def _merge(base: Any, local: Any, committed: Any, path: str,
-           policy: Optional[dict], conflicts: list) -> Any:
+           policy: dict | None, conflicts: list) -> Any:
     """递归合并；返回合并值，冲突时返回 MISSING。"""
     # ① 类型检查（先于相等性比较，避免 1==True / 1==1.0 静默合并）
     if not (_kind(base) == _kind(local) == _kind(committed)):
@@ -243,7 +243,7 @@ def _merge(base: Any, local: Any, committed: Any, path: str,
 
 # ---------------------------------------------------------------- §4.3 对象
 def _merge_object(base: Any, local: Any, committed: Any, path: str,
-                  policy: Optional[dict], conflicts: list) -> Any:
+                  policy: dict | None, conflicts: list) -> Any:
     b = base if isinstance(base, dict) else {}
     l = local if isinstance(local, dict) else {}
     c = committed if isinstance(committed, dict) else {}
@@ -286,7 +286,7 @@ def _merge_object(base: Any, local: Any, committed: Any, path: str,
 
 # ---------------------------------------------------------------- §4.2 数组
 def _merge_array(base: Any, local: Any, committed: Any, path: str,
-                 policy: Optional[dict], conflicts: list) -> Any:
+                 policy: dict | None, conflicts: list) -> Any:
     p = _resolve_policy(path, policy)           # §3.2
     if p is MergePolicy.REPLACE:
         return _deepcopy(committed)
@@ -317,7 +317,7 @@ def _merge_array(base: Any, local: Any, committed: Any, path: str,
 
 # ---------------------------------------------------------------- 公开入口
 def merge3(base: Any, local: Any, committed: Any,
-           policy: Optional[dict] = None) -> MergeResult:
+           policy: dict | None = None) -> MergeResult:
     """JSON-aware 3-way merge（§4）。
 
     :param base:    合并基线（无 pre-image 时为 MISSING）

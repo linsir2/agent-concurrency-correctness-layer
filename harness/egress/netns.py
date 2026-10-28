@@ -321,10 +321,10 @@ def spawn_userns(argv: Sequence[str], **popen_kwargs) -> subprocess.Popen:
       **必须**含 `--net`；完整 argv 探针不过 → 同样拒绝（**不静默降级**为
       无 `--net` 或残缺 argv）。
     """
-    from . import SandboxUnavailable
-
     import shutil as _shutil
     import sys as _sys
+
+    from . import SandboxUnavailable
     if _shutil.which("unshare") is None:
         reason = "unshare 不可用（util-linux 未安装）→ 无法建立 netns 隔离"
         register_degradation("unshare", reason)
@@ -349,8 +349,8 @@ __all__ = [
     "USERNS_ARGV",
     "USERNS_SHORT",
     "create_netns",
-    "delete_netns",
     "degradations",
+    "delete_netns",
     "ip_path",
     "netns_available",
     "register_degradation",

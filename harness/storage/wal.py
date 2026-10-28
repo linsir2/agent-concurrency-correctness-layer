@@ -34,11 +34,19 @@ import struct
 import uuid
 import zlib
 from pathlib import Path
+from typing import Self
 
 from ..types import EventKind
-from ._lock import (EPOCH_ORDER, FencingRejected, WAL_ORDER, _FileLock,
-                    wal_epoch_lock_path, wal_epoch_path, wal_generation_path,
-                    wal_lock_path)
+from ._lock import (
+    EPOCH_ORDER,
+    WAL_ORDER,
+    FencingRejected,
+    _FileLock,
+    wal_epoch_lock_path,
+    wal_epoch_path,
+    wal_generation_path,
+    wal_lock_path,
+)
 from .atomic import atomic_write, fsync_dir, write_all
 
 MAGIC = b"MWAL"
@@ -179,8 +187,7 @@ class Wal:
                 if isinstance(seq, int):
                     self._receipt_index.append((seq, rec.get("payload")))
                     self._receipt_index_keys.append(seq)
-                    if seq > self._receipt_index_seq:
-                        self._receipt_index_seq = seq
+                    self._receipt_index_seq = max(self._receipt_index_seq, seq)
             self._indexed_frame += 1
 
     def receipts_from(self, watermark: int = 0) -> list[tuple[int, dict]]:
@@ -294,7 +301,7 @@ class Wal:
         except OSError:
             pass
 
-    def __enter__(self) -> "Wal":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc) -> None:

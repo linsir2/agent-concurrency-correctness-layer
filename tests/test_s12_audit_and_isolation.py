@@ -27,11 +27,28 @@ import threading
 import pytest
 from _egress_env import FEATURE_UNSHARE, probe_environment, register, unshare_available
 
-from harness import (ACB, EpochStore, EventKind, Harness, Lease,
-                     ReceiptScanFailed, Result, Status, TaskState, Write,
-                     create_production_harness)
-from harness.egress import (EgressStatus, EgressUnavailable, SandboxUnavailable,
-                            container, lsm, netns, probe)
+from harness import (
+    ACB,
+    EpochStore,
+    EventKind,
+    Harness,
+    Lease,
+    ReceiptScanFailed,
+    Result,
+    Status,
+    TaskState,
+    Write,
+    create_production_harness,
+)
+from harness.egress import (
+    EgressStatus,
+    EgressUnavailable,
+    SandboxUnavailable,
+    container,
+    lsm,
+    netns,
+    probe,
+)
 from harness.event_log import WalEventLog
 from harness.storage.wal import Wal
 
@@ -615,7 +632,7 @@ def test_s12_5_probe_is_cached_per_session(monkeypatch):
 def test_s12_5_probe_and_degradation_are_registered_consistently():
     """探针结果与降级登记口径一致（环境 invalid 不得静默）。"""
     snap = probe_environment()
-    ok, reason = netns.userns_available()
+    ok, _reason = netns.userns_available()
     if not ok:
         assert netns.degradations(), "netns 后端不可用必须登记降级"
     else:

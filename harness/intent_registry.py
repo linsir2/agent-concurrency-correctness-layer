@@ -235,8 +235,7 @@ class IntentRegistry:
             epoch = int(epoch or 0)
             if self._run_scoped(run_id):
                 return self._epoch_store.set_epoch(run_id, epoch)
-            if epoch > self._epoch:
-                self._epoch = epoch
+            self._epoch = max(self._epoch, epoch)
             return self._epoch
 
     def compatible(self, dep_id: str, agent_id: str, kind: str = "CONTRACT") -> bool:

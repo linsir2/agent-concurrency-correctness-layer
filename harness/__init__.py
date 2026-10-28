@@ -15,55 +15,137 @@
 （替换点见 `docs/milestones.md` §1.3「可扩展点」）。
 """
 
-from .types import (
-    Resource, Lease, Event, ACB, Write, Decision, Action, Result,
-    ResultEnvelope,
-    ReceiptConflict,
-    Status, Mode, EventKind, TaskState, RunState, TASK_TERMINAL, RUN_TERMINAL,
-    TRANSITIONS, advance,
-)
-from .clock import Clock, SystemClock, ManualClock
-from .event_log import EventLog, WalEventLog
-from .intent_registry import IntentRegistry
-from .workspace import WorkspaceManager, WorkspaceVersionStore
+from .auth import MissingSecret, Signer
 from .budget import BudgetManager, InvariantError, Reservation
-from .checkpoint import (CheckpointCorrupt, CheckpointStore, EffectEntry,
-                         EffectJournal, FileCheckpointStore)
+from .checkpoint import (
+    CheckpointCorrupt,
+    CheckpointStore,
+    EffectEntry,
+    EffectJournal,
+    FileCheckpointStore,
+)
+from .clock import Clock, ManualClock, SystemClock
 from .compensation import CompensationJournal, CompEntry
-from .subscription import SubscriptionRegistry
-from .policy import (CapabilityAttenuationError, CapabilityToken, PolicyEngine,
-                     Scope, attenuate_token)
-from .auth import Signer, MissingSecret
 from .context import ContextAssembler
+from .event_log import EventLog, WalEventLog
+from .facade import Allow, Deny, Receipt, RscSession, Token, Wait
+from .harness import EpochStore, Harness, ReceiptScanFailed, create_production_harness
+from .intent_registry import IntentRegistry
+from .orchestration import (
+    HITL,
+    Dispatcher,
+    Planner,
+    ReconcileLoop,
+    RunCoordinator,
+    Scheduler,
+    SlotTracker,
+)
+from .policy import (
+    CapabilityAttenuationError,
+    CapabilityToken,
+    PolicyEngine,
+    Scope,
+    attenuate_token,
+)
+from .rebase import DELETE, MISSING, Conflict, MergePolicy, MergeResult, merge3
 from .resolver import ConflictResolver, LLMResolver, ScriptedResolver
 from .runtime import AgentRuntime
-from .orchestration import (Planner, Dispatcher, Scheduler, SlotTracker,
-                            RunCoordinator, ReconcileLoop, HITL)
-from .harness import (EpochStore, Harness, ReceiptScanFailed,
-                     create_production_harness)
-from .facade import (RscSession, Allow, Deny, Receipt, Token, Wait)
-from .rebase import (MISSING, DELETE, Conflict, MergePolicy, MergeResult, merge3)
+from .subscription import SubscriptionRegistry
+from .types import (
+    ACB,
+    RUN_TERMINAL,
+    TASK_TERMINAL,
+    TRANSITIONS,
+    Action,
+    Decision,
+    Event,
+    EventKind,
+    Lease,
+    Mode,
+    ReceiptConflict,
+    Resource,
+    Result,
+    ResultEnvelope,
+    RunState,
+    Status,
+    TaskState,
+    Write,
+    advance,
+)
+from .workspace import WorkspaceManager, WorkspaceVersionStore
 
 __all__ = [
-    "Resource", "Lease", "Event", "ACB", "Write", "Decision", "Action",
-    "Result", "ResultEnvelope", "Reservation", "ReceiptConflict",
-    "Status", "Mode", "EventKind", "TaskState", "RunState",
-    "TASK_TERMINAL", "RUN_TERMINAL", "TRANSITIONS", "advance",
-    "Clock", "SystemClock", "ManualClock",
-    "EventLog", "WalEventLog", "IntentRegistry", "WorkspaceManager", "WorkspaceVersionStore",
-    "BudgetManager", "CheckpointStore", "CheckpointCorrupt",
-    "FileCheckpointStore", "EffectJournal", "EffectEntry",
-    "CompensationJournal", "CompEntry",
-    "SubscriptionRegistry",
-    "PolicyEngine", "CapabilityToken", "Signer", "MissingSecret",
-    "Scope", "attenuate_token", "CapabilityAttenuationError",
-    "ContextAssembler", "AgentRuntime",
-    "InvariantError",
-    "ConflictResolver", "ScriptedResolver", "LLMResolver",
-    "Planner", "Dispatcher", "Scheduler", "SlotTracker", "RunCoordinator",
-    "ReconcileLoop", "HITL",
+    "ACB",
+    "DELETE",
+    "HITL",
+    "MISSING",
+    "RUN_TERMINAL",
+    "TASK_TERMINAL",
+    "TRANSITIONS",
+    "Action",
+    "AgentRuntime",
+    "Allow",
+    "BudgetManager",
+    "CapabilityAttenuationError",
+    "CapabilityToken",
+    "CheckpointCorrupt",
+    "CheckpointStore",
+    "Clock",
+    "CompEntry",
+    "CompensationJournal",
+    "Conflict",
+    "ConflictResolver",
+    "ContextAssembler",
+    "Decision",
+    "Deny",
+    "Dispatcher",
+    "EffectEntry",
+    "EffectJournal",
+    "EpochStore",
+    "Event",
+    "EventKind",
+    "EventLog",
+    "FileCheckpointStore",
     "Harness",
-    "EpochStore", "ReceiptScanFailed", "create_production_harness",
-    "RscSession", "Token", "Wait", "Deny", "Receipt", "Allow",
-    "MISSING", "DELETE", "Conflict", "MergePolicy", "MergeResult", "merge3",
+    "IntentRegistry",
+    "InvariantError",
+    "LLMResolver",
+    "Lease",
+    "ManualClock",
+    "MergePolicy",
+    "MergeResult",
+    "MissingSecret",
+    "Mode",
+    "Planner",
+    "PolicyEngine",
+    "Receipt",
+    "ReceiptConflict",
+    "ReceiptScanFailed",
+    "ReconcileLoop",
+    "Reservation",
+    "Resource",
+    "Result",
+    "ResultEnvelope",
+    "RscSession",
+    "RunCoordinator",
+    "RunState",
+    "Scheduler",
+    "Scope",
+    "ScriptedResolver",
+    "Signer",
+    "SlotTracker",
+    "Status",
+    "SubscriptionRegistry",
+    "SystemClock",
+    "TaskState",
+    "Token",
+    "Wait",
+    "WalEventLog",
+    "WorkspaceManager",
+    "WorkspaceVersionStore",
+    "Write",
+    "advance",
+    "attenuate_token",
+    "create_production_harness",
+    "merge3",
 ]

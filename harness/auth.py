@@ -20,7 +20,7 @@ import os
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 
 class MissingSecret(Exception):
@@ -52,7 +52,7 @@ class Signer:
         self._lock = threading.Lock()
 
     @classmethod
-    def from_env(cls, env: str = "HARNESS_AUTH_SECRET") -> "Signer":
+    def from_env(cls, env: str = "HARNESS_AUTH_SECRET") -> Signer:
         """从环境变量读取 secret；缺失 → `MissingSecret`（fail-closed）。"""
         return cls(os.environ.get(env, ""))
 
@@ -127,7 +127,7 @@ class Signer:
         mutated = bytes([raw[0] ^ 0xFF]) + raw[1:]
         return f"{body}.{_b64encode(mutated)}"
 
-    def gc_seen(self, now: Optional[float] = None) -> int:
+    def gc_seen(self, now: float | None = None) -> int:
         """清理已过期的 `jti`（TTL 至 `exp`）。"""
         now = time.time() if now is None else now
         with self._lock:

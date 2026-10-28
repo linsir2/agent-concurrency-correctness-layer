@@ -17,10 +17,8 @@ import hashlib
 import ipaddress
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .auth import MissingSecret
-
 
 # S11a §2.1：data_class 分级序（低 → 高）；token 的等级即「可访问的最高等级」。
 _DATA_CLASS_LEVELS = {
@@ -45,10 +43,10 @@ class Scope:
     tools: set[str] = field(default_factory=set)
     paths: set[str] = field(default_factory=set)
     network: set[str] = field(default_factory=set)
-    data_class: Optional[str] = None
+    data_class: str | None = None
 
 
-def _lower_class(a: str, b: Optional[str]) -> str:
+def _lower_class(a: str, b: str | None) -> str:
     """按分级序取**更低**的 data_class（S13c P0-7）。
 
     ❌ `min("public", "confidential") == "confidential"`（字面量比较 → 越权）；
@@ -203,7 +201,7 @@ def _scope_of_token(token) -> dict:
     }
 
 
-def _token_contains_scope(child: "CapabilityToken", scope: dict) -> bool:
+def _token_contains_scope(child: CapabilityToken, scope: dict) -> bool:
     """`child` 是否 ⊆ 给定父能力快照（语义包含，C4）。"""
     if not _paths_contains(set(scope.get("paths") or ()), child.paths):
         return False
@@ -211,9 +209,8 @@ def _token_contains_scope(child: "CapabilityToken", scope: dict) -> bool:
                               child.network):
         return False
     p_tools = set(scope.get("tools") or ())
-    if "*" not in p_tools:
-        if "*" in child.tools or not (child.tools <= p_tools):
-            return False
+    if "*" not in p_tools and ("*" in child.tools or not (child.tools <= p_tools)):
+        return False
     pd = scope.get("data_class", "public") or "public"
     cd = child.data_class
     if pd == "*":
@@ -225,7 +222,7 @@ def _token_contains_scope(child: "CapabilityToken", scope: dict) -> bool:
     return cc <= pc
 
 
-def _token_contains(child: "CapabilityToken", parent: "CapabilityToken") -> bool:
+def _token_contains(child: CapabilityToken, parent: CapabilityToken) -> bool:
     """`child` 每一维是否 ⊆ `parent`（父 `"*"` 视作全集；C4 语义包含）。"""
     if not _paths_contains(set(getattr(parent, "paths", ()) or ()),
                            set(getattr(child, "paths", ()) or ())):
@@ -235,9 +232,8 @@ def _token_contains(child: "CapabilityToken", parent: "CapabilityToken") -> bool
         return False
     p_tools = set(getattr(parent, "tools", ()) or ())
     c_tools = set(getattr(child, "tools", ()) or ())
-    if "*" not in p_tools:
-        if "*" in c_tools or not (c_tools <= p_tools):
-            return False
+    if "*" not in p_tools and ("*" in c_tools or not (c_tools <= p_tools)):
+        return False
     pd = getattr(parent, "data_class", "public")
     cd = getattr(child, "data_class", "public")
     if pd == "*":
@@ -249,8 +245,8 @@ def _token_contains(child: "CapabilityToken", parent: "CapabilityToken") -> bool
     return cc <= pc
 
 
-def attenuate_token(parent: "CapabilityToken", requested: Scope,
-                    child_id: str) -> "CapabilityToken":
+def attenuate_token(parent: CapabilityToken, requested: Scope,
+                    child_id: str) -> CapabilityToken:
     """S13c §2.4 P0-7：子能力 = parent ∩ requested；`data_class` 按分级序取低。
 
     这是**唯一**给子签发能力（派生）的路径；`policy.issue` 的合同保持不变
@@ -282,7 +278,7 @@ def attenuate_token(parent: "CapabilityToken", requested: Scope,
     return token
 
 
-def _split_host_port(entry: str) -> tuple[str, Optional[int]]:
+def _split_host_port(entry: str) -> tuple[str, int | None]:
     """拆分 `host[:port]`（兼容 IPv6 方括号写法 `[::1]:443`）。"""
     text = (entry or "").strip()
     if not text:
@@ -314,12 +310,12 @@ def _ip_in_cidr(host: str, cidr: str) -> bool:
 class CapabilityToken:
     """四维 scope（tool / path / network / data_class），支持 `"*"` 通配。"""
 
-    def __init__(self, agent_id: str = "", tools: Optional[set[str]] = None,
-                 paths: Optional[set[str]] = None,
-                 network: Optional[set[str]] = None,
+    def __init__(self, agent_id: str = "", tools: set[str] | None = None,
+                 paths: set[str] | None = None,
+                 network: set[str] | None = None,
                  data_class: str = "public",
                  parent_id: str = "",
-                 parent_scope: Optional[dict] = None,
+                 parent_scope: dict | None = None,
                  parent_scope_digest: str = "") -> None:
         self.agent_id = agent_id
         self.tools = set(tools or ())
@@ -396,7 +392,7 @@ class PolicyEngine:
     """
 
     def __init__(self, default_allow: bool = False,
-                 default_token: Optional[CapabilityToken] = None,
+                 default_token: CapabilityToken | None = None,
                  *, signer_factory=None) -> None:
         self._tokens: dict[str, object] = {}
         # 终审 1-2：同一 token 值只验签一次。`Signer.verify` 的 jti 去重是**消息
@@ -408,9 +404,9 @@ class PolicyEngine:
         self._signer_factory = signer_factory
 
     # ---- 签发 ------------------------------------------------------
-    def mint(self, agent_id: str, *, tools: Optional[set[str]] = None,
-             paths: Optional[set[str]] = None,
-             network: Optional[set[str]] = None,
+    def mint(self, agent_id: str, *, tools: set[str] | None = None,
+             paths: set[str] | None = None,
+             network: set[str] | None = None,
              data_class: str = "public", exp=None) -> str:
         """签发 HMAC token（§5.9：委托 `auth`）。缺失 signer → `MissingSecret`。
 
@@ -425,9 +421,9 @@ class PolicyEngine:
         self._tokens[agent_id] = token
         return token
 
-    def issue(self, arg, *, tools: Optional[set[str]] = None,
-              paths: Optional[set[str]] = None,
-              network: Optional[set[str]] = None,
+    def issue(self, arg, *, tools: set[str] | None = None,
+              paths: set[str] | None = None,
+              network: set[str] | None = None,
               data_class: str = "public",
               allow_legacy: bool = False) -> CapabilityToken:
         """两种用法：
@@ -447,7 +443,7 @@ class PolicyEngine:
         return token
 
     # ---- 能力判定（五参 + 四维）------------------------------------
-    def resolve_token(self, token) -> Optional[CapabilityToken]:
+    def resolve_token(self, token) -> CapabilityToken | None:
         """把 token 归一为 `CapabilityToken`；无法解析 / 过期 → `None`。
 
         gateway / 准入必须走本入口（终审 1-1：只判 `token is not None` 会让
@@ -588,9 +584,7 @@ class PolicyEngine:
             return False
         if network and not resolved.allows_network(network):
             return False
-        if data_class and not resolved.allows_data_class(data_class):
-            return False
-        return True
+        return not data_class or resolved.allows_data_class(data_class)
 
     def allows_network(self, token, host: str) -> bool:
         resolved = self._resolve(token)

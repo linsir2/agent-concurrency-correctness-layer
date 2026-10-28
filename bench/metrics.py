@@ -13,13 +13,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from typing import Any
 
 from harness import Status
 from harness.storage.blob import canonical_bytes
 
 from .workloads import Workload, collect_writes
-
 
 _ABSENT = object()
 
@@ -173,7 +171,7 @@ def cell_metrics(result, workload: Workload) -> dict:
     def pct(p: float) -> float:
         if not lat:
             return 0.0
-        idx = min(n - 1, max(0, int(math.ceil(p / 100.0 * n)) - 1))
+        idx = min(n - 1, max(0, math.ceil(p / 100.0 * n) - 1))
         return lat[idx]
 
     total_commits = conf["total_commits"]
