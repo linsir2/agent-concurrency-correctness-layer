@@ -655,4 +655,21 @@ class RscMiddleware:
 
 - CrewAI（`scoped_hooks`）+ OpenAI Agents SDK（guardrails + MCP）+ AG2 + HTTP sidecar
 - extras 打包与 3-agent 示例
-- 真机 DAG 演示（DashScope）
+
+### 13.6 真机 DAG（2026-10-28，DashScope）
+
+`scripts/demo_dag.py` 3 节点（arch + api → summary）跑通真模型：
+
+| 项 | 结果 |
+|---|---|
+| 模型 | `qwen3.7-flash`（OpenAI 兼容端点） |
+| 每节点 | `begin` → 模型生成 → 写 Z3 → `apply` → `finish`，各得 1 张收据，`version=1` |
+| A 并发写 | 先写者 `Receipt`、后写者 `Conflict`，账本保留 `racer-1 wins` |
+| B 同键重试 | `receipt_id` 相同、`dedup=True` |
+| C 忘记 finish | `tick()` 退回 20 预算并回收 token |
+| 离线对照 | `--fake` 同三条保证全过 |
+
+沙箱只有代理出口，而 `build_opener()` **按设计**禁环境代理（防钉住/凭证隔离失效）。
+为此 `LLMClient`/`_post` 增加 `opener` 注入点（默认仍走钉住 opener），演示脚本用
+`--via-proxy` 显式选择代理出口，并打印「绕过 DNS 钉住，仅演示用」提示。
+**生产不得使用 `--via-proxy`**（见 §13.4 与 `harness/egress/resolver.py` 头注释）。
