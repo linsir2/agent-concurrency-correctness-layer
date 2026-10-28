@@ -327,6 +327,8 @@ class ACB:
     # ---- S13-0 §2.1：一次性 schema 迁移（均用 `.get()` 读，兼容旧 checkpoint）----
     hitl_pending: dict | None = None      # {"approval_id","deadline_ms","plan_version"}
     hitl_outcome: dict | None = None      # {"decision","reason","approval_id"}（结算后）
-    replan_count: int = 0
+    replan_count: int = 0                 # 成功 replan 计数（预算）；失败回滚
+    replan_attempts: int = 0              # R4：尝试计数（永不回滚，熔断 replan 风暴）
+    superseded: bool = False              # R7：已被 replan/requeue 取代的旧 ACB
     parent_id: str = ""                   # 父 ACB id（spawn_child 用，空 = 无父）
     children_ids: list = field(default_factory=list)  # [(acb_id, checkpoint_ref)]

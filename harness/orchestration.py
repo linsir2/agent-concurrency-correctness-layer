@@ -36,9 +36,11 @@ def _edge_endpoints(edge) -> tuple:
     return edge[0], edge[1]
 
 
-# S13b §2.3：前驱闸门与 ready 重建必须共用**同一套终态定义**（此前一处只认
-# DONE、另一处认 DONE+CANCELLED → alias 修复后两边判定分裂）。
-PREDECESSOR_SATISFIED = frozenset({TaskState.DONE, TaskState.CANCELLED})
+# S13b §2.3：前驱闸门与 ready 重建必须共用**同一套终态定义**。
+# R3：**CANCELLED 不算前驱满足**。取消/失败代表依赖分支已死；若把 CANCELLED
+# 当「满足」，`_finalize` 会把后继推起来真跑（拿到了从未产出的输入）。
+# 取消必须由 `propagate_failure` 级联到后继，而不是放行。
+PREDECESSOR_SATISFIED = frozenset({TaskState.DONE})
 
 
 def _has_cycle(edges) -> bool:
@@ -98,9 +100,23 @@ class Planner:
     def __init__(self, harness) -> None:
         self.h = harness
         self._counter = itertools.count(1)
-        # 供 `resolve_alias(old_id)`（无 plan 参数调用）兜底；有 plan 时以
-        # plan["_id_aliases"] 为准，避免跨 run 串味。
-        self._id_aliases: dict[str, str] = {}
+
+    @staticmethod
+    def _validate_subgoals(tasks: dict) -> None:
+        """R11：`logical_subgoal_id` 在**同一 plan 内必须唯一**（fail-fast）。
+
+        idem_key / 收据 scope / effect 去重都以 `(run_id, logical_subgoal_id)`
+        为键；两个任务共享同一 subgoal 会让「一个完成」误当成「两个都完成」
+        （`_finalize` 的同 subgoal 后继命中），也会让副作用去重串味。
+        """
+        seen: set[str] = set()
+        for task in tasks.values():
+            subgoal = task.get("logical_subgoal_id")
+            if not subgoal:
+                continue
+            if subgoal in seen:
+                raise ValueError(f"duplicate logical_subgoal_id: {subgoal!r}")
+            seen.add(subgoal)
 
     def plan(self, run_id: str, tasks: list[dict]) -> dict:
         plan = {"run_id": run_id, "version": 1, "tasks": {}, "edges": []}
@@ -120,22 +136,24 @@ class Planner:
                 "state": TaskState.PLANNED,
                 "plan_version": 1,
             }
+        self._validate_subgoals(plan["tasks"])
         self.h.event_log.append(EventKind.PLAN_CREATED, run_id, {"tasks": list(plan["tasks"])})
         return plan
 
-    def resolve_alias(self, old_id: str, plan: dict | None = None) -> str:
+    def resolve_alias(self, old_id: str, plan: dict | None) -> str:
         """`old_id` → 稳定 `logical_subgoal_id`（**一跳解析**，不做链式递归）。
 
         值**永远**是 `logical_subgoal_id`（不是下一个 task id）：这样
         `missing_deps` 直接复用 `add_logical_edge`（含环检测）也不会因 id 链
-        造出环（S13b K-65）。有 `plan` 时读该 plan 的 `_id_aliases`，否则退回
-        Planner 级累积表（兼容单参数调用）。
+        造出环（S13b K-65）。
+
+        R2：别名表**只属于单个 plan**（`plan["_id_aliases"]`）。没有该键 → 恒等
+        返回；**不存在 Planner 级全局回退**（全局表会让 Run A 的 patch 串到
+        Run B，把从未 patch 过的前驱误判为已满足）。
         """
-        aliases = None
-        if plan is not None:
-            aliases = plan.get("_id_aliases")
+        aliases = (plan or {}).get("_id_aliases")
         if not isinstance(aliases, dict):
-            aliases = self._id_aliases
+            return old_id
         return aliases.get(old_id, old_id)
 
     def task_for(self, plan: dict | None, task_id: str) -> dict | None:
@@ -164,10 +182,33 @@ class Planner:
         pool = current_c or candidates
         return max(pool, key=lambda t: int(t.get("plan_version", 0) or 0))
 
+    def _canonical_task_id(self, plan: dict, task_id: str) -> str | None:
+        """R10：把边端点规范化到**当前版本存在的 task id**（alias 一跳）。"""
+        task = self.task_for(plan, task_id)
+        return task.get("task_id") if isinstance(task, dict) else None
+
     def add_logical_edge(self, plan: dict, from_id: str, to_id: str) -> None:
-        """加逻辑边（§2.5）：先落边再做 DFS 环检测；**含环的边不落盘**。"""
+        """加逻辑边（§2.5）：先规范化端点并**按 `(from,to,kind)` 去重**，
+        再落边并做 DFS 环检测；**含环的边不落盘**。
+
+        R10：① 重复加同一条边是 replan 风暴下的常态（每次 patch 都读
+        `missing_deps`）→ 不去重会让 `edges` 无界增长；② `from`/`to` 仍写
+        改名前的旧 id 时，边会落在已不存在的 task 上 → 依赖形同虚设。
+        端点在当前 plan 中无法解析 → **fail-fast**（不静默落一条死边）。
+        """
         edges = plan.setdefault("edges", [])
-        edges.append({"from": from_id, "to": to_id, "kind": "LOGICAL"})
+        src = self._canonical_task_id(plan, from_id)
+        dst = self._canonical_task_id(plan, to_id)
+        if src is None or dst is None:
+            raise ValueError(f"logical edge unknown task: {from_id}->{to_id}")
+        for e in edges:
+            ef, et = _edge_endpoints(e)
+            kind = e.get("kind", "LOGICAL") if isinstance(e, dict) else "LOGICAL"
+            ef_c = self._canonical_task_id(plan, ef) or ef
+            et_c = self._canonical_task_id(plan, et) or et
+            if ef_c == src and et_c == dst and kind == "LOGICAL":
+                return                      # 同一依赖 → 幂等
+        edges.append({"from": src, "to": dst, "kind": "LOGICAL"})
         if _has_cycle(edges):
             edges.pop()
             raise ValueError(f"logical edge {from_id}->{to_id} would form a cycle")
@@ -195,6 +236,8 @@ class Planner:
         D6：任务改名（T1→T1'）后，边仍写旧 id；此处记录 `旧 id → logical_subgoal_id`
         别名，供 `_predecessors_done` / `rebuild_ready_set` / `_finalize` 三处
         统一解析，避免后继永久 `PREDECESSOR_NOT_DONE`。
+
+        R2：别名只写**本 plan 副本**的 `_id_aliases`，不再写 Planner 级全局表。
         """
         new_plan = copy.deepcopy(plan)
         new_plan["version"] = plan["version"] + 1
@@ -205,7 +248,6 @@ class Planner:
                 new_tid = f"{tid}'"
                 # 值保持稳定 logical id（不做 id 链）：一跳解析天然无环
                 id_aliases[tid] = task["logical_subgoal_id"]
-                self._id_aliases[tid] = task["logical_subgoal_id"]
                 task["task_id"] = new_tid
                 task["state"] = TaskState.PLANNED
                 task["plan_version"] = new_plan["version"]
@@ -214,7 +256,9 @@ class Planner:
                 task["plan_version"] = new_plan["version"]
                 remade[tid] = task
         new_plan["tasks"] = remade
-        # S13b §2.3：走 add_logical_edge（含 `_has_cycle`）而非裸 append
+        # R11：remake 后同一 subgoal 不得对应两个 task（否则一个完成会推出全部）
+        self._validate_subgoals(remade)
+        # S13b §2.3：走 add_logical_edge（含 `_has_cycle` + 去重 + 端点规范化）
         for dep in diagnosis.get("missing_deps", []):
             self.add_logical_edge(new_plan, dep["from"], dep["to"])
         event_draft = {
@@ -391,19 +435,31 @@ class Dispatcher:
 
     def try_admit(self, task: dict, run_id: str,
                   required_tools: set[str] | None = None,
-                  token=None, plan: dict | None = None) -> ACB:
+                  token=None, plan: dict | None = None, *,
+                  replace: bool = False) -> ACB:
         """准入谓词（文档 §5）：前驱 → slots → 能力 → 预算 → 逻辑，失败零残留。
 
         `plan` 可选：显式传入（生产入口）或从 `h.plans[run_id]` 取；
         **拿不到 plan/edges 时安全跳过**前驱闸门（向后兼容）。
+
+        R6：准入层按 `(run_id, task_id, plan_version)` 做唯一性登记。同一 key
+        已有**活跃** ACB（非终态、非隔离）→ 直接返回该 ACB，绝不再造一个
+        `A-...-{attempt}` 让 drain 双跑。`replace=True` 仅供显式重新准入
+        （`requeue_readmit`）使用。
         """
+        plan_version = int(task.get("plan_version", 1) or 1)
+        key = (run_id, task["task_id"], plan_version)
+        if not replace:
+            existing = self.h._lookup_admission(key)
+            if existing is not None:
+                return existing
         acb = ACB(id=f"A-{run_id}-{task['task_id']}-{self._next_attempt()}",
                   run_id=run_id, task_id=task["task_id"],
                   logical_subgoal_id=task["logical_subgoal_id"])
         # S13b D10：记录准入时的 plan 版本 —— `_finalize` / `_drain_scheduler`
         # 按 `(run_id, task_id, plan_version)` 解析「当前版本唯一 ACB」，
         # 避免 replan 后旧代际 ACB 被误跑（双跑）。
-        acb.spec["plan_version"] = int(task.get("plan_version", 1) or 1)
+        acb.spec["plan_version"] = plan_version
         if token is not None:                 # 显式 token 绑定到 ACB（§5.9）
             acb.capability = token
 
@@ -414,8 +470,16 @@ class Dispatcher:
             return self._deny(acb, "INVALID_INPUT")
 
         eff_plan = plan if plan is not None else self.h.plans.get(run_id)
-        if eff_plan is not None and not self._predecessors_done(eff_plan, task["task_id"]):
-            return self._deny(acb, "PREDECESSOR_NOT_DONE")
+        # R11：同一 plan 内 subgoal 唯一（共享 subgoal 会串 idem_key / 误判完成）
+        if eff_plan is not None:
+            dup = [t for t in eff_plan.get("tasks", {}).values()
+                   if isinstance(t, dict)
+                   and t.get("logical_subgoal_id") == task["logical_subgoal_id"]]
+            if len(dup) > 1:
+                acb.spec["admission_error"] = "DUPLICATE_SUBGOAL"
+                return self._deny(acb, "INVALID_INPUT")
+            if not self._predecessors_done(eff_plan, task["task_id"]):
+                return self._deny(acb, "PREDECESSOR_NOT_DONE")
 
         node = None
         resv = None
@@ -425,6 +489,9 @@ class Dispatcher:
             committed = self._try_admit_commit(
                 acb, task, required_tools, eff_plan)
         if committed:
+            if replace:
+                self.h._clear_admission(key)
+            self.h._register_admission(acb)
             self.h.budget.flush_pending()           # 成功 → 同帧 append_batch
         else:
             self.h.budget.discard_pending()         # 失败 → 丢弃草稿

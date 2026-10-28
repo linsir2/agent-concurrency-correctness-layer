@@ -292,6 +292,9 @@ class CheckpointStore:
             "hitl_pending": copy.deepcopy(getattr(acb, "hitl_pending", None)),
             "hitl_outcome": copy.deepcopy(getattr(acb, "hitl_outcome", None)),
             "replan_count": int(getattr(acb, "replan_count", 0) or 0),
+            # R4/R7：尝试计数（永不回滚）+ superseded（旧 ACB 已由 replan 取代）
+            "replan_attempts": int(getattr(acb, "replan_attempts", 0) or 0),
+            "superseded": bool(getattr(acb, "superseded", False)),
             "parent_id": getattr(acb, "parent_id", "") or "",
             "children_ids": _children_to_payload(
                 getattr(acb, "children_ids", None)),
@@ -759,47 +762,50 @@ class FileCheckpointStore(CheckpointStore):
 
     # ---- 写入 -------------------------------------------------------
     def save(self, acb) -> str:
-        payload = self._build_payload(acb)
-        with self._thread_lock, self._flock():
-            meta = self._read_meta_locked()
-            seq = int(meta.get("next_seq", 0) or 0)
-            meta["next_seq"] = seq + 1
-            atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
-            ref = f"CP-{str(meta['store_uuid'])[:8]}-{seq:020d}-{uuid.uuid4().hex[:12]}"
-            now_ms = int(time.time() * 1000)
-            header = {
-                "format_version": _FORMAT_VERSION,
-                "schema_version": _SCHEMA_VERSION,
-                "ref": ref,
-                "acb_id": acb.id,
-                "run_id": acb.run_id,
-                "task_id": acb.task_id,
-                "generation": int(acb.generation),
-                "save_seq": seq,
-                "created_at_ms": now_ms,
-                "event_cursor": int(payload.get("event_cursor") or 0),
-            }
-            encoded_payload = encode(payload)
-            payload_bytes = dumps(encoded_payload).encode("utf-8")
-            envelope = dict(header)
-            envelope["header_checksum"] = _sha256(dumps(header).encode("utf-8"))
-            envelope["payload_checksum"] = _sha256(payload_bytes)
-            envelope["payload"] = encoded_payload
+        # R7：`_build_payload` 读活跃 ACB / 预算节点的实时字段，必须与写入同临界区，
+        # 否则并发 `_finalize`/`replan` 会把半更新快照落到盘上（恢复出矛盾状态）。
+        with self._thread_lock:
+            payload = self._build_payload(acb)
+            with self._flock():
+                meta = self._read_meta_locked()
+                seq = int(meta.get("next_seq", 0) or 0)
+                meta["next_seq"] = seq + 1
+                atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
+                ref = f"CP-{str(meta['store_uuid'])[:8]}-{seq:020d}-{uuid.uuid4().hex[:12]}"
+                now_ms = int(time.time() * 1000)
+                header = {
+                    "format_version": _FORMAT_VERSION,
+                    "schema_version": _SCHEMA_VERSION,
+                    "ref": ref,
+                    "acb_id": acb.id,
+                    "run_id": acb.run_id,
+                    "task_id": acb.task_id,
+                    "generation": int(acb.generation),
+                    "save_seq": seq,
+                    "created_at_ms": now_ms,
+                    "event_cursor": int(payload.get("event_cursor") or 0),
+                }
+                encoded_payload = encode(payload)
+                payload_bytes = dumps(encoded_payload).encode("utf-8")
+                envelope = dict(header)
+                envelope["header_checksum"] = _sha256(dumps(header).encode("utf-8"))
+                envelope["payload_checksum"] = _sha256(payload_bytes)
+                envelope["payload"] = encoded_payload
 
-            ref_path = self._ref_path(ref)
-            self._ensure_dir(ref_path.parent)
-            self._write_new(ref_path, dumps(envelope).encode("utf-8"))
+                ref_path = self._ref_path(ref)
+                self._ensure_dir(ref_path.parent)
+                self._write_new(ref_path, dumps(envelope).encode("utf-8"))
 
-            self._write_pointer(self._latest_path("latest", acb.id),
-                                ref, acb, seq, now_ms)
-            self._write_pointer(self._latest_path("latest_run", acb.run_id),
-                                ref, acb, seq, now_ms)
-            self._write_pointer(self._task_pointer_path(acb),
-                                ref, acb, seq, now_ms)
+                self._write_pointer(self._latest_path("latest", acb.id),
+                                    ref, acb, seq, now_ms)
+                self._write_pointer(self._latest_path("latest_run", acb.run_id),
+                                    ref, acb, seq, now_ms)
+                self._write_pointer(self._task_pointer_path(acb),
+                                    ref, acb, seq, now_ms)
 
-            # 先盘后缓存：全部落盘成功后才填只读镜像
-            self._store[ref] = copy.deepcopy(payload)
-            self._meta = meta
+                # 先盘后缓存：全部落盘成功后才填只读镜像
+                self._store[ref] = copy.deepcopy(payload)
+                self._meta = meta
         acb.result_ref = ref
         return ref
 
