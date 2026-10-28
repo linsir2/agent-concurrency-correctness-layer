@@ -19,6 +19,7 @@ python3 examples/three_agents/run.py                  # [PASS] naive 丢写 vs R
 python3 examples/semantic_conflict/run.py             # [结论] 我们能拦住语义冲突
 python3 -m harness.spec.corpus --check                # 语料无漂移（35 / 0）
 python3 -m harness.diagnose --state-dir <dir>         # 只读体检，退出码 0/1/2
+python3 -m bench.llm_replay --json                    # token 基准回放（n=1，离线）
 ```
 
 `examples/semantic_conflict/run.py` 的实际输出（同一仓库、两处互不重叠的改动）：
@@ -57,7 +58,7 @@ python3 -m harness.diagnose --state-dir <dir>         # 只读体检，退出码
 | 跨主机租约复制 | 定位 §6.5、S21 明确「不做 → K-103」 | ✅ S24-8：`LeaseState` 纯状态机 + `MemoryLeaseStore`（同进程）/ `RaftLeaseStore`（共识复制，与 `_ReplicatedLeaseLog` 同一 RSM）；旧 epoch 的续租与提交被拒；缺 pysyncobj 时 fail-closed |
 | 多租户 / 计量 / Admin | 定位 §6.5 | ✅ S20/S15/S17 |
 | 宿主适配（LangGraph/CrewAI/OpenAI/AG2/MCP/HTTP） | 定位 §6.2 阶段一交付物、§6.4 MVP | ✅ S22/S23 |
-| 基准五指标 | phase1 §9.3 | 🟡 token 指标 N/A、LLM 用 scripted |
+| 基准五指标 | phase1 §9.3 | ✅ S24-9：真实调用录制 → 离线回放，token 倍数 **1.39**、rework_rate **0.33**（n=1，`bench/fixtures/llm_replay.json`）；其余四指标见 S7 |
 | 确定性原语（seeded uuid/now） | 定位 §4.3 第 3 条 | ❌ `uuid4` 仍散落 |
 | DurableTimer / 定义版本化 | design §14 | ❌ 仅 `tick` 轮询 |
 
@@ -146,6 +147,7 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 | S24-6 | 只读诊断 `rsc-diagnose`：WAL 完整性/seq、租约 epoch、收据链、版本流、幂等键、token、store；退出码 0/1/2 | ✅ 已实现，16 个用例 |
 | S24-7 | TLA+ 最小模型 I1/I2/I4/I7 + TLC 反例（jar/Java 可选，主门禁不依赖 Java） | ✅ 已实现，4 正确 + 4 broken 实跑 |
 | S24-8 | 跨主机租约复制：`LeaseState` 纯状态机 + `MemoryLeaseStore` + `RaftLeaseStore`；接管 epoch+1，旧 epoch 续租/提交被拒；缺依赖 fail-closed | ✅ 已实现，18 个用例（含真实 3 节点 Raft） |
+| S24-9 | 真实 token 基准：`LLMReply` 保留上游 usage → `bench/llm_replay.py` 录制 + 离线回放；报 token 倍数与返工率（n=1，不声称显著） | ✅ 已实现（实测 1.39× / 0.33），17 个用例 |
 
 ### 5.1 S24-1 实现要点
 
@@ -274,6 +276,29 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
   11 条内存后端用例在主门禁常跑（不依赖 pysyncobj）。
 - **不做**：per-resource/分片租约、跨主机 worktree/文件同步、网络分区下的活性保证、
   真实多机跨网络验证（沙箱只做本地 3 节点）。
+
+### 5.10 S24-9 真实 token 基准（`bench/llm_replay.py`）
+
+- **为什么之前是 N/A**：`LLMClient.chat` 只返回文本、丢弃 `usage`（`harness/llm.py:190`），
+  基准全是 scripted decisions。S24-9 新增 `chat_with_usage() -> LLMReply`，保留
+  prompt/completion/cached/reasoning/total；`chat()` 签名与行为不变。
+- **采集（`--live`）**：同一份 `config.json`、两个 agent 同时读取 → naive 后写覆盖前写；
+  RSC 的第二个写者被 CAS 拒绝（`Conflict`）→ **真实再调一次模型**按最新内容重写。
+  两个条件**共享** A/B 两次调用的 usage（配对），只有重试 turn 是 RSC 独有。
+- **实测（2026-10-28，qwen3.7-flash，temperature=0，n=1）**：
+
+  | 条件 | turns | total tokens | rework_rate | success | lost_update |
+  |---|---|---|---|---|---|
+  | naive | 2 | **788** | 0 | false | **true** |
+  | rsc | 3 | **1096** | **0.3333** | **true** | false |
+
+  **token 倍数 = 1.3909×**，rework_rate 增量 = 0.3333。原始 usage 冻结在
+  `bench/fixtures/llm_replay.json`（`provenance=live`），回放完全离线且逐值可重算。
+- **口径纪律**：naive 的 token 少是因为它**丢写**；必须与 `success/lost_update` 同表呈现，
+  不得单独拿「token 倍数」说优劣。n=1、每条件 2–3 turn，**不做显著性声明**。
+- **注意**：该模型把「思考」计入 `completion_tokens`（`reasoning_tokens` 约 674/920），
+  `max_tokens=64` 并未真正限制总 completion；报告单列 `reasoning_tokens`。
+- **不做**：大规模评测、多模型横评、把回放数字写成 live、缺 usage 时按字符估算。
 
 ---
 

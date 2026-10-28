@@ -29,7 +29,7 @@ B1 串行 / B2 worktree + merge / B3 共享层；C0 零冲突 / C1 弱重叠 / C
 
 ### 0.3 五项指标
 
-`lost_update_rate`、`conflict_rate`（分 `detected`/`silent`）、`speedup`、`serialization_rate`、`wasted_work`；`token_multiplier` **阶段一 N/A**。
+`lost_update_rate`、`conflict_rate`（分 `detected`/`silent`）、`speedup`、`serialization_rate`、`wasted_work`；`token_multiplier` 阶段一 N/A，**S24-9 已用真实调用录制补上**（`bench/llm_replay.py`，n=1：1.39×，见 `docs/s24-gap-analysis-and-repositioning.md` §5.10）。
 
 ### 0.4 S8 现状
 
@@ -152,7 +152,7 @@ fail_under = 80        # 兜底
 | ≥70% | `runtime.py`、`orchestration.py` |
 | 其余（`auth`/`resolver`/`policy`/`context`/`subscription`/`compensation`/`clock`/`types`/`llm`/`storage/*`/`spec/*`） | 归全局，**软提示** |
 
-**`LLMResolver` 网络分支**：标 `# pragma: no cover` 并在报告注明（阶段一无真实 LLM，`token_multiplier` N/A）；成功路径只覆盖 `ScriptedResolver` + `_validate_resolution`。
+**`LLMResolver` 网络分支**：标 `# pragma: no cover` 并在报告注明（阶段一无真实 LLM）；成功路径只覆盖 `ScriptedResolver` + `_validate_resolution`。`token_multiplier` 已由 S24-9 的录制回放单独计量（不改本节基准）。
 
 新增 `scripts/check_coverage.py`：硬门禁（上表）未达即 `exit 1`；软提示只告警。**显式列出被排除的模块与理由**，避免阈值形同虚设。断言 `bench/` 在 coverage source 外。
 

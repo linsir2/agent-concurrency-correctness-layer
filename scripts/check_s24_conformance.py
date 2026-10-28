@@ -261,6 +261,45 @@ for token in ("test_only_one_host_can_hold_lease",
               "test_missing_pysyncobj_refuses_to_start"):
     chk(f"Raft 租约用例 {token}", f"def {token}(" in _raft_tests)
 
+# ---------------------------------------------------------------- S24-9 token 基准
+chk("bench 回放模块存在", (_ROOT / "bench/llm_replay.py").exists())
+chk("live fixture 存在", (_ROOT / "bench/fixtures/llm_replay.json").exists())
+from harness.llm import LLMReply, usage_from_response
+
+chk("LLMReply 保留 usage", hasattr(LLMReply, "prompt_tokens")
+    and hasattr(LLMReply, "total_tokens"))
+_u = usage_from_response({"usage": {"prompt_tokens": 3,
+                                    "completion_tokens": 4,
+                                    "total_tokens": 7}})
+chk("usage 解析正确", _u["total_tokens"] == 7 and _u["usage_missing"] is False)
+chk("缺 usage 标 missing（不估算）",
+    usage_from_response({})["usage_missing"] is True)
+chk("chat 兼容旧签名", "return self.chat_with_usage(" in _src("harness/llm.py"))
+
+from bench.llm_replay import compute_metrics, load_fixture
+
+_fixture = load_fixture()
+_metrics = compute_metrics(_fixture)
+chk("fixture provenance=live", _fixture["provenance"] == "live")
+chk("fixture 有真实 token", _metrics["conditions"]["naive"]["total_tokens"] > 0)
+chk("token 倍数 > 1", _metrics["token_multiplier"] > 1)
+chk("rsc 有返工", _metrics["conditions"]["rsc"]["rework_rate"] > 0)
+chk("naive 丢写 / rsc 成功",
+    _metrics["conditions"]["naive"]["outcome"]["success"] is False
+    and _metrics["conditions"]["rsc"]["outcome"]["success"] is True)
+_replay_src = _src("bench/llm_replay.py")
+chk("回放离线可重算", "sum(int(t.get(\"total_tokens\", 0)) for t in turns)" in _replay_src)
+chk("无 key 显式 skip", '"status": "skipped"' in _replay_src
+    and "missing_api_key" in _replay_src)
+chk("缺 usage 不估算（显式标志）", "usage_missing" in _src("harness/llm.py"))
+_replay_tests = _src("tests/test_s24_replay.py")
+for token in ("test_metrics_are_recomputed_from_turns",
+              "test_killer_mutation_removing_retry_changes_metrics",
+              "test_missing_usage_is_rejected",
+              "test_live_without_key_skips_without_numbers"):
+    chk(f"回放用例 {token}", f"def {token}(" in _replay_tests)
+chk("usage 用例存在", (_ROOT / "tests/test_s24_llm_usage.py").exists())
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)
@@ -340,6 +379,13 @@ with tempfile.TemporaryDirectory() as tmp:
     _store.set_fail(True)
     chk("租约后端故障 fail-closed",
         _h1._renew_writer_lease() is False and _h1._lease_outcome == "unavailable")
+
+    # S24-9 运行期：离线回放 JSON 可解析
+    from bench.llm_replay import main as replay_main
+    with contextlib.redirect_stdout(io.StringIO()):
+        replay_rc = replay_main(["--fixture", str(_ROOT / "bench/fixtures/llm_replay.json"),
+                                 "--json"])
+    chk("token 回放 exit 0", replay_rc == 0)
 
     # S24-6 运行期：空状态 → 0；无参数 → 2（用法错误）
     from harness.diagnose import main as diag_main

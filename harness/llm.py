@@ -155,6 +155,74 @@ def configure_egress(guard: EgressGuard | None) -> None:
     _default_guard = guard
 
 
+@dataclass(frozen=True)
+class LLMReply:
+    """一次成功调用的文本 + **真实 usage**（S24-9 基准用）。
+
+    `usage_missing=True` 表示上游没给 usage —— **不得**按字符数估算，
+    基准里必须显式标注「不可计」，否则会伪造 token 数据。
+    """
+
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+    total_tokens: int = 0
+    usage_missing: bool = False
+    model: str = ""
+    attempts: int = 1
+
+    @property
+    def tokens(self) -> int:
+        return int(self.total_tokens) or (int(self.prompt_tokens)
+                                          + int(self.completion_tokens))
+
+    def as_dict(self) -> dict:
+        return {"prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "cached_tokens": self.cached_tokens,
+                "reasoning_tokens": self.reasoning_tokens,
+                "total_tokens": self.total_tokens,
+                "usage_missing": self.usage_missing,
+                "model": self.model, "attempts": self.attempts,
+                "text_chars": len(self.text or "")}
+
+
+def _as_int(value) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def usage_from_response(data: dict) -> dict:
+    """从 OpenAI 兼容响应里取 usage（兼容 prompt/input、completion/output 两套命名）。
+
+    `cached` 与 `reasoning` 单列：前者不重复计费，后者已含在 completion 内。
+    """
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0,
+                "reasoning_tokens": 0, "total_tokens": 0, "usage_missing": True}
+    prompt = _as_int(usage.get("prompt_tokens", usage.get("input_tokens")))
+    completion = _as_int(usage.get("completion_tokens",
+                                   usage.get("output_tokens")))
+    p_details = usage.get("prompt_tokens_details") or {}
+    c_details = usage.get("completion_tokens_details") or {}
+    cached = _as_int(p_details.get("cached_tokens")
+                     if isinstance(p_details, dict) else 0) \
+        or _as_int(usage.get("cache_read_input_tokens")) \
+        or _as_int(usage.get("cached_tokens"))
+    reasoning = _as_int(c_details.get("reasoning_tokens")
+                        if isinstance(c_details, dict) else 0) \
+        or _as_int(usage.get("reasoning_tokens"))
+    total = _as_int(usage.get("total_tokens")) or (prompt + completion)
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "cached_tokens": cached, "reasoning_tokens": reasoning,
+            "total_tokens": total, "usage_missing": False}
+
+
 class LLMClient:
     """把 egress guard 与配置绑在一起的客户端（`Harness.llm` 使用）。"""
 
@@ -169,6 +237,14 @@ class LLMClient:
     def chat(self, messages: Iterable[Mapping[str, str]], *,
              temperature: float = 0.0,
              max_tokens: int | None = None) -> str:
+        """向后兼容：只返回文本（既有调用点字节不变）。"""
+        return self.chat_with_usage(messages, temperature=temperature,
+                                    max_tokens=max_tokens).text
+
+    def chat_with_usage(self, messages: Iterable[Mapping[str, str]], *,
+                        temperature: float = 0.0,
+                        max_tokens: int | None = None) -> LLMReply:
+        """同 `chat`，但把**上游 usage**一并带回（S24-9 基准）。"""
         cfg = self.config or LLMConfig.from_env()
         validate_base_url(cfg.base_url)
         url = f"{cfg.base_url}/chat/completions"
@@ -189,7 +265,11 @@ class LLMClient:
             try:
                 data = _post(url, payload, headers, cfg.timeout_s,
                              egress=self.egress, opener=self.opener)
-                return data["choices"][0]["message"]["content"]
+                text = data["choices"][0]["message"]["content"]
+                usage = usage_from_response(data)
+                return LLMReply(text=text,
+                                model=str(data.get("model") or cfg.model),
+                                attempts=attempt + 1, **usage)
             except EgressDenied:
                 raise                       # 出站被策略拒绝：不得重试、不得降级
             except urllib.error.HTTPError as exc:          # 4xx 不重试（除 429）
