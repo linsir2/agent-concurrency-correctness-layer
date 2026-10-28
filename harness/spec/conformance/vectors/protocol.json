@@ -1,0 +1,140 @@
+{
+  "vectors": [
+    {
+      "description": "无冲突 → 放行",
+      "expect": {
+        "reason": "",
+        "verdict": "GRANT"
+      },
+      "id": "protocol.decide.000",
+      "input": {
+        "contract_conflict": false,
+        "read_write_conflict": false,
+        "write_write_overlap": false
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    },
+    {
+      "description": "准入真值表：contract_conflict",
+      "expect": {
+        "reason": "CONTRACT_CONFLICT",
+        "verdict": "WAIT"
+      },
+      "id": "protocol.decide.100",
+      "input": {
+        "contract_conflict": true,
+        "read_write_conflict": false,
+        "write_write_overlap": false
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    },
+    {
+      "description": "准入真值表：read_write_conflict",
+      "expect": {
+        "reason": "READ_WRITE_CONFLICT",
+        "verdict": "WAIT"
+      },
+      "id": "protocol.decide.010",
+      "input": {
+        "contract_conflict": false,
+        "read_write_conflict": true,
+        "write_write_overlap": false
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    },
+    {
+      "description": "准入真值表：contract_conflict, read_write_conflict",
+      "expect": {
+        "reason": "CONTRACT_CONFLICT",
+        "verdict": "WAIT"
+      },
+      "id": "protocol.decide.110",
+      "input": {
+        "contract_conflict": true,
+        "read_write_conflict": true,
+        "write_write_overlap": false
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    },
+    {
+      "description": "准入真值表：write_write_overlap",
+      "expect": {
+        "reason": "WRITE_WRITE_OVERLAP",
+        "verdict": "DIE"
+      },
+      "id": "protocol.decide.001",
+      "input": {
+        "contract_conflict": false,
+        "read_write_conflict": false,
+        "write_write_overlap": true
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    },
+    {
+      "description": "准入真值表：contract_conflict, write_write_overlap",
+      "expect": {
+        "reason": "CONTRACT_CONFLICT",
+        "verdict": "WAIT"
+      },
+      "id": "protocol.decide.101",
+      "input": {
+        "contract_conflict": true,
+        "read_write_conflict": false,
+        "write_write_overlap": true
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    },
+    {
+      "description": "准入真值表：read_write_conflict, write_write_overlap",
+      "expect": {
+        "reason": "READ_WRITE_CONFLICT",
+        "verdict": "WAIT"
+      },
+      "id": "protocol.decide.011",
+      "input": {
+        "contract_conflict": false,
+        "read_write_conflict": true,
+        "write_write_overlap": true
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    },
+    {
+      "description": "准入真值表：contract_conflict, read_write_conflict, write_write_overlap",
+      "expect": {
+        "reason": "CONTRACT_CONFLICT",
+        "verdict": "WAIT"
+      },
+      "id": "protocol.decide.111",
+      "input": {
+        "contract_conflict": true,
+        "read_write_conflict": true,
+        "write_write_overlap": true
+      },
+      "invariants": [
+        "I1"
+      ],
+      "kind": "protocol.decide"
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "invariants": [
+    {
+      "description": "同一资源同一时刻只有一个写生效（提交层 CAS）",
+      "id": "I1",
+      "name": "单写者提交",
+      "test": "test_i1_single_writer_commit"
+    },
+    {
+      "description": "覆盖写被拒并 rebase",
+      "id": "I2",
+      "name": "无丢失更新",
+      "test": "test_i2_no_lost_update"
+    },
+    {
+      "description": "revoke 后旧租约被拒",
+      "id": "I3",
+      "name": "fencing 单调",
+      "test": "test_i3_fencing_monotonic"
+    },
+    {
+      "description": "越权访问被拒",
+      "id": "I4",
+      "name": "能力封闭",
+      "test": "test_capability_denied_blocks_tool"
+    },
+    {
+      "description": "consumed ≤ reserved ≤ limits；父约束不被子突破",
+      "id": "I5",
+      "name": "预算守恒",
+      "test": "test_i5_budget_conservation"
+    },
+    {
+      "description": "materialized + ordered events 是一致前缀",
+      "id": "I6",
+      "name": "上下文因果一致",
+      "test": "test_i6_context_consistent_prefix"
+    },
+    {
+      "description": "重复投递去重（幂等键）",
+      "id": "I7",
+      "name": "effect 有效一次",
+      "test": "test_i7_effect_exactly_once"
+    },
+    {
+      "description": "资源提交与 WorkspaceEvent 同事务",
+      "id": "I8",
+      "name": "事件原子",
+      "test": "test_i8_event_atomic_with_replace"
+    },
+    {
+      "description": "Plan 无环、footprint 完整",
+      "id": "I9",
+      "name": "计划有效",
+      "test": "test_i9_plan_valid_acyclic"
+    },
+    {
+      "description": "Z3 私有 worktree 对共享态不可见",
+      "id": "I10",
+      "name": "隔离",
+      "test": "test_i10_isolation_private_worktree_invisible"
+    },
+    {
+      "description": "cursor 不落后于保留窗口",
+      "id": "I11",
+      "name": "有界",
+      "test": "test_a7_event_storm_cursor_snapshot_replay"
+    },
+    {
+      "description": "每个 task 在期限内到达终态",
+      "id": "I12",
+      "name": "终止/公平",
+      "test": "test_a11_finalize_not_triggered_with_nonterminal"
+    },
+    {
+      "description": "收据可离线验证",
+      "id": "I13",
+      "name": "可审计",
+      "test": "test_i13_receipt_chain"
+    },
+    {
+      "description": "NO_PROGRESS 检测后 FAILED",
+      "id": "I14",
+      "name": "无进展终止",
+      "test": "test_a13_per_action_guard_budget"
+    }
+  ]
+}

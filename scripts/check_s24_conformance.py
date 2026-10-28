@@ -7,8 +7,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
+import json
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -126,6 +131,93 @@ chk("用例覆盖容量/超时/取消",
     and "test_timeout_returns_wait" in _qt
     and "test_cancel_pending_ticket" in _qt)
 
+# ---------------------------------------------------------------- S24-5 合规语料
+chk("语料模块存在", (_ROOT / "harness/spec/corpus.py").exists())
+chk("语料 manifest 存在", (_ROOT / "harness/spec/conformance/manifest.json").exists())
+chk("语料 runner 协议说明", (_ROOT / "harness/spec/conformance/README.md").exists())
+from harness.spec.corpus import build_corpus, check_corpus
+
+_manifest = json.loads(build_corpus()["manifest.json"].decode("utf-8"))
+_corpus = check_corpus()
+chk("磁盘语料无漂移", _corpus["ok"], str(_corpus["drift"]))
+chk("语料向量可执行", _corpus["run"]["failed"] == 0,
+    str(_corpus["run"]["errors"][:1]))
+chk("语料覆盖 I1-I14", _manifest["totals"]["invariants"] == 14)
+chk("语料向量 >= 30", _manifest["totals"]["vectors"] >= 30)
+chk("I13 有可执行向量", "I13" in _manifest["totals"]["executable_invariants"])
+chk("I9/I10 测试指针已修",
+    "test_i9_plan_valid_acyclic" in _src("harness/spec/invariants.py")
+    and "test_i10_isolation_private_worktree_invisible" in _src(
+        "harness/spec/invariants.py"))
+chk("语料版本化", "CORPUS_VERSION" in _src("harness/spec/corpus.py")
+    and "corpus_version" in _src("harness/spec/corpus.py"))
+chk("冻结签名不现场生成", '"payload_sha256"' in _src("harness/spec/corpus.py"))
+_ct_corpus = _src("tests/test_s24_corpus.py")
+for token in ("test_disk_corpus_matches_reference", "test_changed_expect_is_detected",
+              "test_tampered_file_breaks_manifest_sha",
+              "test_main_check_exit_one_on_drift",
+              "test_invariant_test_pointers_exist"):
+    chk(f"语料用例 {token}", f"def {token}(" in _ct_corpus)
+chk("package-data 含语料", "conformance/vectors/*.json" in _src("pyproject.toml"))
+
+# ---------------------------------------------------------------- S24-6 诊断 CLI
+chk("诊断模块存在", (_ROOT / "harness/diagnose.py").exists())
+chk("诊断用例存在", (_ROOT / "tests/test_s24_diagnose.py").exists())
+_diag = _src("harness/diagnose.py")
+chk("诊断不构造 Wal", "Wal(" not in _diag)
+chk("诊断不构造 FileCheckpointStore", "FileCheckpointStore(" not in _diag)
+for _bad in ("write_bytes(", "write_text(", "mkdir(", "unlink(", "truncate(",
+             "os.replace(", "os.remove("):
+    chk(f"诊断只读（无 {_bad}）", _bad not in _diag)
+chk("诊断只读读 WAL（read_bytes）", "read_bytes" in _diag)
+chk("退出码 0/1/2", 'return 0 if report["ok"] else 1' in _diag
+    and "return 2" in _diag)
+chk("rsc-diagnose 入口", 'rsc-diagnose = "harness.diagnose:main"' in _src(
+    "pyproject.toml"))
+chk("诊断 JSON schema", '"schema_version": SCHEMA_VERSION' in _diag)
+_diag_test = _src("tests/test_s24_diagnose.py")
+for token in ("test_mid_frame_crc_is_error", "test_broken_receipt_chain",
+              "test_resource_version_gap", "test_diagnose_is_read_only",
+              "test_lease_epoch_behind_wal", "test_cli_exit_one_on_error"):
+    chk(f"诊断用例 {token}", f"def {token}(" in _diag_test)
+
+# ---------------------------------------------------------------- S24-7 TLA+
+_TLA = _ROOT / "spec" / "tla"
+chk("TLA 目录存在", _TLA.is_dir())
+chk("TLA 校验脚本存在", (_ROOT / "scripts/check_tla.py").exists())
+chk("TLA 说明存在", (_TLA / "README.md").exists())
+_TLA_CASES = (("I1", "I1SingleWriter", "AtMostOneWriter"),
+              ("I2", "I2NoLostUpdate", "NoLostUpdate"),
+              ("I4", "I4Capability", "CapabilityClosed"),
+              ("I7", "I7EffectExactlyOnce", "EffectAtMostOnce"))
+for _key, _mod, _inv in _TLA_CASES:
+    chk(f"TLA {_key} 三件套",
+        (_TLA / f"{_mod}.tla").is_file()
+        and (_TLA / f"{_mod}.cfg").is_file()
+        and (_TLA / f"{_mod}.broken.cfg").is_file())
+    _tla_src = (_TLA / f"{_mod}.tla").read_text(encoding="utf-8") \
+        if (_TLA / f"{_mod}.tla").is_file() else ""
+    chk(f"TLA {_key} 模块名", f"---- MODULE {_mod} ----" in _tla_src)
+    chk(f"TLA {_key} 不变量", f"{_inv} ==" in _tla_src and "TypeOK" in _tla_src)
+    _cfg = (_TLA / f"{_mod}.cfg").read_text(encoding="utf-8") \
+        if (_TLA / f"{_mod}.cfg").is_file() else ""
+    chk(f"TLA {_key} cfg 声明不变量", f"INVARIANT {_inv}" in _cfg)
+chk("TLA 主门禁不依赖 Java（--require 才硬失败）",
+    "--require" in _src("scripts/check_tla.py")
+    and "SKIP" in _src("scripts/check_tla.py"))
+chk("TLA 用例缺 jar 显式 skip", "pytest.skip" in _src("tests/test_s24_tla.py")
+    and "pytest.fail" in _src("tests/test_s24_tla.py"))
+_tla_jar = os.environ.get("TLA2TOOLS_JAR")
+if _tla_jar and pathlib.Path(_tla_jar).is_file():
+    _tla_run = subprocess.run(
+        [sys.executable, str(_ROOT / "scripts/check_tla.py"), "--jar", _tla_jar],
+        capture_output=True, text=True, check=False)
+    chk("TLA 实跑 8/0", _tla_run.returncode == 0, _tla_run.stdout[-200:])
+else:
+    chk("TLA 缺 jar 时 SKIP exit 0",
+        subprocess.run([sys.executable, str(_ROOT / "scripts/check_tla.py")],
+                       capture_output=True, text=True, check=False).returncode == 0)
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)
@@ -196,6 +288,15 @@ with tempfile.TemporaryDirectory() as tmp:
                        idempotency_key="k3", agent_id="a2")
     chk("通过后可提交", isinstance(r, Receipt))
     chk("收据带 verified", getattr(r, "verified", False) is True)
+
+    # S24-6 运行期：空状态 → 0；无参数 → 2（用法错误）
+    from harness.diagnose import main as diag_main
+    diag_dir = pathlib.Path(tmp) / "diag"
+    diag_dir.mkdir()
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        chk("诊断空状态 exit 0", diag_main(["--state-dir", str(diag_dir)]) == 0)
+        chk("诊断无参数 exit 2", diag_main([]) == 2)
 
 print(f"通过 {len(ok)} / 失败 {len(bad)}")
 for name, detail in bad:

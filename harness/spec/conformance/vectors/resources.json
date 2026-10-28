@@ -1,0 +1,214 @@
+{
+  "vectors": [
+    {
+      "description": "API 的版本语义",
+      "expect": {
+        "semantics": "content_hash"
+      },
+      "id": "resources.semantics.API",
+      "input": {
+        "kind": "API"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "BUDGET_NODE 的版本语义",
+      "expect": {
+        "semantics": "monotonic"
+      },
+      "id": "resources.semantics.BUDGET_NODE",
+      "input": {
+        "kind": "BUDGET_NODE"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "CONTRACT 的版本语义",
+      "expect": {
+        "semantics": "content_hash"
+      },
+      "id": "resources.semantics.CONTRACT",
+      "input": {
+        "kind": "CONTRACT"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "DB_ROW 的版本语义",
+      "expect": {
+        "semantics": "monotonic"
+      },
+      "id": "resources.semantics.DB_ROW",
+      "input": {
+        "kind": "DB_ROW"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "DIR 的版本语义",
+      "expect": {
+        "semantics": "monotonic"
+      },
+      "id": "resources.semantics.DIR",
+      "input": {
+        "kind": "DIR"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "EFFECT 的版本语义",
+      "expect": {
+        "semantics": "idempotency_key"
+      },
+      "id": "resources.semantics.EFFECT",
+      "input": {
+        "kind": "EFFECT"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "FILE 的版本语义",
+      "expect": {
+        "semantics": "monotonic"
+      },
+      "id": "resources.semantics.FILE",
+      "input": {
+        "kind": "FILE"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "INVARIANT 的版本语义",
+      "expect": {
+        "semantics": "content_hash"
+      },
+      "id": "resources.semantics.INVARIANT",
+      "input": {
+        "kind": "INVARIANT"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "SYMBOL 的版本语义",
+      "expect": {
+        "semantics": "content_hash"
+      },
+      "id": "resources.semantics.SYMBOL",
+      "input": {
+        "kind": "SYMBOL"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "TYPE_GRAPH 的版本语义",
+      "expect": {
+        "semantics": "content_hash"
+      },
+      "id": "resources.semantics.TYPE_GRAPH",
+      "input": {
+        "kind": "TYPE_GRAPH"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.semantics"
+    },
+    {
+      "description": "a.py 推断的资源类型",
+      "expect": {
+        "kind": "FILE"
+      },
+      "id": "resources.path.a.py",
+      "input": {
+        "path": "a.py"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.path"
+    },
+    {
+      "description": "a.ts 推断的资源类型",
+      "expect": {
+        "kind": "FILE"
+      },
+      "id": "resources.path.a.ts",
+      "input": {
+        "path": "a.ts"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.path"
+    },
+    {
+      "description": "a.json 推断的资源类型",
+      "expect": {
+        "kind": "FILE"
+      },
+      "id": "resources.path.a.json",
+      "input": {
+        "path": "a.json"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.path"
+    },
+    {
+      "description": "a.sql 推断的资源类型",
+      "expect": {
+        "kind": "DB_ROW"
+      },
+      "id": "resources.path.a.sql",
+      "input": {
+        "path": "a.sql"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.path"
+    },
+    {
+      "description": "README 推断的资源类型",
+      "expect": {
+        "kind": "FILE"
+      },
+      "id": "resources.path.README",
+      "input": {
+        "path": "README"
+      },
+      "invariants": [
+        "I2"
+      ],
+      "kind": "resources.path"
+    }
+  ]
+}

@@ -1,0 +1,296 @@
+{
+  "vectors": [
+    {
+      "description": "链校验三态：empty",
+      "expect": {
+        "result": false
+      },
+      "id": "receipt.verify.empty",
+      "input": {
+        "receipts": [],
+        "secret": "corpus-fixture-secret"
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    },
+    {
+      "description": "链校验三态：single_signed",
+      "expect": {
+        "result": true
+      },
+      "id": "receipt.verify.single_signed",
+      "input": {
+        "receipts": [
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "0000000000000000",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "03e6f92412aa14454f52a6971dd9cb8e609d7ba76f62d1889ee1543929007178",
+            "task_id": "t",
+            "version_after": 1,
+            "version_before": 0
+          }
+        ],
+        "secret": "corpus-fixture-secret"
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    },
+    {
+      "description": "链校验三态：chain_signed",
+      "expect": {
+        "result": true
+      },
+      "id": "receipt.verify.chain_signed",
+      "input": {
+        "receipts": [
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "0000000000000000",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "03e6f92412aa14454f52a6971dd9cb8e609d7ba76f62d1889ee1543929007178",
+            "task_id": "t",
+            "version_after": 1,
+            "version_before": 0
+          },
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "b74e7c910bd3939b",
+            "receipt_id": "v-1",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "f7f4428eaf78259773ba038def2bd52047462066dbfbe8bf9870d060cd570498",
+            "task_id": "t",
+            "version_after": 2,
+            "version_before": 1
+          }
+        ],
+        "secret": "corpus-fixture-secret"
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    },
+    {
+      "description": "链校验三态：unsigned",
+      "expect": {
+        "result": null
+      },
+      "id": "receipt.verify.unsigned",
+      "input": {
+        "receipts": [
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "0000000000000000",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "",
+            "task_id": "t",
+            "version_after": 1,
+            "version_before": 0
+          }
+        ],
+        "secret": "corpus-fixture-secret"
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    },
+    {
+      "description": "链校验三态：chain_only_no_secret",
+      "expect": {
+        "result": null
+      },
+      "id": "receipt.verify.chain_only_no_secret",
+      "input": {
+        "receipts": [
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "0000000000000000",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "03e6f92412aa14454f52a6971dd9cb8e609d7ba76f62d1889ee1543929007178",
+            "task_id": "t",
+            "version_after": 1,
+            "version_before": 0
+          },
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "b74e7c910bd3939b",
+            "receipt_id": "v-1",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "f7f4428eaf78259773ba038def2bd52047462066dbfbe8bf9870d060cd570498",
+            "task_id": "t",
+            "version_after": 2,
+            "version_before": 1
+          }
+        ],
+        "secret": ""
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    },
+    {
+      "description": "链校验三态：tampered_signature",
+      "expect": {
+        "result": false
+      },
+      "id": "receipt.verify.tampered_signature",
+      "input": {
+        "receipts": [
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "0000000000000000",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "0000000000000000000000000000000000000000000000000000000000000000",
+            "task_id": "t",
+            "version_after": 1,
+            "version_before": 0
+          }
+        ],
+        "secret": "corpus-fixture-secret"
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    },
+    {
+      "description": "链校验三态：broken_prev_hash",
+      "expect": {
+        "result": false
+      },
+      "id": "receipt.verify.broken_prev_hash",
+      "input": {
+        "receipts": [
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "0000000000000000",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "03e6f92412aa14454f52a6971dd9cb8e609d7ba76f62d1889ee1543929007178",
+            "task_id": "t",
+            "version_after": 1,
+            "version_before": 0
+          },
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "ffffffffffffffff",
+            "receipt_id": "v-1",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "f7f4428eaf78259773ba038def2bd52047462066dbfbe8bf9870d060cd570498",
+            "task_id": "t",
+            "version_after": 2,
+            "version_before": 1
+          }
+        ],
+        "secret": "corpus-fixture-secret"
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    },
+    {
+      "description": "链校验三态：duplicate_receipt_id",
+      "expect": {
+        "result": false
+      },
+      "id": "receipt.verify.duplicate_receipt_id",
+      "input": {
+        "receipts": [
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "0000000000000000",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "03e6f92412aa14454f52a6971dd9cb8e609d7ba76f62d1889ee1543929007178",
+            "task_id": "t",
+            "version_after": 1,
+            "version_before": 0
+          },
+          {
+            "compensation_ref": null,
+            "effect_id": null,
+            "idem_key": null,
+            "logical_subgoal_id": "g",
+            "prev_receipt_hash": "b74e7c910bd3939b",
+            "receipt_id": "v-0",
+            "resource": "r",
+            "run_id": "run",
+            "schema_version": 1,
+            "signature": "f7f4428eaf78259773ba038def2bd52047462066dbfbe8bf9870d060cd570498",
+            "task_id": "t",
+            "version_after": 2,
+            "version_before": 1
+          }
+        ],
+        "secret": "corpus-fixture-secret"
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.verify"
+    }
+  ]
+}

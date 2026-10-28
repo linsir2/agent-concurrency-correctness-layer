@@ -12,10 +12,13 @@
 ## 0. 真跑证据（可复现）
 
 ```bash
-python3 -m pytest -q                                  # 734 passed / 3 skipped / 4 xfailed
+python3 -m pytest -q                                  # 810 passed / 11 skipped / 4 xfailed
+TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest -q # 818 passed / 3 skipped（TLA 实测）
 python3 scripts/check_s23_conformance.py              # 80 / 0
 python3 examples/three_agents/run.py                  # [PASS] naive 丢写 vs RSC 保全
-python3 examples/semantic_conflict/run.py             # [结论] 我们拦不住语义冲突
+python3 examples/semantic_conflict/run.py             # [结论] 我们能拦住语义冲突
+python3 -m harness.spec.corpus --check                # 语料无漂移（35 / 0）
+python3 -m harness.diagnose --state-dir <dir>         # 只读体检，退出码 0/1/2
 ```
 
 `examples/semantic_conflict/run.py` 的实际输出（同一仓库、两处互不重叠的改动）：
@@ -49,8 +52,8 @@ python3 examples/semantic_conflict/run.py             # [结论] 我们拦不住
 | 物化快照 + 版本钉住 | design §5.5 | ✅ `harness/context.py` |
 | Z3 私有 worktree | design §0.1 | ✅ `harness/worktree.py` |
 | 收据签名链 | design §18.3 | ✅ `harness/spec/receipt.py` |
-| **VerifierRunner / 语义验证** | design §4.2、milestones §「VerifierRunner（独立上下文校验）」标 P2/MS5「当前无」 | **❌ 零实现** |
-| 四件套对外（TLA+ / corpus / CLI） | 定位 §6.3、design §18.4 | 🟡 规范在 `harness/spec/`；**无 .tla**、无对外 corpus、无 `rsc-diagnose` |
+| **VerifierRunner / 语义验证** | design §4.2、milestones §「VerifierRunner（独立上下文校验）」标 P2/MS5「当前无」 | ✅ S24-1：`session.verify` + `verify_cmd` 自动门禁；语义冲突由 `harness/semantic.py` 静态拦截 |
+| 四件套对外（TLA+ / corpus / CLI） | 定位 §6.3、design §18.4 | ✅ `harness/spec/conformance/`（35 条语言无关向量 + manifest）、`python3 -m harness.diagnose`、`spec/tla/`（I1/I2/I4/I7 + TLC 反例） |
 | 跨主机租约复制 | 定位 §6.5、S21 明确「不做 → K-103」 | 🟡 Raft 事件/预算已跨主机，租约未复制 |
 | 多租户 / 计量 / Admin | 定位 §6.5 | ✅ S20/S15/S17 |
 | 宿主适配（LangGraph/CrewAI/OpenAI/AG2/MCP/HTTP） | 定位 §6.2 阶段一交付物、§6.4 MVP | ✅ S22/S23 |
@@ -139,6 +142,9 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 | S24-2 | 适配器接入：`RscSession(verify_cmd=...)` 后 `apply` 自动先跑验证（无需改适配器代码） | ✅ 已生效；sidecar/MCP 响应新增 `verified` |
 | S24-3 | 符号级语义冲突检测：删除/改名符号仍被引用 → `Deny(semantic_conflict)`（不执行代码、零依赖、仅 Python） | ✅ 已实现（`harness/semantic.py` + `semantic=off|warn|block`），22 个用例 |
 | S24-4 | 进程内 merge queue：单写者 FIFO，「出队 → 最新账本重验 → 提交」串成一步 | ✅ 已实现（`harness/merge_queue.py` + `apply_queued`），9 个用例 |
+| S24-5 | 合规语料：`harness/spec/conformance/`（manifest + 35 条语言无关向量 + runner 协议），`python3 -m harness.spec.corpus --check` 防漂移 | ✅ 已实现，17 个用例 |
+| S24-6 | 只读诊断 `rsc-diagnose`：WAL 完整性/seq、租约 epoch、收据链、版本流、幂等键、token、store；退出码 0/1/2 | ✅ 已实现，16 个用例 |
+| S24-7 | TLA+ 最小模型 I1/I2/I4/I7 + TLC 反例（jar/Java 可选，主门禁不依赖 Java） | ✅ 已实现，4 正确 + 4 broken 实跑 |
 
 ### 5.1 S24-1 实现要点
 
@@ -202,10 +208,47 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 | 验证的是**文件视图** | 只叠加「路径已存在于候选副本」的账本资源；纯 JSON/非文件资源不参与合并视图 |
 | 不替代 CI | 只跑你给的一条命令；耗时 = 一次全量检查，接受不了就配更快的子集 |
 | 静态检测只覆盖「名字消失」 | 签名/行为变化、类成员、动态引用查不到（S24-3 明确不做，交给 `verify`） |
-| merge queue 没做 | S24-4；当前没有 rebase 到队首再验的串行化 |
 | 副本复制成本 | 大仓库每次 `apply` 复制一棵树；可用 `verify_cmd=None` + 显式 `verify()` 控制频率 |
 
 **不做**：语义 diff 的全量程序分析、替代 CI、替代 git 合并。
+
+### 5.6 S24-5 合规语料（`harness/spec/conformance/`）
+
+- **形态**：`manifest.json`（版本 + 每文件 sha256 + 总数）+ `vectors/*.json`（协议 8 /
+  资源 15 / 收据构建 4 / 链校验 8）+ `invariants.json`（I1–I14 目录）。
+  共 **35 条向量**，每条含 `id / kind / description / invariants / input / expect`。
+- **语言无关**：向量只依赖 JSON 解析；`README.md` 给出 runner 协议（`kind` 分派表、
+  canonical payload、HMAC 算法、三态语义）。第三方实现不需要读 Python 代码。
+- **冻结期望**：收据向量的 `payload_sha256` 与 `signature` 是字面量，**不由实现现场生成**；
+  `python3 -m harness.spec.corpus --check` 比对磁盘语料与参考实现（默认只读），
+  任何 canonical 化/签名漂移都会以 `drift` 报出。`--write` 是显式的开发动作。
+- **版本规则**：加字段/加向量 = minor；删改语义 = major；下游按 `corpus_version` 钉住。
+- **诚实边界**：I6/I8–I12/I14 需真实调度或崩溃注入，只在 `invariants.json` 登记测试名，
+  **不伪造纯函数向量**；当前可执行不变量为 I1/I2/I13。
+
+### 5.7 S24-6 只读诊断（`python3 -m harness.diagnose`）
+
+- **检查项**：`wal.integrity`（magic/len/CRC，末帧半写 = warn，中段坏帧 = error）、
+  `wal.seq`（seq 连续）、`writer.lease`（owner/epoch/expires_at；租约 epoch 落后于
+  `wal.log.epoch` → error，对应 I3）、`receipt.chain`（按 scope 重建，断链/重复 id/
+  畸形 payload；未签名 = warn）、`resource.versions`（首版 = 1 且严格 +1，I2）、
+  `effect.idem`（同一 idem_key 只能有一个 INTENT，I7）、`checkpoint.store`
+  （store.json 可解析、refs 存在但 store.json 缺失 → error、`.corrupt` 计数）、
+  `tokens.index`（可解析、必填键、过期提示）。
+- **只读红线**：**不构造** `Wal` / `FileCheckpointStore`（构造器会 `mkdir`、`O_CREAT`、
+  截断尾部），自己按 `MAGIC/HEADER` 只读解析；测试对整个状态目录取哈希，诊断前后必须字节不变。
+- **退出码**：0 无 error；1 有 error（`--strict` 时 warn 也算）；2 用法/输入不可读。
+  默认文本报告，`--json` 给机器可读 schema（`tool/schema_version/ok/checks/findings/stats`）。
+- **不做**：自动修复、在线监控、checkpoint payload 的完整业务语义校验（只校验结构）。
+
+### 5.8 S24-7 TLA+ 最小模型（`spec/tla/`）
+
+- 四个模型各带「正确 cfg + broken cfg」：I1 单写者（去掉进入互斥）、I2 无丢失更新
+  （去掉 CAS guard）、I4 能力封闭（去掉 scope 检查）、I7 effect 一次（去掉幂等去重）。
+- `scripts/check_tla.py`：读 `--jar` 或 `TLA2TOOLS_JAR`，正确模型期望 TLC exit 0，
+  broken 期望报不变量违反（实测 exit 12）；`--require` 缺 Java/jar 时 exit 2，否则显式 SKIP。
+- **主门禁不依赖 Java**：jar 只在开发机/可选 CI job 提供；`tests/test_s24_tla.py` 在缺
+  jar 时 `skip`（带原因），设置了 `TLA2TOOLS_JAR` 却没 Java 时 `fail`（不假绿）。
 
 ---
 
@@ -217,5 +260,5 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 | `docs/milestones.md` MS5 出口 | 未包含 `VerifierRunner`，却判通过（它是 P2 但被列为差异化能力） |
 | `docs/positioning-and-roadmap.md` §2.4 | 标「语义验证 ✅、worktree 🟡」，与代码相反 |
 | `docs/positioning-and-roadmap.md` 附录 A.2 | 把 Trace 计入 L4 交付，与 design §0.5「L5 不交付」冲突 |
-| `harness/spec/invariants.py` | I12/I14 的测试指向旧用例名 |
-| `README.md`（已修） | 测试数写 91，实际 733 |
+| `harness/spec/invariants.py` | ✅ 已修：I9/I10 的测试指针失效（原 `test_i9_plan_valid` / `test_i10_isolation`），并由语料用例 `test_invariant_test_pointers_exist` 常驻守卫 |
+| `README.md`（已修） | 测试数写 91，实际 810（+8 条 TLA 用例在无 jar 时显式 skip） |

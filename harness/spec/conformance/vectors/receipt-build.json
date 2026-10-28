@@ -1,0 +1,100 @@
+{
+  "vectors": [
+    {
+      "description": "未签名：signature 为空串",
+      "expect": {
+        "payload_sha256": "a40a27d6934060f4e92c511a07e1d112ec98e3eeb50ba4a9e0e6ce19d11687e2",
+        "signature": "",
+        "signed": false
+      },
+      "id": "receipt.build.0",
+      "input": {
+        "logical_subgoal_id": "g-1",
+        "receipt_id": "r-1",
+        "resource": "app/a.py",
+        "run_id": "run-1",
+        "task_id": "t-1",
+        "version_after": 1,
+        "version_before": 0
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.build",
+      "secret": ""
+    },
+    {
+      "description": "已签名的收据：payload 与 HMAC 全量 64 hex",
+      "expect": {
+        "payload_sha256": "4113b22b7ab68fc61cb00b7357b1b359b7c36a19926050dfbcc773a672e31098",
+        "signature": "7766f2d80f4b41881981a3911f523a596b938f256e1f2c0647bc89c0c13541c9",
+        "signed": true
+      },
+      "id": "receipt.build.1",
+      "input": {
+        "logical_subgoal_id": "g-1",
+        "prev_receipt_hash": "deadbeefdeadbeef",
+        "receipt_id": "r-2",
+        "resource": "app/b.py",
+        "run_id": "run-1",
+        "task_id": "t-1",
+        "version_after": 2,
+        "version_before": 1
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.build",
+      "secret": "corpus-fixture-secret"
+    },
+    {
+      "description": "已签名的收据：payload 与 HMAC 全量 64 hex",
+      "expect": {
+        "payload_sha256": "dab8d077e5ed3542113c0ff3790f828ec0523f170339c00c2f0e66ca38ee6690",
+        "signature": "81dbf359192504f1ad9fdae929293a8de3cbcc44be228f5e387d6552a39d185c",
+        "signed": true
+      },
+      "id": "receipt.build.2",
+      "input": {
+        "effect_id": "e-1",
+        "idem_key": "k-1",
+        "logical_subgoal_id": "g-2",
+        "receipt_id": "r-3",
+        "resource": "effect:pay",
+        "run_id": "run-1",
+        "task_id": "t-2",
+        "version_after": 1,
+        "version_before": 0
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.build",
+      "secret": "corpus-fixture-secret"
+    },
+    {
+      "description": "已签名的收据：payload 与 HMAC 全量 64 hex",
+      "expect": {
+        "payload_sha256": "21117ba679e75780b734cfab9ecde0d65d86bfe58724131a0c1d5eba4c215df3",
+        "signature": "34a9d6238a5f1307a483f02b90a8ff2aa600f4a02d2cffcfbc5ea15c8f343b1a",
+        "signed": true
+      },
+      "id": "receipt.build.3",
+      "input": {
+        "compensation_ref": "cmp-1",
+        "logical_subgoal_id": "g-3",
+        "receipt_id": "r-4",
+        "resource": "app/c.py",
+        "run_id": "run-2",
+        "task_id": "t-3",
+        "version_after": 8,
+        "version_before": 7
+      },
+      "invariants": [
+        "I13"
+      ],
+      "kind": "receipt.build",
+      "secret": "corpus-fixture-secret"
+    }
+  ]
+}

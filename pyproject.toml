@@ -20,6 +20,10 @@ requires-python = ">=3.11"
 # 任何情况下都**不静默放行**（`harness/egress/__init__.py` 的 `EgressGuard`）。
 dependencies = []
 
+# S24-6：只读诊断 CLI（`python3 -m harness.diagnose` 亦可；装包后可用短命令）
+[project.scripts]
+rsc-diagnose = "harness.diagnose:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "hypothesis>=6", "ruff>=0.16"]
 # 内核 LSM（Landlock）强制点：真实 API = `Sandbox(...)` + **子进程** `sandbox.run(argv)`
@@ -46,6 +50,11 @@ egress = ["sandlock>=0.1", "py-landlock>=0.1", "mitmproxy>=10"]
 
 [tool.setuptools.packages.find]
 include = ["harness*"]
+
+# S24-5：对外合规语料随包分发（JSON + runner 协议说明）
+[tool.setuptools.package-data]
+"harness.spec" = ["conformance/*.json", "conformance/*.md",
+                  "conformance/vectors/*.json"]
 
 [tool.ruff]
 target-version = "py311"
@@ -82,6 +91,7 @@ markers = [
     "netns: 网络命名空间用例（需 CAP_NET_ADMIN，缺失时 xfail 登记）",
     "egress: egress 强制点用例（gate / DNS 钉住 / SSRF）",
     "raft: MS9 Raft 后端用例（需 pysyncobj；缺失时 xfail 登记，真实端口/选主约 1-2s）",
+    "tla: TLA+ 模型用例（需 java + tla2tools.jar；缺失时显式 skip，不假绿）",
 ]
 
 [tool.coverage.run]
