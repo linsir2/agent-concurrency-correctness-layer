@@ -246,7 +246,7 @@ L5 门面      harness（组装 + 端到端）
 | **新增模块** | `observability`、`admin`、`dlq` |
 | **依赖** | MS8、MS9 |
 | **入口条件** | MS9 出口通过 |
-| **出口条件** | `test_dlq`（毒任务转 `DEAD_LETTER` —— **产生路径已有 4 条**：aging `AGING_EXHAUSTED`、`escalate_quarantined`、replan 预算耗尽、aging 上限；缺的是「毒任务自动识别 + redrive」的测试）、`test_admin_pause_resume`（**需新增**：当前无 pause/resume 语义）、`test_ingress_idempotent`（**需新增**：`RunCoordinator.submit_command` 仍是空壳） |
+| **出口条件（v1.3 已达成，S15+S17）** | `test_dlq` ✅（毒任务 `POISON_TASK` 自动进 `DEAD_LETTER` + 有界 redrive）、`test_admin_pause_resume` ✅（pause 保留资源 / resume 可执行 / kill / purge）、`test_ingress_idempotent` ✅（IETF Idempotency-Key）；另有 `Harness.drain`（优雅排空）与 `observability`（`SpanSink` + 可选 OTel 适配器） |
 | **扩展点** | OTel / Prometheus 适配器 |
 | **承上启下** | 交付给外部用户 |
 

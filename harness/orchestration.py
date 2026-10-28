@@ -15,8 +15,8 @@ import itertools
 import threading
 from dataclasses import dataclass
 
-from .types import ACB, TASK_TERMINAL, EventKind, Status, TaskState, advance
 from .storage.blob import canonical_bytes
+from .types import ACB, TASK_TERMINAL, EventKind, Status, TaskState, advance
 
 
 def _normalize_required(t) -> dict:
@@ -850,6 +850,16 @@ class RunCoordinator:
         with self._lock:
             self._active[acb.id] = acb.run_id
 
+    def unregister(self, acb: ACB) -> None:
+        """S17 MS10：`purge_run` 把已终态 run 移出内存时同步清理注册表。
+
+        历史遗留：原实现只注册不清理（长跑会累积），purge 是第一个需要反注册的
+        路径；保留为显式方法而非在 `_finalize` 里自动清理（自动清理会破坏
+        `cancel_run` 对已终态后代的遍历）。
+        """
+        with self._lock:
+            self._active.pop(acb.id, None)
+
     def is_cancelled(self, acb: ACB) -> bool:
         """先查 **acb_id**（子可能用独立 run_id），再查 run_id。"""
         with self._lock:
@@ -1058,7 +1068,7 @@ class RunCoordinator:
                 loaded[acb_id] = (ref, data)
         if not loaded:
             return
-        parent_of = {aid: str((data.get("parent_id") or ""))
+        parent_of = {aid: str(data.get("parent_id") or "")
                      for aid, (_ref, data) in loaded.items()}
         roots = [aid for aid in loaded if parent_of.get(aid) not in loaded]
         for aid in roots:

@@ -15,36 +15,73 @@ from contextlib import nullcontext
 
 from .auth import Signer
 from .budget import BudgetManager, InvariantError, Reservation, _is_budget_kind
-from .checkpoint import (CheckpointCorrupt, CheckpointStore, EffectJournal,
-                         FileCheckpointStore)
+from .checkpoint import (
+    CheckpointCorrupt,
+    CheckpointStore,
+    EffectJournal,
+    FileCheckpointStore,
+)
 from .clock import SystemClock
 from .compensation import CompensationJournal
 from .context import ContextAssembler
 from .egress import EgressGuard
 from .event_log import EventLog
+from .ingress import Ingress
 from .intent_registry import IntentRegistry
 from .llm import LLMClient
-from .ingress import Ingress
-from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
-                            RunCoordinator, Scheduler, SlotTracker, _UNSET,
-                            classify_verdict)
-from .policy import (CapabilityAttenuationError, CapabilityToken, PolicyEngine,
-                     Scope, attenuate_token)
+from .orchestration import (
+    _UNSET,
+    HITL,
+    Dispatcher,
+    Planner,
+    ReconcileLoop,
+    RunCoordinator,
+    Scheduler,
+    SlotTracker,
+    classify_verdict,
+)
+from .policy import (
+    CapabilityAttenuationError,
+    CapabilityToken,
+    PolicyEngine,
+    Scope,
+    attenuate_token,
+)
+from .rebase import DELETE
 from .resolver import ScriptedResolver
 from .runtime import AgentRuntime, CrashInjected
-from .spec.receipt import (GENESIS_HASH, Receipt, ReceiptMalformed,
-                           build_receipt, receipt_hash, verify_chain_detailed)
-from .storage._lock import (RECEIPTS_ORDER, FencingRejected, _FileLock,
-                            receipts_lock_path)
+from .spec.receipt import (
+    GENESIS_HASH,
+    Receipt,
+    ReceiptMalformed,
+    build_receipt,
+    receipt_hash,
+    verify_chain_detailed,
+)
+from .storage._lock import (
+    RECEIPTS_ORDER,
+    FencingRejected,
+    _FileLock,
+    receipts_lock_path,
+)
 from .storage.atomic import atomic_write
+from .storage.blob import InMemoryBlobStore, canonical_bytes
 from .storage.codec import CodecError, dumps, loads
 from .subscription import SubscriptionRegistry
-from .storage.blob import InMemoryBlobStore, canonical_bytes
-from .types import (ACB, TASK_TERMINAL, EventKind, Mode, ReceiptConflict,
-                    ResultEnvelope, Result, Status, TaskState, Write, advance)
+from .types import (
+    ACB,
+    TASK_TERMINAL,
+    EventKind,
+    Mode,
+    ReceiptConflict,
+    Result,
+    ResultEnvelope,
+    Status,
+    TaskState,
+    Write,
+    advance,
+)
 from .workspace import WorkspaceManager, WorkspaceVersionStore
-from .rebase import DELETE
-
 
 # S13d §2.5 P0-9：worker 内嵌套 `run_task` 一律内联；该上限只用于**防递归**
 # （不是 spawn 的父子层数 `spawn_depth`，两者语义不同）。
@@ -175,7 +212,9 @@ class Harness:
                  claim_lease_ms: int | None = None,
                  aging_ms: int = 0,
                  aging_max_attempts: int = 3,
-                 max_redrives: int = 3) -> None:
+                 max_redrives: int = 3,
+                 poison_after_failures: int = 3,
+                 drain_timeout_s: float = 5.0) -> None:
         if epoch_scope not in ("run", "global"):
             raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
         if isinstance(replan_budget, bool) or not isinstance(replan_budget, int) \
@@ -354,6 +393,10 @@ class Harness:
         # pause 只阻止**未开始**的调度，资源保留（可恢复）；与 cancel 不同。
         self._paused_runs: set[str] = set()
         self.max_redrives = max(0, int(max_redrives))
+        # S17 MS10：毒任务识别阈值（连续失败 >= N → 直接 DLQ，避免无限重试）
+        self.poison_after_failures = max(0, int(poison_after_failures))
+        self.drain_timeout_s = float(drain_timeout_s)
+        self._draining = False
         self.ingress = Ingress(self)
         # S13d §2.5 P0-10：claim 的 fence epoch 接入**写路径**（commit_batch /
         # budget.consume / effects.begin / checkpoints.save）。sync 模式无 claim
@@ -581,7 +624,7 @@ class Harness:
             watermark = self._receipt_scan_watermark
             try:
                 records = self._receipt_records(watermark)
-            except Exception as exc:  # noqa: BLE001  # K-45：回扫失败 → 拒绝服务
+            except Exception as exc:  # K-45：回扫失败 → 拒绝服务
                 self._receipt_scan_failed = True
                 raise ReceiptScanFailed(str(exc)) from exc
             new_records = [rp for rp in records if rp[0] > watermark]
@@ -1160,8 +1203,7 @@ class Harness:
                         self._receipt_heads[scope] = head
                         self._receipt_ids.update(issued)
                     for e in events:
-                        if e.seq > self._receipt_scan_watermark:
-                            self._receipt_scan_watermark = e.seq
+                        self._receipt_scan_watermark = max(self._receipt_scan_watermark, e.seq)
 
             # ⑦ 投影（锁外，可重放）：去重写走版本守卫，新写走 _apply_locked
             for (w, _d, _vb, version_after, _ck), ev in zip(records, dedup_events):
@@ -1910,7 +1952,7 @@ class Harness:
 
         能按 `child_id` 找回 → 回填 ref；完全找不到 → 孤儿结算（留痕后移除条目）。
         """
-        pending_ids = set((getattr(acb, "children_pending", None) or {}))
+        pending_ids = set(getattr(acb, "children_pending", None) or {})
         new_entries: list = []
         changed = False
         for entry in list(getattr(acb, "children_ids", []) or []):
@@ -2144,7 +2186,7 @@ class Harness:
                     if failure is not None:
                         raise _SpawnAbort(failure)
                 self.budget.flush_pending()
-            except BaseException as exc:  # noqa: BLE001  # CrashInjected 必须回滚后重抛
+            except BaseException as exc:  # CrashInjected 必须回滚后重抛
                 with self.budget.suppressed():
                     self._spawn_rollback(child_id, node, resv, slot)
                 self.budget.discard_pending()
@@ -2327,9 +2369,7 @@ class Harness:
             status = "NEEDS_RECONCILIATION"
         elif pending:
             status = "RUNNING"
-        elif total == 0:
-            status = "DONE"
-        elif terminal == total and done == total and not partial_child:
+        elif total == 0 or terminal == total and done == total and not partial_child:
             status = "DONE"
         elif terminal == total and done > 0 and (failed or cancelled or partial_child):
             status = "DONE_PARTIAL"
@@ -2736,6 +2776,82 @@ class Harness:
             "event_log_tail": self.event_log.tail(),
         }
         return {"counters": counters, "gauges": gauges}
+
+    # ---- S17 MS10：优雅排空 / Admin kill·purge / 可观测 ----------------
+    def drain(self, timeout_s: float | None = None) -> dict:
+        """优雅排空：**不再接受新调度**，等在途任务自然结束。
+
+        返回值：`{"drained": 已终态数, "remaining": 未完成数, "timed_out": bool}`
+
+        与 `cancel` 的区别：drain **不打断**在途任务（避免半提交），只阻止新任务
+        被取出执行；超时也不强杀（由调用方决定是否 `kill_run`）。
+        """
+        import time as _time
+
+        timeout = self.drain_timeout_s if timeout_s is None else float(timeout_s)
+        self._draining = True
+        deadline = _time.monotonic() + max(0.0, timeout)
+        before = sum(1 for a in self.acbs.values() if a.state in TASK_TERMINAL)
+        while True:
+            self.pump()
+            active = [a for a in self.acbs.values() if a.state not in TASK_TERMINAL]
+            if not active:
+                return {"drained": before, "remaining": 0, "timed_out": False}
+            if _time.monotonic() >= deadline:
+                return {"drained": before, "remaining": len(active),
+                        "timed_out": True}
+            _time.sleep(0.005)
+
+    def kill_run(self, run_id: str) -> int:
+        """**立即**终止该 run 的全部未终态任务（不可恢复；资源全部结算）。
+
+        与 `pause_run` 的区别：pause 保留资源可恢复；kill 释放一切且不可恢复。
+        返回被终止的 ACB 数。
+        """
+        killed = 0
+        for acb in list(self.acbs.values()):
+            if acb.run_id != run_id or acb.state in TASK_TERMINAL:
+                continue
+            with self._transition_lock(acb):
+                if acb.state in TASK_TERMINAL:
+                    continue
+                acb.state = TaskState.CANCELLED
+                acb.failure = "KILLED_BY_ADMIN"
+                self.intents.revoke_all(acb.id)
+                self._finalize(acb)
+                killed += 1
+        self._paused_runs.discard(run_id)
+        return killed
+
+    def purge_run(self, run_id: str) -> bool:
+        """把**已全终态**的 run 移出内存（`acbs`/`plans`）。
+
+        **不删除历史事件**（保留审计与收据链），只写 `RUN_PURGED` 事件。
+        存在未终态任务 → 返回 `False`（要求先 `kill_run`/等完成）。
+        """
+        acbs = [a for a in self.acbs.values() if a.run_id == run_id]
+        if any(a.state not in TASK_TERMINAL for a in acbs):
+            return False
+        for acb in acbs:
+            self.acbs.pop(acb.id, None)
+            self.run_coordinator.unregister(acb)
+        self.plans.pop(run_id, None)
+        self._paused_runs.discard(run_id)
+        self.event_log.append(EventKind.RUN_PURGED, run_id, {}, run_id=run_id)
+        return True
+
+    def export_observability(self, sink=None) -> int:
+        """把事件流 + metrics 推给 `SpanSink`（默认 `MemorySpanSink`）。
+
+        **零依赖**：不 import OTel；需要真实 OTel 时传入
+        `observability.make_otel_sink()`。返回推送的 span 条数。
+        """
+        from .observability import MemorySpanSink, export_metrics, export_spans
+
+        target = sink if sink is not None else MemorySpanSink()
+        n = export_spans(target, self.event_log.all())
+        export_metrics(target, self.metrics())
+        return n
 
 
     # ---- S13d §2.5：aging（墙钟 deadline）+ claim fencing --------------
@@ -3317,6 +3433,32 @@ class Harness:
             return
         with self._transition_lock(acb):
             self._finalize_locked(acb)
+            self._maybe_poison_locked(acb)
+
+    def _maybe_poison_locked(self, acb: ACB) -> None:
+        """S17 MS10：**毒任务识别** —— 连续失败达阈值 → 直接 `DEAD_LETTER`。
+
+        为什么复用 `escalate_quarantined`：`QUARANTINED →(replan_budget_exhausted)
+        → DEAD_LETTER` 是**已声明**的合法边；不新造状态机暗门，也不改
+        `DEAD_LETTER` 的终态语义。失败码记为 `POISON_TASK` 以便 DLQ 检索。
+        """
+        if acb.state in (TaskState.DONE, TaskState.DONE_PARTIAL):
+            acb.consecutive_failures = 0
+            return
+        if acb.state is TaskState.FAILED:
+            acb.consecutive_failures = int(acb.consecutive_failures or 0) + 1
+            return
+        if acb.state is not TaskState.QUARANTINED:
+            return
+        acb.consecutive_failures = int(acb.consecutive_failures or 0) + 1
+        if self.poison_after_failures <= 0:
+            return
+        if acb.consecutive_failures < self.poison_after_failures:
+            return
+        # 达到阈值 → 走既有合法边进 DEAD_LETTER（真终态）
+        self.escalate_quarantined(acb)
+        acb.failure = "POISON_TASK"
+        self._safe_save(acb)
 
     def _finalize_locked(self, acb: ACB) -> None:
         # X1：结算前先释放活跃 claim（幂等）。否则 finalize→release 的顺序会让
@@ -3848,6 +3990,8 @@ class Harness:
             # S13d §2.5：aging 计数跨恢复继承（否则重规划/重准入会无限超时）
             acb.aging_count = int(data.get("aging_count", 0) or 0)
             acb.redrive_count = int(data.get("redrive_count", 0) or 0)
+            acb.consecutive_failures = int(
+                data.get("consecutive_failures", 0) or 0)
             # X7：恢复 claim 三字段（观测用）；租约已过期 → 立即视为已释放，
             # 允许重新 claim（本进程的 scheduler 本就没有该 claim）。
             acb.claim_epoch = int(data.get("claim_epoch", 0) or 0)
@@ -4317,4 +4461,4 @@ def create_production_harness(*args, **kwargs) -> Harness:
     return harness
 
 
-__all__ = ["Harness", "ReceiptScanFailed", "EpochStore", "create_production_harness"]
+__all__ = ["EpochStore", "Harness", "ReceiptScanFailed", "create_production_harness"]

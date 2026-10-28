@@ -147,7 +147,8 @@ class BudgetManager(Protocol):
     def create_node(self, node_id: str, limits: int, parent_id: str = "run") -> Any:
         ...
 
-    def reserve(self, node_id: str, amount: int) -> Reservation | None:
+    def reserve(self, node_id: str, amount: int, *,
+                reservation_id: Optional[str] = None) -> Reservation | None:
         ...
 
     def consume(self, reservation_id: str, amount: int = 1, *,

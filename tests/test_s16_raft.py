@@ -51,6 +51,24 @@ def _require_raft() -> None:
     pytest.xfail(reason)
 
 
+@pytest.fixture(scope="module")
+def shared_cluster():
+    """**K-84**：模块级共享集群，仅供「只读集群、不需状态隔离」的用例复用。
+
+    每测试新建 3 节点集群约 0.5–0.7s；这里把纯观测类用例（选主 / epoch）
+    合并到一次建簇，缩短 Raft 子集耗时（不改任何断言）。
+    """
+    _require_raft()
+    cluster = RaftCluster(_ReplicatedLog, base_port=_base_port())
+    if not cluster.wait_ready(20.0):
+        cluster.close()
+        pytest.fail("共享集群未在 20s 内就绪")
+    try:
+        yield cluster
+    finally:
+        cluster.close()
+
+
 @pytest.fixture
 def raft_log():
     _require_raft()
@@ -69,17 +87,12 @@ def _port_free(port: int) -> bool:
 
 
 # ============================================================ S16-1
-def test_s16_1_cluster_elects_leader():
+def test_s16_1_cluster_elects_leader(shared_cluster):
     """3 节点均 ready，且能选出 leader（20s 上限内）。"""
-    _require_raft()
-    cluster = RaftCluster(_ReplicatedLog, base_port=_base_port())
-    try:
-        assert cluster.wait_ready(20.0), "集群未在 20s 内就绪"
-        assert all(n.isReady() for n in cluster.nodes)
-        assert cluster.leader() is not None
-        assert cluster.quorum() is True
-    finally:
-        cluster.close()
+    cluster = shared_cluster
+    assert all(n.isReady() for n in cluster.nodes)
+    assert cluster.leader() is not None
+    assert cluster.quorum() is True
 
 
 # ============================================================ S16-2
@@ -193,20 +206,23 @@ def test_s16_7_harness_runs_e2e_with_raft(raft_log):
 
 
 # ============================================================ S16-8
-def test_s16_8_epoch_comes_from_consensus():
-    """epoch 由 Raft term 推进；本地 `bump_epoch()` **不自增**。"""
-    _require_raft()
-    cluster = RaftCluster(_ReplicatedLog, base_port=_base_port())
-    try:
-        assert cluster.wait_ready(20.0)
+def test_s16_8_epoch_comes_from_consensus(shared_cluster):
+    """epoch 由 Raft term 推进；本地 `bump_epoch()` **明确不可用**（S17 K-85）。
+
+    S17 变更：原实现「返回同值」会让调用方误以为已推进 → 改为显式抛错，
+    并暴露 `supports_bump=False`，避免静默语义漂移。
+    """
+    from harness.storage.raft import EpochNotBumpable
+
+    cluster = shared_cluster
+    if True:
         epoch = RaftEpochSource(cluster)
         e1 = epoch.read_epoch()
         assert e1 >= 1, "leader 的 term 应 >= 1"
-        assert epoch.bump_epoch() == e1, (
-            "本地 bump_epoch 不得自增（否则旧 leader 可越过 fence）")
-        assert epoch.read_epoch() == e1
-    finally:
-        cluster.close()
+        assert epoch.supports_bump is False
+        with pytest.raises(EpochNotBumpable):
+            epoch.bump_epoch()
+        assert epoch.read_epoch() == e1, "读 epoch 不应被失败的 bump 改变"
 
 
 # ============================================================ S16-10

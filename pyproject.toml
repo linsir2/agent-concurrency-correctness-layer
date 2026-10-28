@@ -27,6 +27,8 @@ sandbox = ["sandlock>=0.1"]
 # MS9 分布式化：Raft 组替换「单写者 seq / reserve」（MIT，2025-02 仍在维护）
 # 未安装 → `RaftEventLog()` 抛 `RaftUnavailable`（fail-closed，不静默降级为单机）
 raft = ["pysyncobj>=0.3.14"]
+# MS10 可观测：真实 OTel 导出（**可选**；未装时 `make_otel_sink()` fail-closed）
+otel = ["opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]
 # 备选 LSM 绑定（sandlock 不可解析时的降级候选；不自研 seccomp/Landlock）
 landlock-alt = ["py-landlock>=0.1"]
 # L7 代理（只与 netns MODE_B 搭配；单独用不构成强制点，§0.1）

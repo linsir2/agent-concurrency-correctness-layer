@@ -106,6 +106,7 @@ class EventKind(str, Enum):
     RUN_PAUSED = "RUN_PAUSED"                # Admin 暂停（可恢复，保留资源）
     RUN_RESUMED = "RUN_RESUMED"              # Admin 恢复
     DLQ_REDRIVEN = "DLQ_REDRIVEN"            # 死信显式重放（审计）
+    RUN_PURGED = "RUN_PURGED"                # Admin purge（移出内存，**不删历史事件**）
     PIVOT = "PIVOT"
     PLAN_CREATED = "PLAN_CREATED"
     PLAN_PATCHED = "PLAN_PATCHED"
@@ -393,3 +394,4 @@ class ACB:
     claim_lease_until_ms: int = 0         # 快照中记录的 claim 租约到期（X7）
     aging_count: int = 0                  # 累计 aging 超时次数（>= N → DEAD_LETTER）
     redrive_count: int = 0                # S15 D2：死信重放次数（>= max_redrives → 拒绝）
+    consecutive_failures: int = 0         # S17 MS10：连续失败次数（>= 阈值 → 毒任务 DLQ）

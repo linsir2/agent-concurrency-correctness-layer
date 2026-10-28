@@ -72,7 +72,8 @@ chk("K-70 未实现严格化（宽松默认仍在）", TaskState.DONE_PARTIAL in
 ms = open(str(_ROOT / 'docs/milestones.md'), encoding='utf-8').read()
 chk("MS8 分级已更新（v1.2 复核）", "覆盖强度（v1.2 已按代码复核修正）" in ms)
 chk("MS9 前置已更新（注入已存在）", "已支持全组件 keyword 注入" in ms)
-chk("MS10 已更新（4 条路径）", "产生路径已有 4 条" in ms)
+chk("MS10 已按实况更新（S15+S17 已达成出口）",
+    "已达成，S15+S17" in ms or "产生路径已有 4 条" in ms)
 
 # --- 测试文件与用例名
 for f in ("tests/test_s14_boundaries.py", "tests/test_s14_i12.py"):

@@ -21,7 +21,6 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
 
 from .types import Event, EventKind, Result, Status
 
@@ -58,7 +57,7 @@ class BudgetNode:
         self,
         node_id: str,
         limits: int,
-        parent: "BudgetNode | None" = None,
+        parent: BudgetNode | None = None,
         owner: str = "",
         run_id: str = "",
     ) -> None:
@@ -68,7 +67,7 @@ class BudgetNode:
         self.subtree_reserved = 0     # 本节点 + 全部后代（显式维护）
         self.consumed = 0             # 已确认消耗（永久账）
         self.folded_consumed = 0      # 归档子树折入的永久账（无对应预留条目）
-        self.children: list["BudgetNode"] = []
+        self.children: list[BudgetNode] = []
         self.reservations: dict[str, Reservation] = {}
         self.owner = owner
         self.run_id = run_id          # K-40：预算事件按 run 归属（per-run 过滤）
@@ -307,7 +306,14 @@ class BudgetManager:
     # ------------------------------------------------------------------ #
     # 预留 / 释放 / 结算
     # ------------------------------------------------------------------ #
-    def reserve(self, node_id: str, amount: int) -> Reservation | None:
+    def reserve(self, node_id: str, amount: int, *,
+                reservation_id: str | None = None) -> Reservation | None:
+        """预留 `amount`。
+
+        `reservation_id`（S17 K-81）：**可注入**确定性 id —— Raft 后端在复制
+        状态机内用递增计数器生成（`f"R{n}"`），使各副本得到**相同** id，
+        从而使预算状态机可复制。缺省 `None` → `uuid4()`（保持既有语义）。
+        """
         if not self._valid_amount(amount):
             return None
         node0 = self._nodes.get(node_id)
@@ -327,7 +333,7 @@ class BudgetManager:
             for a in chain:
                 a.subtree_reserved += amount
             node.self_reserved += amount
-            resv = Reservation(uuid.uuid4().hex, node_id, amount)
+            resv = Reservation(reservation_id or uuid.uuid4().hex, node_id, amount)
             node.reservations[resv.reservation_id] = resv
             self._reservations[resv.reservation_id] = (node, resv)
             self._emit(EventKind.BUDGET_RESERVED, node_id,

@@ -23,7 +23,9 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
                  tombstone_ttl_s: float = 86400.0,
                  hitl_timeout_ms: int = 30_000,
                  max_concurrent: int = 100,
-                 checkpoints=None, checkpoint_root=None) -> Harness:
+                 checkpoints=None, checkpoint_root=None,
+                 poison_after_failures: int = 3,
+                 drain_timeout_s: float = 5.0) -> Harness:
     """默认 Harness + 通配能力 token（D13：deny-by-default 下的测试夹具）。
 
     安全用例必须用**不装 default_token** 的 `Harness()` 自行断言拒绝。
@@ -44,7 +46,9 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
                 gc_every=gc_every, tombstone_ttl_s=tombstone_ttl_s,
                 hitl_timeout_ms=hitl_timeout_ms,
                 max_concurrent=max_concurrent,
-                checkpoints=checkpoints, checkpoint_root=checkpoint_root)
+                checkpoints=checkpoints, checkpoint_root=checkpoint_root,
+                poison_after_failures=poison_after_failures,
+                drain_timeout_s=drain_timeout_s)
     if probe is not None:
         h.effects._probe = probe
     if toolgw is not None:
