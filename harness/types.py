@@ -322,3 +322,9 @@ class ACB:
     span_id: str = ""
     parent: "ACB | None" = None
     children: list = field(default_factory=list)
+    # ---- S13-0 §2.1：一次性 schema 迁移（均用 `.get()` 读，兼容旧 checkpoint）----
+    hitl_pending: dict | None = None      # {"approval_id","deadline_ms","plan_version"}
+    hitl_outcome: dict | None = None      # {"decision","reason","approval_id"}（结算后）
+    replan_count: int = 0
+    parent_id: str = ""                   # 父 ACB id（spawn_child 用，空 = 无父）
+    children_ids: list = field(default_factory=list)  # [(acb_id, checkpoint_ref)]

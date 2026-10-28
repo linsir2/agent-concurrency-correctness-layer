@@ -8,6 +8,8 @@
 
 * 时序指标（`wall` / `speedup` / `throughput` / `latency` / `serialization_rate`）
   每次重跑后刷新，不再与 `result.json` 脱节；
+* **§3 五项主指标表**（`primary`）也由脚本生成 —— 之前是人工维护，重跑后
+  `serialization_rate` 漂移会让 `report_check` 越界（F7）；
 * 确定性指标（`lost` / `conflict` / `wasted` / 判定）**不在此列** —— 它们由
   `report_check.py` 逐值校验，必须稳定；
 * 叙述章节（§1–§3、§5–§9）由人维护，脚本不碰。
@@ -35,6 +37,32 @@ def _fmt(value: float, digits: int = 3) -> str:
     if abs(value) >= 1:
         return f"{value:.2f}"
     return f"{value:.{digits}f}"
+
+
+def _primary_table(summary: dict) -> str:
+    """§3 五项主指标表（12 行 = 4 负载 × B1/B2/B3）。
+
+    列序必须与 `bench/report_check.py::check_report` 的索引一致：
+    `0 负载 | 1 条件 | 2 lost | 3 conflict_detected | 4 conflict_silent |
+     5 serialization | 6 wasted`。
+    """
+    lines = [
+        "| 负载 | 条件 | `lost_update_rate` | `conflict_rate_detected` "
+        "| `conflict_rate_silent` | `serialization_rate` | `wasted_work` |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for wl in ("C0", "C1", "C2", "C3"):
+        for cond in ("B1", "B2", "B3"):
+            row = summary[wl][cond]
+            lines.append("| {} | {} | {:.3f} | {:.3f} | {:.3f} | {:.3f} | {:.3f} |".format(
+                wl, cond,
+                row["lost_update_rate"]["mean"],
+                row["conflict_rate_detected"]["mean"],
+                row["conflict_rate_silent"]["mean"],
+                row["serialization_rate"]["mean"],
+                row["wasted_work"]["mean"],
+            ))
+    return "\n".join(lines)
 
 
 def _speed_table(speed: dict) -> str:
@@ -131,6 +159,7 @@ def regen(result_path: Path, report_path: Path) -> None:
     text = report_path.read_text(encoding="utf-8")
 
     blocks = {
+        "primary": _primary_table(summary),
         "speed": _speed_table(data["speed"]),
         "throughput": _throughput_table(summary),
         "latency": _latency_table(summary),

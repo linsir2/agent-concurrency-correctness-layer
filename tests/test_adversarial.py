@@ -237,39 +237,72 @@ def test_a7_backpressure_degrades_to_snapshot():
 
 
 # ---------------------------------------------------------------- A8
-def test_a8_hitl_crash_budget_compensation():
-    """A8：HITL 挂起 + 崩溃 + 预算 + 补偿 → 不误杀、不泄漏。"""
+def test_a8_hitl_suspend_crash_before_decision_stays_waiting(monkeypatch):
+    """A8①：挂起 → 崩溃（决策前）→ recover 仍 WAITING，预算未结算。"""
     h = make_harness(run_limits=100)
     seed(h, "r", "base")
     plan = h.planner.plan("A8", [{"task_id": "T1", "min_budget": 30}])
     h.plans["A8"] = plan
     acb = admit(h, "A8", plan, "T1")
 
-    # 挂起前 staged 被丢弃、锁被释放
-    h.run_task(acb, [decision(1, stage("r", "x"), hitl())])
-    assert acb.hitl_result is not None
-    assert acb.staged == {}                       # discard_staged
-    # release_all_locks：无 valid 租约且 active 意图为空（`len(_leases)==0` 恒假）
+    def crashy(acb_):
+        raise CrashInjected(1, 0)          # save 之后、决策之前
+
+    monkeypatch.setattr(h.hitl, "resolve", crashy)
+    with pytest.raises(CrashInjected):
+        h.run_task(acb, [decision(1, stage("r", "x"), hitl())])
+
+    # 挂起前 staged 被丢弃、锁被释放；审批尚未结算
+    assert acb.state is TaskState.WAITING_APPROVAL
+    assert acb.staged == {}
     assert not [lease for lease in h.intents._leases.values() if lease.valid]
     assert not [v for v in h.intents._active.values() if v]
-
-    # 崩溃恢复：非终态不判 stale（ReconcileLoop 排除 WAITING_APPROVAL）
+    approval_id = acb.hitl_pending["approval_id"]
     ref = acb.result_ref
-    recovered = h.recover(ref)
-    assert recovered.state in (TaskState.RUNNING, TaskState.DONE)
 
-    # 节点身份含 run/attempt，不得按固定 'B-T1' 查找；recover 须恢复预留句柄
+    recovered = h.recover(ref)
+    assert recovered.state is TaskState.WAITING_APPROVAL
+    assert recovered.hitl_pending["approval_id"] == approval_id
+    assert recovered.hitl_outcome is None
+    # 预算未被误结算：预留仍 ACTIVE、subtree_reserved 原样
     assert recovered.reservation_ids != []
     assert recovered.budget_node is not None
-    node_id = recovered.budget_node.node_id
-    assert h.budget._nodes[node_id] is recovered.budget_node
-    assert all(rid in h.budget._reservations for rid in recovered.reservation_ids)
-
-    # 预留状态被恢复：checkpoint 保存于 `_finalize` 结算之前（K-3），
-    # 故恢复出来的是「仍占用 30」的活跃预留，且不变量自洽
-    h.budget.check_invariants()
-    assert recovered.budget_node.self_reserved == 30
     assert h.budget.root.subtree_reserved == 30
+    h.budget.check_invariants()
+
+
+def test_a8_hitl_approved_crash_then_recover_and_finish():
+    """A8②：批准后崩溃 → recover RUNNING → 继续执行 DONE，预算正确结算。"""
+    h = make_harness(run_limits=100)
+    seed(h, "r", "base")
+    plan = h.planner.plan("A8", [{"task_id": "T1", "min_budget": 30}])
+    h.plans["A8"] = plan
+    acb = admit(h, "A8", plan, "T1")
+
+    assert h.run_task(acb, [decision(1, stage("r", "x"), hitl())]) \
+        == Status.NEEDS_APPROVAL
+    assert acb.state is TaskState.WAITING_APPROVAL
+    h.hitl.set_result(acb.run_id, acb.hitl_pending["approval_id"],
+                      {"approved": True})
+
+    # 批准后执行第 2 轮，在 `finish` 之前崩溃（不产生 UNKNOWN 副作用）
+    with pytest.raises(CrashInjected):
+        h.run_task(acb, [decision(2, finish())], crash_at=(2, 0))
+    assert acb.state is TaskState.RUNNING          # 已过审批，非挂起
+
+    recovered = h.recover(acb.result_ref)
+    assert recovered.state in (TaskState.RUNNING, TaskState.DONE)
+    assert recovered.reservation_ids != []
+    assert recovered.budget_node is not None
+    assert h.budget.root.subtree_reserved == 30
+
+    # 恢复后继续执行 → DONE + 预算结算干净
+    st = h.run_task(recovered, [decision(3, finish())])
+    assert st == Status.OK
+    assert recovered.state is TaskState.DONE
+    assert recovered.hitl_pending is None
+    assert h.budget.root.subtree_reserved == 0
+    h.budget.check_invariants()
 
 
 # ---------------------------------------------------------------- A9

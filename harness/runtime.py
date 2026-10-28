@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import copy
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
+from .orchestration import classify_verdict
 from .rebase import (MISSING, MergeResult, _kind, _merge_object, _strict_eq,
                      merge3)
 from .spec.receipt import GENESIS_HASH
@@ -25,6 +27,7 @@ from .types import (
     ReceiptConflict,
     Result,
     Status,
+    TASK_TERMINAL,
     TaskState,
     Write,
     advance,
@@ -59,6 +62,10 @@ class AgentRuntime:
         if acb.state is TaskState.QUARANTINED:
             # 已隔离：不得覆写为 FAILED（文档 §5.5）
             return Status.SEMANTIC_REJECTED
+        if acb.state in TASK_TERMINAL:
+            # F4：tick 可能已判超时（FAILED）—— 终态不得被无条件改回 RUNNING
+            # （否则任务真的进 guard/执行，且 failure 被覆盖成 BUDGET_EXHAUSTED）。
+            return self.h._terminal_status(acb)
         acb.state = TaskState.RUNNING
         for decision in decisions:
             acb.turn_seq = decision.turn_seq
@@ -98,7 +105,11 @@ class AgentRuntime:
                     return st
                 if st in (Status.OK, Status.VALID):      # D13b：本 turn 有进展
                     progressed = True
-                if st in (Status.CANCELLED, Status.APPROVAL_TIMEOUT):
+                if st in (Status.CANCELLED, Status.APPROVAL_TIMEOUT, Status.DENIED):
+                    return st
+                if acb.state is TaskState.WAITING_APPROVAL:
+                    # S13a §2.2：三态 `_UNSET` → 保持 WAITING_APPROVAL 并停止执行
+                    # （不执行后续 action、不失败）；批准后才 advance("resume") → RUNNING。
                     return st
                 if st == Status.NEEDS_APPROVAL:
                     continue
@@ -281,22 +292,53 @@ class AgentRuntime:
 
     @register_action("request_hitl")
     def _action_request_hitl(self, acb: ACB, action: Action, i: int) -> Result:
+        """S13a §2.2：三态审批（`_UNSET` / 拒绝 / 批准）；超时由 `tick()` 判定。
+
+        F8：状态迁移走 `advance("request_approval")`（唯一写入口），不再直接赋值；
+        结算后由 `_record_approval` 清 `hitl_pending` 并 append `APPROVAL_RESOLVED`。
+        """
         acb.staged.clear()
         self.h.intents.revoke_all(acb.id)
-        acb.state = TaskState.WAITING_APPROVAL
+        moved = advance(acb, "request_approval")     # RUNNING → WAITING_APPROVAL
+        if moved != Status.OK:
+            return moved
+        # approval_id 随 hitl_pending 落盘（P0-2：不用 generation 做键）
+        approval_id = uuid.uuid4().hex
+        now_ms = self.h.clock.now_ms()
+        plan = self.h.plans.get(acb.run_id)
+        task = plan.get("tasks", {}).get(acb.task_id) if plan else None
+        plan_version = (int(task.get("plan_version", 1))
+                        if isinstance(task, dict) else 1)
+        deadline_ms = now_ms + int(getattr(self.h, "hitl_timeout_ms", 30_000))
+        acb.hitl_pending = {
+            "approval_id": approval_id,
+            "deadline_ms": deadline_ms,
+            "plan_version": plan_version,
+        }
+        # write-ahead：先落盘再 append `APPROVAL_RAISED`（崩溃后可续判）
         self.h.checkpoints.save(acb)
-        self.h.event_log.append(EventKind.APPROVAL_RAISED, acb.task_id, {},
-                                producer=acb.id)
-        resolved = self.h.hitl.resolve(acb)
-        if resolved is None:
-            acb.state = TaskState.FAILED
-            acb.failure = "APPROVAL_TIMEOUT"
-            return Result(Status.APPROVAL_TIMEOUT, {})
-        acb.hitl_result = resolved
-        acb.state = TaskState.RUNNING
-        self.h.event_log.append(EventKind.APPROVAL_RESOLVED, acb.task_id, {},
-                                producer=acb.id)
-        return Result(Status.NEEDS_APPROVAL, {})
+        self.h.event_log.append(EventKind.APPROVAL_RAISED, acb.task_id,
+                                {"approval_id": approval_id,
+                                 "deadline_ms": deadline_ms},
+                                producer=acb.id, run_id=acb.run_id)
+        kind = classify_verdict(self.h.hitl.resolve(acb))   # F1：严格三态
+        if kind == "unset":
+            # 还没人审批：保持 WAITING_APPROVAL（不执行、不失败）
+            return Result(Status.NEEDS_APPROVAL, {"approval_id": approval_id})
+        if kind == "approved":
+            acb.hitl_result = {"approved": True}
+            advance(acb, "resume")
+            self.h._record_approval(acb, "approved", "APPROVED")
+            self.h.checkpoints.save(acb)
+            return Result(Status.NEEDS_APPROVAL, {"approval_id": approval_id})
+        # 显式拒绝 / 非法判词：走唯一 FAILED 边，failure 码区分 denied / invalid
+        advance(acb, "timeout")
+        acb.failure = "APPROVAL_DENIED" if kind == "denied" else "APPROVAL_INVALID"
+        self.h._record_approval(
+            acb, "denied" if kind == "denied" else "invalid", acb.failure)
+        self.h.checkpoints.save(acb)
+        return Result(Status.DENIED,
+                      {"reason": acb.failure, "approval_id": approval_id})
 
     @register_action("finish")
     def _action_finish(self, acb: ACB, action: Action, i: int) -> Result:

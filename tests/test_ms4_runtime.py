@@ -47,7 +47,16 @@ def test_t19_registry_dispatches_five_kinds():
     results.append(h.runtime._do_action(acb, Action(kind="finish"), 3))
 
     hitl_acb = ACB(id="A-T19H", run_id="R19", task_id="T2")
-    results.append(h.runtime._do_action(hitl_acb, Action(kind="request_hitl"), 0))
+    hitl_acb.state = TaskState.RUNNING        # 真实路径：runtime 已置 RUNNING
+    # S13a 契约迁移：HITL 默认 deny（`_UNSET` ≠ 批准）→ 首次派发返回 NEEDS_APPROVAL；
+    # 拿到 approval_id 后按**新签名**显式审批（F3：不再有 legacy task_id 键）。
+    first = h.runtime._do_action(hitl_acb, Action(kind="request_hitl"), 0)
+    results.append(first)
+    assert first == Status.NEEDS_APPROVAL
+    approval_id = hitl_acb.hitl_pending["approval_id"]
+    h.hitl.set_result("R19", approval_id, {"approved": True})
+    assert h._hitl_gate(hitl_acb) is None
+    assert hitl_acb.state is TaskState.RUNNING
 
     assert all(isinstance(r, Result) for r in results)
     assert [r.status for r in results] == [

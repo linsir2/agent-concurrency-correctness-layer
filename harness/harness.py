@@ -22,8 +22,9 @@ from .event_log import EventLog
 from .intent_registry import IntentRegistry
 from .llm import LLMClient
 from .orchestration import (Dispatcher, HITL, Planner, ReconcileLoop,
-                            RunCoordinator, Scheduler, SlotTracker)
-from .policy import PolicyEngine
+                            RunCoordinator, Scheduler, SlotTracker, _UNSET,
+                            classify_verdict)
+from .policy import CapabilityToken, PolicyEngine
 from .resolver import ScriptedResolver
 from .runtime import AgentRuntime, CrashInjected
 from .spec.receipt import (GENESIS_HASH, Receipt, ReceiptMalformed,
@@ -134,6 +135,7 @@ class Harness:
                  aging_max: int = 5, max_steps: int = 10_000,
                  max_concurrent: int = 100,
                  policy_default_allow: bool = False, *,
+                 hitl_timeout_ms: int = 30_000,
                  clock=None, event_log=None, intents=None, versions=None,
                  workspace=None, budget=None, checkpoints=None, effects=None,
                  policy=None, context=None, subscriptions=None,
@@ -157,6 +159,7 @@ class Harness:
         self.aging_max = aging_max
         self.max_steps = max_steps
         self.max_concurrent = max_concurrent
+        self.hitl_timeout_ms = int(hitl_timeout_ms)   # S13a：审批超时（tick 判定）
         self.retention = retention
         self.per_action_delay = per_action_delay   # §2.5：基准配对用注入点
         # S12 K-33：per-run 高水位游标（每 run 独立推进，见 `floor_for`）
@@ -260,6 +263,9 @@ class Harness:
 
         self.slots = SlotTracker(max_concurrent, shared=self.checkpoints)
         self.checkpoints.slots = self.slots        # checkpoint 快照活跃槽位
+        # F6：checkpoint 落盘的是**有效 token**（`acb.capability` → `policy._tokens`
+        # → `default_token`），否则跨进程 recover 会拿到 `None` → 工具全 DENIED。
+        self.checkpoints.token_provider = self._effective_token
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)
         self.scheduler = Scheduler(self)
@@ -1425,18 +1431,185 @@ class Harness:
         self.run_coordinator.register(acb)
         if acb.state is not TaskState.ADMITTED:
             return acb
+        # F8：原「HITL 判态」分支在此处是死代码（新准入恒为 ADMITTED，永远不会
+        # 走到 WAITING_APPROVAL）；恢复路径统一走 `run_task` 的入口判态，故删除。
         self.run_task(acb, decisions, crash_at=crash_at)
         return acb
 
-    def run_task(self, acb: ACB, decisions, crash_at=None) -> Status:
+    def run_task(self, acb: ACB, decisions, crash_at=None) -> Status | Result:
         """外部直接调用入口：注册 + push 到调度器 + 执行 + 消费调度器。"""
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
+        # S13a P0-3：唯一超时驱动面（每轮调用）；recover 结束也调一次。
+        self.tick()
+        # 修 B-1：`runtime.run` 会无条件置 RUNNING —— 必须在进入 `_run_one`
+        # **之前**判态，否则恢复出的 WAITING_APPROVAL 审批被绕过。
+        gate = self._hitl_gate(acb)
+        if gate is not None:
+            return gate                     # 不 push、不 finalize（槽位已在等待态释放）
+        if acb.state in TASK_TERMINAL:
+            return self._terminal_status(acb)   # tick 已在本次调用中结算过期审批
         self.scheduler.push(acb.id)            # D10：调度器存 acb.id（不再存 task_id）
         try:
             return self._run_one(acb, decisions, crash_at=crash_at)
         finally:
             self._drain_scheduler()            # D12：异常路径（含 CrashInjected）也消费队列
+
+    # ---- HITL 结算 -------------------------------------------------
+    @staticmethod
+    def _approval_slot(acb: ACB) -> tuple[str | None, int | None]:
+        """取 `(approval_id, deadline_ms)`；任一不可用 → `None`（fail-closed 依据）。"""
+        pending = acb.hitl_pending if isinstance(acb.hitl_pending, dict) else None
+        if pending is None:
+            return (None, None)
+        approval_id = pending.get("approval_id")
+        deadline = pending.get("deadline_ms")
+        if not isinstance(approval_id, str) or not approval_id:
+            approval_id = None
+        if isinstance(deadline, bool) or not isinstance(deadline, int):
+            deadline = None
+        return (approval_id, deadline)
+
+    def _record_approval(self, acb: ACB, decision: str, reason: str) -> None:
+        """F8/F11：结算审批 —— 落 `hitl_outcome`、清 `hitl_pending`、写审计事件。
+
+        批准/拒绝/超时/非法/状态丢失**全部** append `APPROVAL_RESOLVED`
+        （payload 带 `approval_id` + `decision` + `reason`），避免只剩 RAISED。
+        """
+        approval_id, _ = self._approval_slot(acb)
+        acb.hitl_outcome = {
+            "decision": decision,
+            "reason": reason,
+            "approval_id": approval_id,
+        }
+        acb.hitl_pending = None
+        self.event_log.append(
+            EventKind.APPROVAL_RESOLVED, acb.task_id,
+            {"approval_id": approval_id, "decision": decision, "reason": reason},
+            producer=acb.id, run_id=acb.run_id)
+
+    def _hitl_gate(self, acb: ACB) -> Status | Result | None:
+        """S13a §2.2：`WAITING_APPROVAL` 进入执行前的三态判态（fail-closed）。
+
+        - `_UNSET` → `NEEDS_APPROVAL`，保持等待（不 push / 不 finalize）；
+        - `{"approved": True}` → `advance("resume")` 继续（重占槽位）；
+        - `None` / `{"approved": False}` → FAILED(APPROVAL_DENIED) + 结算；
+        - 其余判词（str / 非 dict / approved 非 bool）→ FAILED(APPROVAL_INVALID)；
+        - `hitl_pending` 不可用（无 `approval_id` / 无 `deadline_ms`）→
+          FAILED(APPROVAL_STATE_LOST)（F2：绝不允许永久挂起）。
+
+        `tick` 与本函数在 `HITL._lock` 内完成「读 verdict + 翻转状态」的 CAS。
+        """
+        if acb.state is not TaskState.WAITING_APPROVAL:
+            return None
+        with self.hitl._lock:
+            if acb.state is not TaskState.WAITING_APPROVAL:
+                return None
+            approval_id, deadline = self._approval_slot(acb)
+            if approval_id is None or deadline is None:
+                advanced = advance(acb, "timeout")
+                if advanced != Status.OK:
+                    return self._terminal_status(acb)
+                acb.failure = "APPROVAL_STATE_LOST"
+                self._record_approval(acb, "lost", "APPROVAL_STATE_LOST")
+                decision = "lost"
+            else:
+                kind = classify_verdict(self.hitl.resolve(acb))
+                if kind == "unset":
+                    return Status.NEEDS_APPROVAL
+                if kind == "approved":
+                    acb.hitl_result = {"approved": True}
+                    advanced = advance(acb, "resume")
+                    if advanced != Status.OK:
+                        return self._terminal_status(acb)
+                    self._record_approval(acb, "approved", "APPROVED")
+                    decision = "approved"
+                else:
+                    advanced = advance(acb, "timeout")
+                    if advanced != Status.OK:
+                        return self._terminal_status(acb)
+                    acb.failure = ("APPROVAL_DENIED" if kind == "denied"
+                                   else "APPROVAL_INVALID")
+                    self._record_approval(
+                        acb, "denied" if kind == "denied" else "invalid",
+                        acb.failure)
+                    decision = "denied" if kind == "denied" else "invalid"
+        if decision == "approved":
+            # F5：等待态已释放槽位 —— 恢复执行前重新占用（release 幂等）。
+            if not self.slots.try_acquire(acb.id):
+                acb.state = TaskState.QUARANTINED
+                acb.failure = "NO_SLOT"
+                acb.needs_readmit = True
+                self.intents.revoke_all(acb.id)
+                self._finalize(acb)
+                return Status.SEMANTIC_REJECTED
+            self._safe_save(acb)
+            return None
+        self.intents.revoke_all(acb.id)     # 释放租约
+        self._finalize(acb)                 # 结算预算 / 释放槽位
+        if decision == "timeout":
+            return Status.APPROVAL_TIMEOUT
+        # F11：拒绝/非法/状态丢失带结构化原因（不复用裸 `Status.DENIED`，
+        # 避免与租约失败等其它 DENIED 混淆）。
+        return Result(Status.DENIED,
+                      {"reason": acb.failure, "approval_id": approval_id})
+
+    @staticmethod
+    def _terminal_status(acb: ACB) -> Status:
+        # F11：先读审批结论（`hitl_outcome`），避免 `failure` 被预算等其它码覆盖后
+        # 把审批拒绝误报成 SEMANTIC_REJECTED。
+        outcome = getattr(acb, "hitl_outcome", None)
+        decision = outcome.get("decision") if isinstance(outcome, dict) else None
+        if decision == "timeout":
+            return Status.APPROVAL_TIMEOUT
+        if decision in ("denied", "invalid", "lost"):
+            return Status.DENIED
+        if acb.failure == "APPROVAL_TIMEOUT":
+            return Status.APPROVAL_TIMEOUT
+        if acb.failure in ("APPROVAL_DENIED", "APPROVAL_INVALID",
+                           "APPROVAL_STATE_LOST"):
+            return Status.DENIED
+        if acb.state in (TaskState.DONE, TaskState.DONE_PARTIAL):
+            return Status.OK
+        if acb.state is TaskState.CANCELLED:
+            return Status.CANCELLED
+        return Status.SEMANTIC_REJECTED
+
+    def tick(self, now_ms: int | None = None) -> None:
+        """S13a P0-3：唯一超时驱动面（fail-closed）。
+
+        supervisor / 调度器每轮调用；`recover()` 结束也调一次（否则恢复出的
+        过期审批永不结算）。**不引入后台线程**（`ManualClock` 不可共享，会 flaky）。
+
+        扫描与审批提交在 `HITL._lock` 内完成 CAS：若已有决策（批准/拒绝），
+        跳过超时（决策优先，交给 `run_task` 的入口判态处理），避免双写。
+        F2：`hitl_pending` 不可用 → `APPROVAL_STATE_LOST`（不再 `continue` 永久挂起）。
+        F4：`advance` 返回值必须校验（非法迁移 → 不结算）。
+        """
+        now = int(self.clock.now_ms() if now_ms is None else now_ms)
+        for acb in list(self.acbs.values()):
+            if acb.state is not TaskState.WAITING_APPROVAL:
+                continue
+            with self.hitl._lock:
+                if acb.state is not TaskState.WAITING_APPROVAL:
+                    continue
+                approval_id, deadline = self._approval_slot(acb)
+                if approval_id is None or deadline is None:
+                    if advance(acb, "timeout") != Status.OK:
+                        continue
+                    acb.failure = "APPROVAL_STATE_LOST"
+                    self._record_approval(acb, "lost", "APPROVAL_STATE_LOST")
+                else:
+                    if now < deadline:
+                        continue
+                    if self.hitl.peek(acb) is not _UNSET:
+                        continue            # 已有决策 → 不判超时
+                    if advance(acb, "timeout") != Status.OK:
+                        continue
+                    acb.failure = "APPROVAL_TIMEOUT"
+                    self._record_approval(acb, "timeout", "APPROVAL_TIMEOUT")
+            self.intents.revoke_all(acb.id)  # 释放租约
+            self._finalize(acb)              # 结算预算 / 释放槽位
 
     def _run_one(self, acb: ACB, decisions=None, crash_at=None) -> Status:
         """执行体（§2.6）：`runtime.run` + `_finalize`；**不 push、不 drain**（防递归）。"""
@@ -1505,7 +1678,10 @@ class Harness:
                 if self.budget.archive_node(acb.budget_node.node_id):
                     acb.budget_node = None
         self.budget.flush_pending()
-        self.slots.release(acb.id)                     # P1-5：先释放槽位（不因落盘失败跳过）
+        # F5：等待审批**不是**占槽位的理由（否则 `max_concurrent` 下等待中的任务会
+        # 饿死其他 run）；统一释放，`_hitl_gate` 批准后重新 `try_acquire`。
+        # `SlotTracker.release` 幂等，重复释放不会泄漏。
+        self.slots.release(acb.id)                 # P1-5：先释放槽位（不因落盘失败跳过）
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
             # D14：patch 后旧 ACB 的 task_id 可能已不在 plan["tasks"] 中 → 用 .get() 安全取值
             task = plan.get("tasks", {}).get(acb.task_id) if plan else None
@@ -1655,6 +1831,8 @@ class Harness:
             self.checkpoints.save(acb)
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
+        # S13a P0-3：恢复结束即驱动一次超时结算（否则恢复出的过期审批永不结算）。
+        self.tick()
         return acb
 
     def requeue_readmit(self, acb: ACB) -> ACB:
@@ -1728,17 +1906,53 @@ class Harness:
             acb.deadline = data.get("deadline")
             acb.no_progress_steps = data.get("no_progress_steps", 0)
             acb.needs_readmit = bool(data.get("needs_readmit", False))
+            # ---- S13-0 §2.1：新字段全部 `.get()` 读（兼容旧 checkpoint）----
+            hp = data.get("hitl_pending")
+            acb.hitl_pending = dict(hp) if isinstance(hp, dict) else None
+            ho = data.get("hitl_outcome")
+            acb.hitl_outcome = dict(ho) if isinstance(ho, dict) else None
+            acb.replan_count = int(data.get("replan_count", 0) or 0)
+            acb.parent_id = data.get("parent_id", "") or ""
+            children: list = []
+            for child in data.get("children_ids") or []:
+                if isinstance(child, (list, tuple)) and child:
+                    children.append((child[0],
+                                     child[1] if len(child) > 1 else None))
+            acb.children_ids = children
+            # F6：能力来源不可知 → fail-closed，不回退 `default_token`（后者会
+            # 静默抹掉 attenuation）。空串是**哨兵**：`_effective_token` 只判
+            # `is not None`，空串会原样返回并被 gateway 判为不可解析 → 拒绝；
+            # 不能留 None（会落到 `policy.default_token` 而 fail-open）。
+            #
+            # 判定依据（F10 的 schema_version 消费者）：
+            #   ① 缺 `capability` 键（旧扁平 payload）→ 丢失；
+            #   ② 有 `capability` 但为 None 且**无** `schema_version`（F10 前的
+            #      旧 payload / 旧 bug 落盘的 None）→ 丢失；
+            #   ③ 当前 schema（`schema_version` 存在）且 None → 本进程确实未签发
+            #      token，保持 None（既有回退语义）。
+            cap = data.get("capability")
+            legacy_payload = "schema_version" not in data
+            if cap is None and ("capability" not in data or legacy_payload):
+                acb.capability = ""
+                acb.needs_readmit = True
+                acb.failure = acb.failure or "CAPABILITY_LOST"
+            elif cap is not None:
+                self._restore_capability(acb, cap)
             self._restore_budget(acb, data)
             # §2.4：`slots_active` 交叉校验——非终态快照若不含本 ACB 槽位，
             # 说明快照摄于槽位释放之后（如 `_finalize` 末），标记 needs_readmit。
+            # F5：`WAITING_APPROVAL` 本来就**不**占槽位，必须豁免。
             snap_active = data.get("slots_active")
             if (isinstance(snap_active, list) and snap_active
                     and acb.state not in TASK_TERMINAL
+                    and acb.state is not TaskState.WAITING_APPROVAL
                     and acb.id not in snap_active):
                 acb.needs_readmit = True
-            if not self.slots.try_acquire(acb.id):
-                acb.state = TaskState.QUARANTINED
-                acb.failure = "NO_SLOT"
+            # F5：等待态不占槽位（与 `_finalize` 一致）；其它状态恢复即重新占用。
+            if acb.state is not TaskState.WAITING_APPROVAL:
+                if not self.slots.try_acquire(acb.id):
+                    acb.state = TaskState.QUARANTINED
+                    acb.failure = "NO_SLOT"
             self.bump_epoch()
             return acb
         except Exception:  # noqa: BLE001  # 恢复失败 → needs_readmit，不抛
@@ -1748,6 +1962,29 @@ class Harness:
             acb.failure = "restore_failed"
             acb.needs_readmit = True
             return acb
+
+    def _restore_capability(self, acb: ACB, cap) -> None:
+        """S13-0 §2.1：从 dict 重建 `CapabilityToken`（P1-4：**不得**回退 default_token）。
+
+        payload 已把 token 转成内建类型；恢复后 `_effective_token` 直接命中
+        `acb.capability`，不会落到 `policy.default_token`（后者会抹掉 attenuation）。
+        F6：字符串 token 在新进程里无法验签（换 secret / 无 signer）→
+        `CAPABILITY_LOST` + `needs_readmit`（留告警，而非静默全 DENIED）。
+        """
+        if isinstance(cap, dict):
+            acb.capability = CapabilityToken(
+                agent_id=str(cap.get("agent_id", "")),
+                tools=set(cap.get("tools") or ()),
+                paths=set(cap.get("paths") or ()),
+                network=set(cap.get("network") or ()),
+                data_class=str(cap.get("data_class", "public")),
+            )
+        elif isinstance(cap, str):
+            acb.capability = cap
+            if self.policy.resolve_token(cap) is None:
+                acb.needs_readmit = True
+                acb.failure = acb.failure or "CAPABILITY_LOST"
+        # None → 不覆盖（旧格式 / 未签发）
 
     def _restore_budget(self, acb: ACB, data: dict) -> None:
         """恢复预算节点与预留（S10a §2.2 重写）。

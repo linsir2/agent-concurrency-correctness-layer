@@ -539,16 +539,98 @@ class ReconcileLoop:
         return fixed
 
 
+_UNSET = object()          # S13a P0-1：三态哨兵（absent ≠ None）
+
+
+def classify_verdict(verdict) -> str:
+    """审批判词的**严格**分类：`unset` / `approved` / `denied` / `invalid`。
+
+    F1：只认 `{"approved": True}` 为批准、`None` 或 `{"approved": False}` 为拒绝；
+    其余（字符串 / 非 dict / `approved` 非 bool / 多余键）一律 `invalid`
+    （fail-closed，绝不落到「批准」分支）。
+    """
+    if verdict is _UNSET:
+        return "unset"
+    if verdict is None:
+        return "denied"
+    if isinstance(verdict, dict) and set(verdict) == {"approved"}:
+        value = verdict["approved"]
+        if value is True:
+            return "approved"
+        if value is False:
+            return "denied"
+    return "invalid"
+
+
 class HITL:
+    """审批处理器（S13a §2.2）。
+
+    **三态**：`_UNSET`（还没人审批）/ `None` 或 `{"approved": False}`（显式拒绝）/
+    `{"approved": True}`（批准）。超时不在本类判定，由 `Harness.tick()` 驱动。
+
+    审批键是 `(run_id, approval_id)`（P0-2）——`recover` 会把 `generation` +1，
+    用 generation 做键会让崩溃前已批准的审批在恢复后失配。`approval_id` 随
+    `acb.hitl_pending` 落盘，天然跨进程稳定。
+
+    F3：**没有 legacy 回退键**（旧签名 `set_result(task_id, verdict)` 会让同
+    `task_id` 的跨 run 审批互相串键）；`set_result` 拒绝空 `approval_id`。
+    """
+
     def __init__(self) -> None:
-        self._pending: dict[str, object] = {}
+        self._pending: dict[tuple[str, str], object] = {}
+        # P0-3：扫描（tick）与审批提交必须同一把锁内 CAS，否则「批准/超时」双写
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(acb: ACB) -> tuple[str, str] | None:
+        pending = getattr(acb, "hitl_pending", None)
+        if not isinstance(pending, dict):
+            return None
+        approval_id = pending.get("approval_id")
+        run_id = getattr(acb, "run_id", "")
+        if not isinstance(approval_id, str) or not approval_id:
+            return None
+        if not isinstance(run_id, str) or not run_id:
+            return None
+        return (run_id, approval_id)
+
+    def peek(self, acb: ACB):
+        """只查不消费（供 `tick` 在锁内做「是否已有决策」CAS）。"""
+        key = self._key(acb)
+        if key is None:
+            return _UNSET
+        with self._lock:
+            return self._pending.get(key, _UNSET)
 
     def resolve(self, acb: ACB):
-        """返回审批结果；None 表示超时。测试中可注入。"""
-        return self._pending.get(acb.task_id, {"approved": True})
+        """返回并**消费**审批结果：`_UNSET` | `None` | `{"approved": bool}`。
 
-    def set_result(self, task_id: str, result) -> None:
-        self._pending[task_id] = result
+        命中即 `pop`（F3：防 `_pending` 无界增长；键不存在时返回 `_UNSET`）。
+        """
+        key = self._key(acb)
+        if key is None:
+            return _UNSET
+        with self._lock:
+            return self._pending.pop(key, _UNSET)
 
-    def clear(self, task_id: str) -> None:
-        self._pending.pop(task_id, None)
+    def set_result(self, run_id: str, approval_id: str, verdict) -> None:
+        """提交审批结果（**唯一**签名：`set_result(run_id, approval_id, verdict)`）。
+
+        F1：入口 schema 校验 —— 只接受 `None` 或 `{"approved": bool}`，
+        其余抛 `ValueError`（不再静默接受任意对象）；F3：`run_id` /
+        `approval_id` 必须是非空字符串（空键会退化为 `(run_id, "")`，
+        一次提交可批准该 run 的所有空 pending）。
+        """
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("set_result: run_id 必须是非空字符串")
+        if not isinstance(approval_id, str) or not approval_id:
+            raise ValueError("set_result: approval_id 必须是非空字符串")
+        valid = (verdict is None
+                 or (isinstance(verdict, dict)
+                     and set(verdict) == {"approved"}
+                     and isinstance(verdict["approved"], bool)))
+        if not valid:
+            raise ValueError(
+                "set_result: verdict 只接受 None | {'approved': bool}")
+        with self._lock:
+            self._pending[(run_id, approval_id)] = verdict

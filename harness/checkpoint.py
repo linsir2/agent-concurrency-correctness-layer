@@ -34,7 +34,10 @@ from .types import Action, Event, EventKind
 
 
 _FORMAT_VERSION = 1
-_SCHEMA_VERSION = 2
+# S13-0 §2.1：payload 增 hitl_pending/hitl_outcome/replan_count/parent_id/
+# children_ids/capability；F10：`schema_version` 同时写进 payload（不止 header）。
+# 版本递增仅作标记；`load`/`load_strict` **不做严格版本比对**（旧扁平 payload 仍可读）。
+_SCHEMA_VERSION = 3
 
 _HEADER_FIELDS = (
     "format_version", "schema_version", "ref", "acb_id", "run_id", "task_id",
@@ -85,6 +88,36 @@ class EffectEntry:
     state: str = "INTENT"        # INTENT | CONFIRMED | UNKNOWN
     probe: str = ""              # "" | "True" | "False" | "None"
     updated_at: float = 0.0
+
+
+def _capability_to_payload(token) -> Any:
+    """`CapabilityToken` → 内建类型 dict（codec 只支持内建类型，直接放对象会 `TypeError`）。
+
+    `None` / 已签发的字符串 token 原样保留（codec 均支持）。
+    """
+    if token is None:
+        return None
+    if isinstance(token, str):
+        return token
+    agent_id = getattr(token, "agent_id", None)
+    if agent_id is None:
+        raise TypeError(f"不支持的 capability 类型：{type(token).__name__}")
+    return {
+        "agent_id": str(agent_id),
+        "tools": sorted(str(x) for x in (getattr(token, "tools", None) or ())),
+        "paths": sorted(str(x) for x in (getattr(token, "paths", None) or ())),
+        "network": sorted(str(x) for x in (getattr(token, "network", None) or ())),
+        "data_class": str(getattr(token, "data_class", "public")),
+    }
+
+
+def _children_to_payload(children) -> list:
+    """`[(acb_id, checkpoint_ref)]` → codec 可序列化的二元列表（内存版 ref 恒 `None`）。"""
+    out: list = []
+    for child in children or ():
+        acb_id, ref = (child[0], child[1] if len(child) > 1 else None)
+        out.append([str(acb_id), None if ref is None else str(ref)])
+    return out
 
 
 def effect_idem_key(acb, action) -> str:
@@ -255,7 +288,27 @@ class CheckpointStore:
             "spec": copy.deepcopy(acb.spec),
             "deadline": acb.deadline,
             "no_progress_steps": acb.no_progress_steps,
+            # ---- S13-0 §2.1：全部 `.get()` 读，兼容旧格式 ----
+            "hitl_pending": copy.deepcopy(getattr(acb, "hitl_pending", None)),
+            "hitl_outcome": copy.deepcopy(getattr(acb, "hitl_outcome", None)),
+            "replan_count": int(getattr(acb, "replan_count", 0) or 0),
+            "parent_id": getattr(acb, "parent_id", "") or "",
+            "children_ids": _children_to_payload(
+                getattr(acb, "children_ids", None)),
+            # F6：存**有效 token**（`acb.capability` → `policy._tokens` →
+            # `default_token`）；生产路径 token 常在 `policy._tokens`，
+            # 只存 `acb.capability` 会把 None 落盘 → 跨进程恢复后能力全丢。
+            "capability": _capability_to_payload(self._effective_capability(acb)),
+            # F10：版本号也进 payload（不止 envelope header），供 load 消费。
+            "schema_version": _SCHEMA_VERSION,
         }
+
+    def _effective_capability(self, acb):
+        """取落盘用的有效 token；`token_provider` 由 `Harness` 注入。"""
+        provider = getattr(self, "token_provider", None)
+        if callable(provider):
+            return provider(acb)
+        return getattr(acb, "capability", None)
 
     # ---- S5 快照辅助 ------------------------------------------------
     @staticmethod
