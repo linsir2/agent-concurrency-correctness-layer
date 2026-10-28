@@ -135,9 +135,9 @@ agent = Agent(name="arch", tools=[...], middleware=[RscToolMiddleware(session, w
   并把 `request_queue_size` 调到 64；
 - **不做长轮询 / SSE / TLS**：`gate` 是即时版本比较，长轮询只会挂死线程；用短轮询 +
   `Retry-After`。
-- 鉴权：`X-RSC-Auth` 共享密钥 + `hmac.compare_digest`；**`agent_id` 绝不作为请求参数**
-  （它参与幂等命名空间与 worktree 归属，冒名会命中他人收据/删他人目录），由
-  「密钥→agent_id」映射推导（沿用 [mcp_server.py](harness/integrations/mcp_server.py) 的做法）。
+- 鉴权：**每个 agent 一把密钥**（`{key: agent_id}`），逐个 `hmac.compare_digest`
+  比较；缺失密钥 `401`、未知密钥 `403`。**`agent_id` 绝不作为请求参数**（它参与
+  幂等命名空间与 worktree 归属，冒名会命中他人收据/删他人目录），只从密钥映射推导。
 - 每个请求调 `session.tick()`（与 MCP 一致），保证 reaper 在无后台线程时也推进。
 - 不交付 FastAPI 双实现（避免协议漂移）；确需 ASGI 时再开 `sidecar-fastapi` extra。
 
@@ -178,14 +178,17 @@ idempotency_key = sha256(f"{tenant}|{agent_id}|{resource}|{intent_key}")
 
 ## 6. 分轮实现计划（每轮独立可验收）
 
-| 轮 | 交付 | 出口条件 |
+| 轮 | 交付 | 状态（2026-10-28） |
 |---|---|---|
-| **S23-0** 验证基线 | 在 3.12 venv 里跑一个 CrewAI `kickoff` + OpenAI 单工具 run 的**最小真实脚本**（fake LLM / scripted），确认 §1 的阻断语义在**运行期**成立 | 阻断/放行 4 种返回值与 §1 实测一致；记录版本 |
-| **S23-1** CrewAI 适配器 | `rsc_tools` 包装 + `RscDenied`；`writes_map` | 6 场景 × CrewAI 全绿（`importorskip`）；未声明工具透传且标 `unsupported` |
-| **S23-2** OpenAI 适配器 | `rsc_run` + guardrail 注入；MCP 兜底 | 6 场景 × OpenAI 全绿；**缺 `tool_call_id` 必 raise** |
-| **S23-3** AG2 适配器 | `RscToolMiddleware` | 6 场景 × AG2 全绿；`event.id` 进审计 |
-| **S23-4** HTTP sidecar | stdlib server + 6 端点 + 鉴权 + 2 个上限 | 6 场景 × HTTP 全绿；401/411/413/429/409 全部覆盖 |
-| **S23-5** 打包/示例/文档 | extras、`examples/three_agents/`、`check_s23_conformance.py`、README 行 | 全量测试 3 轮 + S14–S23 核对 0 失败；覆盖率 ≥80 |
+| **S23-0** 验证基线 | 3.12 venv 内运行期验证 §1 的阻断语义（`HookAborted→blocked`、普通异常 `→fail-open`、openai guardrail、AG2 短路） | ✅ 结论并入 §1；venv 保留在 `/tmp/s23venv` |
+| **S23-1** CrewAI 适配器 | `rsc_tools` 包装 `BaseTool.run` + `writes_map` + `root` 注入 | ✅ [crewai.py](harness/integrations/crewai.py)，9 用例 |
+| **S23-2** OpenAI 适配器 | `rsc_agent`（guardrail + root 注入 + schema 去 root） | ✅ [openai_agents.py](harness/integrations/openai_agents.py)，9 用例 |
+| **S23-3** AG2 适配器 | `rsc_middleware`（`on_tool_execution` 短路） | ✅ [ag2.py](harness/integrations/ag2.py)，7 用例 |
+| **S23-4** HTTP sidecar | stdlib server + 6 端点 + 每 agent 密钥 + 体积/并发上限 | ✅ [http_sidecar.py](harness/integrations/http_sidecar.py)，14 用例 |
+| **S23-5** 打包/示例/文档 | extras（`crewai`/`openai-agents`/`ag2`/`integrations`）+ README/文档 | ✅ extras 与文档；示例与 conformance 脚本留到下一轮 |
+
+**门禁**：主环境（3.14）**732 passed / 3 skipped / 4 xfailed**（3 个框架文件 `importorskip`）；
+3.12 venv **39 passed**（4 个 S23 文件全跑）；`ruff check .` 0 errors。
 
 **统一 6 场景**（沿用 S22）：并发写冲突、同键重试同收据、同键异内容 CONFLICT、
 租约过期旧 token 被拒、预算耗尽 WAIT + reaper 回收、协调器不可达 fail-closed。
@@ -236,3 +239,22 @@ FastAPI 双实现、把 `agent_id` 当请求参数、接管宿主编排/LLM。
 | Q3 | AG2 支持级别 | 以 **1.2.x middleware** 为准，标 beta；不承诺 Classic |
 | Q4 | sidecar 依赖 | 纯 stdlib；不建 FastAPI 双实现 |
 | Q5 | CI | 增 **Python 3.12** 任务跑三个框架适配器；3.14 任务只跑 skip |
+
+---
+
+## 9. 对抗式评审与修复（2026-10-28）
+
+评审在 3.12 venv 实跑 22 条适配器用例并做针对性实证，结论落地如下：
+
+| 级别 | 发现 | 修复 |
+|---|---|---|
+| P0 | sidecar 只校验密钥→agent，**不校验 token 归属** → K2 可 apply/finish K1 的 token，写他人账本并销毁其 worktree | 门面新增 `owner_of`；五个端点（apply/gate/finish/abort/snapshot）不符即 `403 token_owner_mismatch`；用例 `test_token_owner_cannot_be_taken_over` |
+| P1 | `/apply` 可写 `begin` 未声明的资源（无 base_version → 静默 last-write-wins） | 门面 `begin` 记 `spec.rsc_writes`，`apply` 校验子集 → `Deny(undeclared_write)`；sidecar 映射 `400`；用例 `test_apply_rejects_undeclared_resource` |
+| P1 | OpenAI 工具抛错时 SDK **不跑 output guardrail** → token/预算/槽位泄漏到 TTL | `invoke` 捕获后 `_abandon`（pop + abort）再重抛；用例 `test_tool_exception_aborts_token` |
+| P1 | OpenAI 幂等键直接哈希原始 JSON 字符串（空白差异 → 不同键） | 先 `json.loads` 再 `canonical_args`；解析失败 `trip`；用例 `test_arguments_are_canonicalized_for_idempotency` |
+| P1 | CrewAI/AG2 键把将被覆盖的 `root` 算进去（换 root 同内容不去重） | 算键前剔除 `root_arg`；两框架各加用例 |
+| P1 | sidecar 信号量在 `tick()` 抛异常时泄漏；连接无读超时 | `_guard` 异常路径释放；handler `timeout=10`；用例 `test_tick_failure_does_not_leak_inflight` |
+| P2 | sidecar `reads` 未逐项校验 → facade `set()` TypeError（断连而非 400） | 逐项 `isinstance(str)` → `400 bad_reads`；用例 `test_bad_reads_is_400` |
+| P2 | `request_queue_size` 在 `listen()` 后赋值无效 | 用 `_SidecarServer` 子类在 bind 前设 64 |
+| P2 | CrewAI 缓存在 `tool.run` 之上命中 → wrapper 不执行、账本无提交 | `cache_function=_never_cache`（模块级函数，避免序列化告警） |
+| P2 | 测试覆盖名不副实（`shared_cwd` 未证明工具写入） | 共享 cwd 用例改为断言「工具实际产物被读回」；框架适配器测试统一 `importorskip`，CI 需 3.12 任务（Q5） |

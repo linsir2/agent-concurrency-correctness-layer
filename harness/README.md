@@ -31,7 +31,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `harness/spec/` | L2 | MS8（资源模型 / 协调协议 / 收据 / 不变量语料） |
 | `harness/worktree.py` | L1 | S22（Z3 私有工作区） |
 | `harness/facade.py` | L5 | S22（`RscSession` 六动作集成门面） |
-| `harness/integrations/` | 适配 | S22（LangGraph / MCP，可选依赖） |
+| `harness/integrations/` | 适配 | S22/S23（LangGraph / MCP / CrewAI / OpenAI Agents / AG2 / HTTP sidecar，可选依赖） |
 
 ## 测试
 
@@ -84,6 +84,10 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s22_facade.py` | S22 门面：并发冲突 / 同键重放 / 跨会话命名空间 / 过期 token / 预算回收 / 重启恢复 |
 | `tests/test_s22_langgraph.py` | S22 LangGraph：root 注入、读回、sync+async、Conflict→Command、worktree 缺失 fail-closed |
 | `tests/test_s22_mcp.py` | S22 MCP：单次 apply / 多步会话 / 幂等 / 删除 / agent_id 不可冒名 |
+| `tests/test_s23_crewai.py` | S23 CrewAI：包装 `BaseTool.run`、root 注入、读回提交、同参幂等、stale→CONFLICT、预算 WAIT、协调器 DENY（`importorskip`） |
+| `tests/test_s23_openai_agents.py` | S23 OpenAI Agents：guardrail 顺序、schema 去 root、`tool_call_id` 必填 fail-closed、dispositions、共享 cwd 模式（`importorskip`） |
+| `tests/test_s23_ag2.py` | S23 AG2：`on_tool_execution` 短路、`serialized_arguments` 注入、stale→CONFLICT、预算 WAIT、未声明透传（`importorskip`） |
+| `tests/test_s23_sidecar.py` | S23 HTTP sidecar：鉴权（401/403）、幂等重放、stale 409、411/413/501、404/410、agent 不可冒名、tick 回收 |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

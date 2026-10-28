@@ -21,7 +21,7 @@
 | [S9 方案 v1.2](docs/s9-persistence-and-receipts.md) | 持久化 checkpoint（信封/codec/双层锁/唯一 ref）+ 收据链（同帧 + `commit_key` 去重 + scope 锁 + head 锚点）+ `CrashInjected` 契约 + `retention` 安全语义 + 跨进程恢复与 SIGKILL |
 | [S10 方案 v1.2](docs/s10-cross-process-reconciliation.md) | 跨进程预算对账（事件溯源 + 全量重放 + 树完整性 + 单写者 lease）+ 跨进程 flock（`_FileLock` 下沉 + 三锁全序 + WAL seq fstat + fencing）+ `FinalitySink` 接口草案 |
 | [S22 方案 v1.1](docs/s22-implementation-plan.md) | **被集成层**：内核收口（abort/finish/外部幂等键/token 回收/懒恢复）+ Z3 私有工作区（git worktree + copy）+ `RscSession` 六动作门面 + LangGraph 中间件（sync/async）+ MCP server；`dependencies = []` 不变（适配器走 extras） |
-| [S23 调研 v0.1](docs/s23-integration-plan.md) | **集成面第二轮（调研完成，未实现）**：CrewAI 1.15.32 / OpenAI Agents 0.13.6 / AG2 1.2.2 运行实测能力矩阵（阻断强度、`tool_call_id`、fail-open 边界）+ 纯 stdlib HTTP sidecar 协议草案 + extras/示例/分轮计划；修正 S22 的 `scoped_hooks` 误判 |
+| [S23 方案 v1.0](docs/s23-integration-plan.md) | **集成面第二轮**：CrewAI（包装 `BaseTool.run`）、OpenAI Agents（guardrail + root 注入）、AG2（`on_tool_execution` 短路）、纯 stdlib HTTP sidecar（每 agent 密钥、1 MiB/并发上限）；含运行期能力矩阵、6 条必杀变异与对抗式评审记录（1 P0 + 5 P1 + 3 P2 已修） |
 | [S21 方案 v1.1](docs/s21-tenant-admission-and-leases.md) | K-97 tenant 自动接准入 + K-99 失效租约回收器（状态复制 → K-103）+ K-100 墓碑窗口量化（逐墓碑年龄 + 上限随命令复制）+ 多租户优先级份额（reserved 池 / 超额借用） |
 | [S20 方案 v1.1](docs/s20-tenant-metering-and-k94.md) | K-94 claims 有界墓碑 + K-95 prune fail-safe + K-96 就绪复核 + 阶段三：多租户配额 / 事件派生计量 / 统一 Admin 命令面 |
 | [S19 方案 v1.1](docs/s19-budget-gc-and-hardening.md) | K-88 账本三栅栏精密修剪 + K-89 claim fencing 复制 + K-90 重放时间戳 + K-91 `remaining` + K-92 预检/可配密钥 + K-93 owner 共识 |

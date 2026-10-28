@@ -38,10 +38,7 @@ except ImportError:                                         # pragma: no cover
 
 from ..facade import Conflict, Deny, RscSession, Token, Wait
 from ..rebase import DELETE
-
-
-class RscDenied(RuntimeError):
-    """宿主可见的**硬拒绝**（协调器不可达 / 能力 / 非法 token / 未钉住读集）。"""
+from ._common import RscDenied
 
 
 def rsc_writes(*paths: str, root_arg: str | None = None):

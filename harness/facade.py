@@ -192,6 +192,7 @@ class RscSession:
         acb.spec["rsc_worktree"] = worktree
         acb.spec["rsc_agent"] = agent_id
         acb.spec["rsc_token"] = True
+        acb.spec["rsc_writes"] = [str(x) for x in writes]
         deadline = int(self.h.clock.now_ms()) + self.token_ttl_ms
         acb.spec["token_deadline_ms"] = deadline
         ref = self.h.checkpoints.save(acb)
@@ -221,6 +222,14 @@ class RscSession:
         acb = self.resolve(token)
         if isinstance(acb, Deny):
             return acb
+        # 评审 P1：只允许写 `begin` 时声明过的资源（否则无 base_version，
+        # `_base_of` 回落当前版本 → 静默 last-write-wins）。旧快照无此键 → 跳过。
+        declared = acb.spec.get("rsc_writes")
+        if declared is not None:
+            allowed = {str(x) for x in declared}
+            for resource, _content in writes:
+                if str(resource) not in allowed:
+                    return Deny(f"undeclared_write:{resource}")
         # 外部键加命名空间（评审 P0：跨会话同键不得互相命中）。
         ns_key = f"{self.tenant}|{agent_id or acb.spec.get('rsc_agent', '')}|{key}" \
             if key else ""
@@ -309,6 +318,21 @@ class RscSession:
         if isinstance(acb, Deny):
             return acb
         return dict(acb.base_version)
+
+    def owner_of(self, token: str) -> str | None:
+        """token 的归属 agent；未知/终态 → None（由调用方映射 404/410）。"""
+        acb = self.resolve(token)
+        if isinstance(acb, Deny):
+            return None
+        return str(acb.spec.get("rsc_agent") or "")
+
+    def declared_writes(self, token: str) -> tuple[str, ...] | None:
+        """`begin` 时声明的写集；旧快照无此键 → None（不改变既有语义）。"""
+        acb = self.resolve(token)
+        if isinstance(acb, Deny):
+            return None
+        raw = acb.spec.get("rsc_writes")
+        return None if raw is None else tuple(str(x) for x in raw)
 
     # ------------------------------------------------------------------ 内部
     def resolve(self, token: str) -> ACB | Deny:
