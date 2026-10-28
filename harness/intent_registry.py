@@ -62,6 +62,25 @@ class IntentRegistry:
             if not holders:
                 self._logical.pop(dep_id, None)
 
+    def undeclare_all(self, agent_id: str) -> int:
+        """撤销该 agent 的**全部**逻辑依赖声明（S22 `abort` 用）。
+
+        与 `revoke_all` 对称：`abort` 拿不到准入时的局部 `declared` 列表，
+        但 `_logical` 里本来就按 agent 记录了它声明过什么 → 反查即可。
+        幂等；返回撤销条数。
+        """
+        removed = 0
+        with self._lock:
+            for dep_id in list(self._logical):
+                holders = self._logical[dep_id]
+                if agent_id not in holders:
+                    continue
+                del holders[agent_id]
+                removed += 1
+                if not holders:
+                    self._logical.pop(dep_id, None)
+        return removed
+
     def reserve(self, resource: str, agent_id: str, base_version: int,
                 ttl_ms: int = 5000, mode: str = "WRITE",
                 run_id: str = "") -> Lease:

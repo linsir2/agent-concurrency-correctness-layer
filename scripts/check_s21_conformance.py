@@ -46,7 +46,7 @@ chk("K-97 Planner 透传 tenant 到 footprint",
     'footprint["tenant"]' in _pl)
 chk("K-97 Planner 透传 tier 到 footprint",
     'footprint["tier"]' in _pl)
-_dar = inspect.getsource(Harness.dispatch_and_run)
+_dar = inspect.getsource(Harness._admit_and_register)
 chk("K-97 生产入口先登记 plan 再准入",
     _dar.index("self.plans[run_id] = plan")
     < _dar.index("self.dispatcher.try_admit"))

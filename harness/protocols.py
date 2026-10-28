@@ -113,6 +113,10 @@ class IntentRegistry(Protocol):
         """回收已失效（`valid=False` 或 epoch 不匹配）的租约（K-99）。"""
         ...
 
+    def undeclare_all(self, agent_id: str) -> int:
+        """撤销该 agent 的全部逻辑依赖声明（S22 `abort` 用）；幂等。"""
+        ...
+
     # ---- S15 C1：epoch 接缝（fencing 必需）----
     def get_epoch(self) -> int:
         ...

@@ -711,36 +711,57 @@ class Dispatcher:
             if not committed:
                 self._rollback(acb, node, resv, declared)
 
+    def abort(self, acb: ACB) -> None:
+        """S22：公共中止 —— 逆序释放（逻辑 → 预留 → 节点 → 槽位）。**幂等**。
+
+        与 `_rollback` 是**同一实现**（`_rollback` 现在只做参数兼容后委托到这里）。
+        外部调用者（门面 / token reaper）拿不到准入时的局部变量 `declared`，
+        故逻辑声明从 `IntentRegistry._logical` 反查（`undeclare_all`）。
+        普通异常一律吞掉：回滚链必须跑完（与 `_rollback` 的既有契约一致）。
+        """
+        try:
+            self.h.intents.undeclare_all(acb.id)
+        except Exception:  # noqa: BLE001
+            pass
+        for rid in list(acb.reservation_ids):
+            try:
+                self.h.budget.release(rid)
+                # 准入回滚的预留从未消费：清除 tombstone，保证快照零残留
+                self.h.budget._reservations.pop(rid, None)
+                if acb.budget_node is not None:
+                    acb.budget_node.reservations.pop(rid, None)
+            except Exception:  # noqa: BLE001
+                pass
+        if acb.budget_node is not None:
+            # 先归档（把已消费折入父级，节点从 `_nodes` 摘除）；
+            # 若仍有 ACTIVE 预留导致归档被拒，再退回 remove_node（准入失败路径）。
+            node_id = acb.budget_node.node_id
+            try:
+                if not self.h.budget.archive_node(node_id):
+                    self.h.budget.remove_node(node_id, owner=acb.id)
+            except Exception:  # noqa: BLE001
+                pass
+        acb.reservation_ids = []
+        acb.budget_node = None
+        self.h.slots.release(acb.id)
+
     def _rollback(self, acb: ACB, node, resv, declared: list[str]) -> None:
-        """逆序撤销（逻辑 → 预留 → 节点 → 槽位）；不吞原异常。
+        """逆序撤销（S22：收敛到 `abort`；保留签名以兼容既有调用点）。
 
         S9 §2.1 边界（K-25）：这里**保持** `except Exception` 而非
         `CrashInjected`/`BaseException` —— 回滚链必须跑完，注入的崩溃
         不得中断「逻辑撤销 → 预留释放 → 节点移除 → 槽位释放」。真正的
         进程崩溃（SIGKILL）由子进程用例覆盖，不靠本函数的异常语义。
+
+        **等价性**：`reserve` 成功后紧接写 `acb.reservation_ids`/`acb.budget_node`
+        （见 `_try_admit_commit`），所以局部 `node/resv/declared` 都能从 ACB 推出；
+        这里仅做防御性补齐，再交给 `abort`（唯一实现）。
         """
-        for dep_id in declared:
-            try:
-                self.h.intents.undeclare_logical(dep_id, acb.id)
-            except Exception:
-                pass
-        if resv is not None:
-            try:
-                self.h.budget.release(resv.reservation_id)
-                # 准入回滚的预留从未消费：清除 tombstone，保证 T9 快照零残留
-                self.h.budget._reservations.pop(resv.reservation_id, None)
-                if node is not None:
-                    node.reservations.pop(resv.reservation_id, None)
-            except Exception:
-                pass
-        if node is not None:
-            try:
-                self.h.budget.remove_node(node.node_id, owner=acb.id)
-            except Exception:
-                pass
-        acb.reservation_ids = []
-        acb.budget_node = None
-        self.h.slots.release(acb.id)
+        if resv is not None and resv.reservation_id not in acb.reservation_ids:
+            acb.reservation_ids.append(resv.reservation_id)
+        if node is not None and acb.budget_node is None:
+            acb.budget_node = node
+        self.abort(acb)
 
 
 @dataclass

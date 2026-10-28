@@ -204,6 +204,10 @@ TRANSITIONS: dict[tuple[TaskState, str], TaskState] = {
     # INVALID_INPUT）。必须走状态机显式边，让 `_finalize` 能传播 failure。
     (TaskState.ADMITTED, "inline_depth_exceeded"): TaskState.FAILED,
     (TaskState.RUNNING, "inline_depth_exceeded"): TaskState.FAILED,
+    # S22：门面 token 的结束边 —— token 由宿主执行（不经 runtime 调度），
+    # 停在 ADMITTED；`finish`/`abort` 需要一条直达终态的合法边。
+    (TaskState.ADMITTED, "finish_ok"): TaskState.DONE,
+    (TaskState.ADMITTED, "fail"): TaskState.FAILED,
     # S13d §2.5：aging（墙钟）—— 准入后迟迟未被调度 → INADMISSIBLE（非终态）。
     # P1-1：INADMISSIBLE 非终态 → Run 永不 finalize，故必须给两条出路：
     #   ① 单次超时可 `readmit` 重新准入（→ PLANNED，重新 try_admit）；

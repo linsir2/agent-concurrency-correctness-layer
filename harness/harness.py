@@ -88,6 +88,19 @@ from .workspace import WorkspaceManager, WorkspaceVersionStore
 # （不是 spawn 的父子层数 `spawn_depth`，两者语义不同）。
 _MAX_INLINE_DEPTH = 8
 
+# S22：外部幂等键命中「同键异内容」时的哨兵（与「无命中=None」区分开）。
+_EXT_KEY_CONFLICT = object()
+
+
+class _NullLock:
+    """空上下文管理器（无外部幂等键时占位，避免分支里写两套 `with`）。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
 
 class _SpawnAbort(Exception):
     """C1：spawn ② 事务的「明确拒绝」信号（非崩溃），由回滚分支转成 failure。"""
@@ -407,6 +420,8 @@ class Harness:
         _max_ttl_ms = max(int(self.lease_ms), int(self.claim_lease_ms))
         self.max_lease_ttl_s = max(1, -(-_max_ttl_ms // 1000))
         self._claim_window_exceeded = 0
+        # S22：门面 token 回收后的清理钩子（由 `RscSession` 注入，用于销毁 Z3）。
+        self._token_cleanup = None
         self.ingress = Ingress(self)
         # S13d §2.5 P0-10：claim 的 fence epoch 接入**写路径**（commit_batch /
         # budget.consume / effects.begin / checkpoints.save）。sync 模式无 claim
@@ -438,6 +453,8 @@ class Harness:
         # 跨进程**不互斥**；`WalEventLog.append_batch` 的 `_lock` 同理。跨进程
         # 多写者必须自行串行化（跨进程 scope 锁留 S10，本阶段不实现）。
         self._scope_locks: dict[tuple[str, str], threading.RLock] = {}
+        # S22：外部幂等键的进程内串行锁（同键并发 apply 不得双写）。
+        self._ext_key_locks: dict[str, threading.RLock] = {}
         self._receipt_heads: dict[tuple[str, str], str] = {}
         self._receipt_ids: set[str] = set()
         self._tainted_scopes: set[tuple[str, str]] = set()
@@ -789,6 +806,53 @@ class Harness:
             return ev
         return None
 
+    def _ext_key_lock(self, key: str):
+        """S22：外部幂等键的进程内串行锁（只护锁表，不覆盖临界区）。"""
+        with self._lock:
+            lock = self._ext_key_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._ext_key_locks[key] = lock
+            return lock
+
+    def _dedup_by_external_key(self, key: str, expected: set):
+        """S22：按**外部业务键**查既有提交（事件即真相，不另建存储）。
+
+        `expected = {(resource, blob_hash, deleted)}`。
+        返回 `(hits, receipt_ids, seq)` / `_EXT_KEY_CONFLICT` / `None`。
+
+        收据 id 从既有 `RECEIPT_ISSUED` 事件读（**不能**用当前 ACB 重算：
+        重启后 token 恢复出的 ACB 可能换了 run/subgoal，重算会得到不同 id）。
+        """
+        hits = []
+        for ev in self.event_log.all():
+            if ev.kind is not EventKind.RESOURCE_COMMITTED:
+                continue
+            if (ev.payload or {}).get("external_idem_key") != key:
+                continue
+            hits.append(ev)
+        if not hits:
+            return None
+        actual = {(e.payload.get("resource"), e.payload.get("blob_hash"),
+                   bool(e.payload.get("deleted", False))) for e in hits}
+        if actual != set(expected):
+            return _EXT_KEY_CONFLICT
+        scopes = {(e.run_id, (e.payload or {}).get("logical_subgoal_id", ""))
+                  for e in hits}
+        resources = {r for r, _h, _d in expected}
+        receipt_ids = []
+        for ev in self.event_log.all():
+            if ev.kind is not EventKind.RECEIPT_ISSUED:
+                continue
+            p = ev.payload or {}
+            if ((ev.run_id, p.get("logical_subgoal_id", "")) in scopes
+                    and p.get("resource") in resources):
+                rid = p.get("receipt_id")
+                if rid:
+                    receipt_ids.append(rid)
+        seq = max(int(getattr(e, "seq", 0) or 0) for e in hits)
+        return tuple(hits), tuple(receipt_ids), seq
+
     def _replay_dedup_events(self, dedup_events) -> None:
         """P0-1①：把已提交但未投影的 `RESOURCE_COMMITTED` 补投影到 manifest。
 
@@ -1020,12 +1084,17 @@ class Harness:
 
     # ---- RSC 提交（文档 §5.5） ------------------------------------
     def commit_batch(self, acb: ACB, writes: list[Write],
-                     mode: Mode = Mode.COMMIT) -> Result:
+                     mode: Mode = Mode.COMMIT, *,
+                     idempotency_key: str | None = None) -> Result:
         """公共写入口。提交点顺序不可调换：
 
         ① 输入校验 → ② 预留租约(L0) → ③ 全序一次性持锁(L3，锁集合含读集合)
         → ④ 校验 → ④′ 内容先落盘 → ⑤ 提交点前复验租约
         → ⑥ 提交点（一次 fdatasync）→ ⑦ 投影 → ⑧ 锁外通知（不掩盖返回值）。
+
+        S22：`idempotency_key` 是**外部业务键**（宿主派生）。同键同内容 → 返回
+        既有收据（`dedup=True`，不重复写）；同键异内容 → `CONFLICT`（绝不
+        静默覆盖）。为空 → 完全走旧路径，事件字节不变。
         """
         if not writes:
             return Result(Status.OK, {"noop": True, "seq": None})
@@ -1109,21 +1178,49 @@ class Harness:
             for w in writes:
                 draft, version_before, version_after = self._commit_record(
                     acb, w, blob_hashes[w.resource],
-                    deleted=contents[w.resource] is DELETE, mode=mode)
+                    deleted=contents[w.resource] is DELETE, mode=mode,
+                    idempotency_key=idempotency_key)
                 commit_key = self._commit_key(acb, w.resource, blob_hashes[w.resource], mode)
                 records.append((w, draft, version_before, version_after, commit_key))
 
             scope = (acb.run_id, acb.logical_subgoal_id)
+            ext_lock = (self._ext_key_lock(idempotency_key)
+                        if idempotency_key else _NullLock())
             # scope 临界区**覆盖**「去重检查 → 读 head → 构造 drafts → append_batch」
             # P2：去重检查**必须**在临界区内 —— 否则同 scope 跨资源场景下，去重判断
             # 与 head/append 非原子（并发写各自判定「非去重」→ 重复提交 + 重复收据）。
-            with self._scope_lock(scope):                          # 锁序 resource → scope → eventlog
+            # S22：外部键再叠一把**按键**的进程内锁（durable 模式下 receipts flock
+            # 已全局串行化；内存模式靠这把锁防同键并发双写）。
+            with ext_lock, self._scope_lock(scope):                # 锁序 resource → ext → scope → eventlog
                 try:
                     self._refresh_receipts_locked()
                 except ReceiptScanFailed:
                     # K-45：拒绝服务（不 append、不改 head、不加 taint）
                     return Result(Status.UPSTREAM_FAILED,
                                   {"reason": "receipt_scan_failed"})
+                # S22：外部幂等键 —— 同键同内容直接返回既有收据；同键异内容 CONFLICT
+                if idempotency_key:
+                    ext = self._dedup_by_external_key(
+                        idempotency_key,
+                        {(w.resource, blob_hashes[w.resource],
+                          contents[w.resource] is DELETE) for w in writes})
+                    if ext is _EXT_KEY_CONFLICT:
+                        return Result(Status.CONFLICT, {
+                            "reason": "idempotency_key_reused_with_different_content",
+                            "external_key": idempotency_key})
+                    if ext is not None:
+                        hits, receipt_ids, seq = ext
+                        self._replay_dedup_events(hits)
+                        # S22 评审 P1：重放命中也要刷新 base_version/read_set，
+                        # 否则门面 `gate` 会拿旧版本比对 → 误判 stale_view。
+                        self._refresh_after_commit(acb, records)
+                        return Result(Status.OK, {
+                            "resources": sorted(blob_hashes),
+                            "seq": seq,
+                            "receipt_ids": list(receipt_ids),
+                            "dedup": True,
+                            "external_key": idempotency_key,
+                        })
                 # 幂等短路（S9 §2.3.3 / P0-1②③）：逐写匹配既有提交事件
                 #   键 = (run_id, logical_subgoal_id, resource, content_hash, mode)，
                 #   且已提交 blob_hash 必须 == 新内容 hash（内容不同 → 不得短路）。
@@ -1142,6 +1239,7 @@ class Harness:
                         "resources": sorted(blob_hashes),
                         "seq": self._last_committed_seq(dedup_events),
                         "receipt_seq": self._last_receipt_seq(records),
+                        "receipt_ids": [ck for *_rest, ck in records],
                         "dedup": True,
                     })
 
@@ -1234,6 +1332,8 @@ class Harness:
                 "resources": sorted(blob_hashes),
                 "seq": commit_seqs[-1],                  # 保持最后一条 RESOURCE_COMMITTED 的 seq
                 "receipt_seq": receipt_seqs[-1] if receipt_seqs else None,
+                # S22：门面需要收据 id 才能返回 `Receipt`（新增字段，向后兼容）
+                "receipt_ids": list(issued),
             })
         finally:
             self.workspace._release_all(held)                      # 先释放资源锁
@@ -1248,7 +1348,8 @@ class Harness:
                     pass
 
     def _commit_record(self, acb: ACB, w: Write, blob_hash: str,
-                       deleted: bool = False, mode: Mode = Mode.COMMIT
+                       deleted: bool = False, mode: Mode = Mode.COMMIT,
+                       idempotency_key: str | None = None
                        ) -> tuple[dict, int, int]:
         """构造 `RESOURCE_COMMITTED` 草稿，并返回 `(draft, version_before, version_after)`。
 
@@ -1271,6 +1372,9 @@ class Harness:
         }
         if deleted:                                  # Delete 哨兵事件（可重放）
             payload["deleted"] = True
+        # S22：外部幂等键只在实际使用时写入 —— 不用时事件字节与旧版完全一致。
+        if idempotency_key:
+            payload["external_idem_key"] = str(idempotency_key)
         draft = {
             "kind": EventKind.RESOURCE_COMMITTED,          # ← 必须与重建过滤一致
             "subject": w.resource,
@@ -1612,26 +1716,60 @@ class Harness:
         return epoch
 
     # ---- 端到端运行 -----------------------------------------------
-    def dispatch_and_run(self, plan: dict, task_id: str, decisions, *,
-                         required_tools: set[str] | None = None,
-                         crash_at=None, token=None) -> ACB:
-        """唯一生产入口：注册 plan → try_admit → 注册 acb → run_task → 返回 acb。"""
+    def _admit_and_register(self, plan: dict, task_id: str, *,
+                            required_tools: set[str] | None = None,
+                            token=None) -> ACB:
+        """S22：准入 + 注册（`dispatch_and_run` 与门面 `begin` 共用）。
+
+        **先登记 plan 再准入**：`_tenant_of`/`_tier_of` 会读 `h.plans[run_id]`，
+        顺序反了会让 plan 级 tenant/tier 静默失效（S21 终审 P1）。
+        """
         run_id = plan["run_id"]
-        # S21 K-97：plan 必须在准入**之前**登记 —— `_tenant_of`/`_tier_of` 会读
-        # `h.plans[run_id]` 取 run 级 `tenant`/`tier`；先准入后登记会让 plan 级
-        # tenant 静默失效（任务挂到 `run` 下）。
         self.plans[run_id] = plan
         acb = self.dispatcher.try_admit(plan["tasks"][task_id], run_id,
                                         required_tools=required_tools,
                                         token=token, plan=plan)
         self.acbs[acb.id] = acb
         self.run_coordinator.register(acb)
+        return acb
+
+    def dispatch_and_run(self, plan: dict, task_id: str, decisions, *,
+                         required_tools: set[str] | None = None,
+                         crash_at=None, token=None) -> ACB:
+        """唯一生产入口：准入+注册 → run_task → 返回 acb。"""
+        acb = self._admit_and_register(plan, task_id,
+                                       required_tools=required_tools, token=token)
         if acb.state is not TaskState.ADMITTED:
             return acb
         # F8：原「HITL 判态」分支在此处是死代码（新准入恒为 ADMITTED，永远不会
         # 走到 WAITING_APPROVAL）；恢复路径统一走 `run_task` 的入口判态，故删除。
         self.run_task(acb, decisions, crash_at=crash_at)
         return acb
+
+    def finish(self, acb: ACB, *, outcome: str = "DONE") -> Result:
+        """S22：门面 token 的**结束** —— ADMITTED → DONE/FAILED → 结算/归档/释放槽位。
+
+        结算逻辑**全部复用** `_finalize`（不重写）：预留 settle、节点归档、
+        槽位释放、后继推进。已终态 → 直接 OK（幂等，不重复结算）。
+        """
+        if acb.state in TASK_TERMINAL:
+            return Result(Status.OK, {"state": acb.state.value, "already": True})
+        event = "finish_ok" if str(outcome).upper() == "DONE" else "fail"
+        moved = advance(acb, event)
+        if moved != Status.OK:
+            return Result(Status.INVALID_INPUT, {
+                "reason": "illegal_finish", "state": acb.state.value,
+                "outcome": outcome})
+        self._finalize(acb)
+        return Result(Status.OK, {"state": acb.state.value})
+
+    def abort(self, acb: ACB) -> None:
+        """S22：门面 token 的**中止** —— 逆序退款/释放（幂等）。
+
+        与 `finish` 的区别：`abort` 是「这笔工作不算数」，预留**全额退还**、
+        节点摘除；`finish` 是「算数」，已消费部分留账、节点归档。
+        """
+        self.dispatcher.abort(acb)
 
     def run_task(self, acb: ACB, decisions, crash_at=None) -> Status | Result:
         """外部直接调用入口：注册 + push 到调度器 + 执行 + 消费调度器。
@@ -2583,6 +2721,8 @@ class Harness:
             self.intents.reap_expired(now)
         except Exception:  # noqa: BLE001  # 回收失败不影响超时结算
             pass
+        # S22：回收过期的门面 token（只作用于 `spec["rsc_token"]`，不动普通 ACB）
+        self._reap_expired_tokens(now)
         # S13d §2.5 / B-4：aging（墙钟）与 HITL 超时共用**唯一**驱动面；
         # 扫描入口在 ReconcileLoop（`scan_deadlines`），便于观测/替换。
         self.reconcile.scan_deadlines(now)
@@ -2860,6 +3000,47 @@ class Harness:
         self._paused_runs.discard(run_id)
         self.event_log.append(EventKind.RUN_PURGED, run_id, {}, run_id=run_id)
         return True
+
+    def _reap_expired_tokens(self, now_ms: int) -> int:
+        """S22：回收**过期的门面 token**（宿主崩溃/忘记 finish 的兜底）。
+
+        只作用于 `spec["rsc_token"]` 的 ACB（普通 ACB 一律跳过 → 不影响既有
+        aging 语义）。动作 = `cancel` → `dispatcher.abort`（退款/释放槽位）
+        → 清理钩子（销毁 Z3）→ `purge_run`（回收内存）。返回回收数。
+        """
+        now = int(now_ms)
+        reaped = 0
+        for acb in list(self.acbs.values()):
+            spec = acb.spec or {}
+            if not spec.get("rsc_token"):
+                continue
+            if acb.state in TASK_TERMINAL:
+                continue
+            # 评审 P1-5：`INADMISSIBLE`/`QUARANTINED` 是**可重试/待人工**状态
+            # （预算已结算），不能被 token 过期直接转成终态并 purge —— 那会
+            # 永久夺走宿主的重试入口。
+            if acb.state in (TaskState.INADMISSIBLE, TaskState.QUARANTINED):
+                continue
+            # 评审 P1-6：有活跃 claim 说明正在提交临界区 → 让本次 tick 跳过，
+            # 避免「退款」与「在途 commit/consume」竞争。
+            if self.scheduler.claim_of(acb.id) is not None:
+                continue
+            deadline = spec.get("token_deadline_ms")
+            if deadline is None or now < int(deadline):
+                continue
+            if advance(acb, "cancel") != Status.OK:
+                continue
+            self.dispatcher.abort(acb)
+            cleanup = getattr(self, "_token_cleanup", None)
+            if callable(cleanup):
+                try:
+                    cleanup(acb)
+                except Exception:  # noqa: BLE001  # 清理失败不得阻断回收
+                    pass
+            self._drain_skipped.append((acb.id, "token_expired"))
+            self.purge_run(acb.run_id)
+            reaped += 1
+        return reaped
 
     def claim_window_s(self) -> int:
         """有界墓碑集合的**总覆盖窗口** = `tombstone_max × max_lease_ttl_s`（K-100）。
@@ -4100,8 +4281,14 @@ class Harness:
             self.checkpoints.save(acb)              # §2.4：requeue 失败落盘
             return acb
 
-    def _restore_acb(self, data: dict, resume_policy: str = "RESUME") -> ACB:
-        """从 checkpoint 重建 ACB；失败改 `needs_readmit`（**不抛**，§4.3）。"""
+    def _restore_acb(self, data: dict, resume_policy: str = "RESUME", *,
+                     bump_epoch: bool = True) -> ACB:
+        """从 checkpoint 重建 ACB；失败改 `needs_readmit`（**不抛**，§4.3）。
+
+        S22：`bump_epoch=False` 供**门面 token 的懒恢复**使用 —— 全局 epoch
+        推进（`epoch_scope="global"`）会作废**其他 token** 的租约；新进程里
+        旧租约本就不存在，不需要 fence。默认 `True` 保持崩溃恢复的既有语义。
+        """
         try:
             acb = ACB(id=data["acb_id"], run_id=data["run_id"],
                       task_id=data["task_id"],
@@ -4214,7 +4401,8 @@ class Harness:
                 if not self.slots.try_acquire(acb.id):
                     acb.state = TaskState.QUARANTINED
                     acb.failure = "NO_SLOT"
-            self.bump_epoch()
+            if bump_epoch:
+                self.bump_epoch()
             return acb
         except Exception:  # noqa: BLE001  # 恢复失败 → needs_readmit，不抛
             acb = ACB(id=data.get("acb_id", ""), run_id=data.get("run_id", ""),
@@ -4282,6 +4470,15 @@ class Harness:
             acb.reservation_ids = []
             acb.budget_node = None
             acb.needs_readmit = True
+            return
+
+        # S22：**同进程懒恢复**（token 被 purge 后又用同 id 恢复）时，节点还在
+        # `_nodes` 里 —— 直接重绑，绝不触发 `_replay_budget_events`（那会
+        # `_reset_baseline()` 重建整棵树，影响其他 token 的在途预留）。
+        existing = self.budget._nodes.get(node_id)
+        if existing is not None and (not existing.owner or existing.owner == acb.id):
+            acb.budget_node = existing
+            acb.reservation_ids = list(existing.reservations)
             return
 
         if new_format and self.budget.budget_events():
