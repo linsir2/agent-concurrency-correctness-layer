@@ -156,6 +156,19 @@ def gate_scenario(root: str) -> dict:
             "b_code": getattr(rb, "code", "")}
 
 
+def static_scenario(root: str) -> dict:
+    """不跑任何代码：`semantic="block"` 静态查出「符号消失仍被引用」。"""
+    session, _h = _session(root, semantic="block")
+    _commit_a(session)
+    tb = session.begin("agent-b", "feature", writes=["app/feature.py"])
+    _write(tb.worktree, "app/feature.py", FEATURE)
+    rb = session.apply(tb.token, [("app/feature.py", FEATURE)],
+                       idempotency_key="b:1", agent_id="agent-b")
+    session.abort(tb.token, "semantic_conflict")
+    return {"b": type(rb).__name__, "code": getattr(rb, "code", ""),
+            "reason": getattr(rb, "reason", "")}
+
+
 def green_scenario(root: str) -> dict:
     session, _h = _session(root, verify_cmd=[sys.executable, "check_all.py"])
     _commit_a(session)
@@ -191,6 +204,11 @@ def main() -> int:
     print(f"    A={q['a']}  B={q['b']}  code={q['b_code']}  reason={q['b_reason']}")
     print("    → 红 → 拒绝提交（账本不被污染）")
 
+    st = static_scenario(os.path.join(root, "static"))
+    print("\n[3b] 静态语义检查（semantic=\"block\"，不执行任何代码）")
+    print(f"    B={st['b']}  code={st['code']}  reason={st['reason']}")
+    print("    → 改名导致符号消失 → 新引用被拒（比跑测试更早、更便宜）")
+
     gr = green_scenario(os.path.join(root, "green"))
     print("\n[4] B 改用新名字")
     print(f"    B={gr['b']}  verified={gr['b_verified']}  → 放行")
@@ -199,9 +217,10 @@ def main() -> int:
     blocked = (g["merge_clean"] and not g["green"]
                and r["a"] == "Receipt" and r["b"] == "Receipt"
                and q["b"] == "Deny" and q["b_code"] == "verify_failed"
+               and st["b"] == "Deny" and st["code"] == "semantic_conflict"
                and gr["b"] == "Receipt" and gr["b_verified"] is True)
-    print("[结论] " + ("git 与我方 CAS 都不报冲突；`verify_cmd` 在合并视图上跑检查，"
-                       "才是拦住「文本不冲突但跑不通」的唯一手段。"
+    print("[结论] " + ("git 与我方 CAS 都不报冲突；静态语义检查（不执行代码）"
+                       "先拦住「符号消失仍被引用」，`verify_cmd` 再兜底「跑不通」。"
                        if blocked else "[FAIL] 实验前提不成立，请检查环境"))
     return 0 if blocked else 1
 

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 from .harness import _EXT_KEY_CONFLICT
 from .rebase import DELETE
+from .semantic import detect as _detect_semantics
 from .storage.atomic import atomic_write
 from .storage.blob import canonical_bytes
 from .storage.codec import dumps as _dumps
@@ -121,6 +122,30 @@ def _safe_rel(root: str, rel: str) -> str | None:
     return target
 
 
+def _content_bytes(content) -> bytes | None:
+    """账本/pending 内容 → bytes；DELETE/None/结构化对象 → None（不参与）。"""
+    if content is DELETE or content is None:
+        return None
+    if isinstance(content, bytes):
+        return content
+    if isinstance(content, str):
+        return content.encode("utf-8")
+    return None
+
+
+def _issue_summary(issues: list, limit: int = 3) -> str:
+    """把前几条 issue 压成一行（不刷屏），完整报告在 `spec["rsc_semantic"]`。"""
+    parts: list[str] = []
+    for item in issues[:limit]:
+        ref = (item.get("refs") or [{}])[0]
+        parts.append(f"{item.get('kind')}:{item.get('module')}:"
+                     f"{item.get('name')}@{ref.get('path')}:{ref.get('line')}")
+    if len(issues) > limit:
+        parts.append(f"+{len(issues) - limit} more")
+    return "; ".join(parts)
+
+
+
 class RscSession:
     """门面：`begin / apply / gate / verify / finish / abort / snapshot`。"""
 
@@ -129,7 +154,9 @@ class RscSession:
                  worktrees: WorktreeManager | None = None,
                  state_dir: str | None = None,
                  verify_cmd=None, verify_required: bool = False,
-                 verify_timeout_s: float = 120.0) -> None:
+                 verify_timeout_s: float = 120.0,
+                 semantic: str = "off",
+                 semantic_ignore: tuple[str, ...] = ()) -> None:
         self.h = harness
         self.tenant = str(tenant or "")
         self.token_ttl_ms = max(1, int(token_ttl_ms))
@@ -141,6 +168,10 @@ class RscSession:
         if self.verify_required and self.verify_cmd is None:
             # fail-closed：要求验证却没给命令，等于「静默放行」
             raise ValueError("verify_required=True 时必须提供 verify_cmd")
+        self.semantic = str(semantic)
+        if self.semantic not in ("off", "warn", "block"):
+            raise ValueError(f"semantic 必须是 off|warn|block，得到 {semantic!r}")
+        self.semantic_ignore = tuple(str(x) for x in semantic_ignore)
         self._lock = threading.RLock()
         self._op_locks: dict[str, threading.RLock] = {}
         self._index: dict[str, dict] = {}
@@ -290,9 +321,13 @@ class RscSession:
                 except (TypeError, ValueError) as exc:
                     return Deny(f"bad_content:{type(exc).__name__}")
             batch.append(Write(str(resource), content))
+        pending = [(w.resource, w.content) for w in batch]
+        # S24-3：静态语义冲突先挡（便宜、可行动）；S24-1 动态验证后置（权威）。
+        blocked = self._semantic_gate(token, acb, pending)
+        if blocked is not None:
+            return blocked
         # S24-1：Verifier 门禁 —— 提交前必须过验证（自动或显式记录）。
-        blocked = self._verify_gate(token, acb,
-                                    [(w.resource, w.content) for w in batch])
+        blocked = self._verify_gate(token, acb, pending)
         if blocked is not None:
             return blocked
         try:
@@ -334,6 +369,72 @@ class RscSession:
             if self.h.workspace.version(resource) != base:
                 return Deny(f"stale_view:{resource}", code="stale_view")
         return Allow()
+
+
+    # ------------------------------------------------------------ 静态语义
+    def _semantic_view(self, worktree: str, pending=None):
+        """base = 工作区原样（agent 起始视角）；post = 账本合并视图 + 本次 pending。"""
+        base: dict[str, bytes] = {}
+        for root, dirs, files in os.walk(worktree):
+            dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, worktree).replace(os.sep, "/")
+                try:
+                    with open(full, "rb") as fh:
+                        base[rel] = fh.read()
+                except OSError:
+                    continue
+        post = dict(base)
+        for resource in list(self.h.workspace.manifest):
+            if str(resource) not in post:
+                continue
+            data = _content_bytes(self.h.workspace.get(resource))
+            if data is not None:
+                post[str(resource)] = data
+        for resource, content in (pending or []):
+            data = _content_bytes(content)
+            if data is not None:
+                post[str(resource)] = data
+        return base, post
+
+    def check_semantics(self, token: str, *, pending=None) -> Result:
+        """显式运行静态语义检查（宿主可先查详情再决定是否提交）。"""
+        with self._op_lock(token):
+            return self._semantic_locked(token, pending)
+
+    def _semantic_locked(self, token, pending=None) -> Result:
+        acb = self.resolve(token)
+        if isinstance(acb, Deny):
+            return Result(Status.DENIED, {"reason": acb.reason,
+                                          "code": acb.code})
+        worktree = acb.spec.get("rsc_worktree")
+        if not worktree or not os.path.isdir(str(worktree)):
+            return Result(Status.DENIED, {"reason": "semantic_requires_worktree"})
+        base, post = self._semantic_view(str(worktree), pending)
+        report = _detect_semantics(base, post, ignore=self.semantic_ignore)
+        detail = {"issues": [i.as_dict() for i in report.issues],
+                  "scanned": report.scanned,
+                  "skipped": dict(report.skipped),
+                  "duration_ms": report.duration_ms}
+        acb.spec["rsc_semantic"] = detail
+        self._resave(acb, token)
+        return Result(Status.OK if report.ok else Status.SEMANTIC_REJECTED,
+                      detail)
+
+    def _semantic_gate(self, token: str, acb: ACB, pending=None) -> Deny | None:
+        """`off` 不跑；`warn` 只记录；`block` 返回 Deny（不可重试，需改代码）。"""
+        if self.semantic == "off":
+            return None
+        res = self._semantic_locked(token, pending)
+        if res == Status.OK or self.semantic == "warn":
+            return None
+        detail = res.detail or {}
+        issues = detail.get("issues") or []
+        return Deny(_issue_summary(issues) or "semantic_conflict",
+                    code="semantic_conflict")
 
     # ------------------------------------------------------------ Verifier
     def verify(self, token: str, cmd=None, *,

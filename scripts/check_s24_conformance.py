@@ -74,6 +74,39 @@ for token in ("git_scenario", "rsc_scenario", "gate_scenario", "green_scenario")
     chk(f"实验含 {token}", f"def {token}(" in _ex)
 chk("README 链到 S24", "s24-gap-analysis-and-repositioning.md" in _src("README.md"))
 
+# ---------------------------------------------------------------- S24-3 静态语义
+chk("静态语义模块存在", (_ROOT / "harness/semantic.py").exists())
+from harness.semantic import detect
+
+chk("detect 可调用", callable(detect))
+_sem = _src("harness/semantic.py")
+chk("抑制星号导入", 'alias.name == "*"' in _sem)
+chk("抑制动态模块（__getattr__）", "__getattr__" in _sem)
+chk("条件定义为不确定", "uncertain" in _sem)
+chk("跳过 TYPE_CHECKING", "TYPE_CHECKING" in _sem)
+chk("跳过注解", "visit_AnnAssign" in _sem)
+_facade2 = _src("harness/facade.py")
+chk("门面导入 detect", "from .semantic import detect" in _facade2)
+chk("semantic 三态校验", '"off", "warn", "block"' in _facade2)
+chk("显式 check_semantics", "def check_semantics" in _facade2)
+chk("静态门禁存在", "def _semantic_gate" in _facade2)
+_apply2 = inspect.getsource(RscSession._apply_locked)
+chk("静态门禁在动态验证之前",
+    _apply2.index("_semantic_gate(") < _apply2.index("_verify_gate("))
+chk("语义冲突用 Deny 而非 Conflict", 'code="semantic_conflict"' in _facade2)
+chk("语义报告落盘", 'spec["rsc_semantic"]' in _facade2)
+chk("测试覆盖三态", "semantic=mode" in _src("tests/test_s24_semantic.py"))
+_chk_sem = detect(
+    {"app/core.py": b"def f(x):\n    return x\n",
+     "app/use.py": b"from app.core import f\n"},
+    {"app/core.py": b"def g(x):\n    return x\n",
+     "app/use.py": b"from app.core import f\n"})
+chk("运行期检出改名引用", (not _chk_sem.ok)
+    and _chk_sem.issues[0].name == "f")
+chk("运行期兼容改动不报", detect(
+    {"app/core.py": b"def f(x):\n    return x\n"},
+    {"app/core.py": b"def f(x):\n    return x\ndef g():\n    return 1\n"}).ok)
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)

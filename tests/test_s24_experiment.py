@@ -25,6 +25,7 @@ def test_semantic_conflict_experiment_runs():
     assert "A=Receipt  B=Receipt" in out
     # [3] verify_cmd 拦住
     assert "B=Deny" in out and "code=verify_failed" in out
+    assert "code=semantic_conflict" in out
     # [4] 修正后放行且 verified
     assert "verified=True" in out
     assert "[结论]" in out

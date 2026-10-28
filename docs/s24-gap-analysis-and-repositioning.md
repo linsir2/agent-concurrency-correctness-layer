@@ -137,7 +137,7 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 |---|---|---|
 | S24-1 | `session.verify(token, cmd, timeout)`：在「候选副本 + 账本合并视图 + 本次 pending」上跑命令；红/超时/无工作区 → 拒绝提交；结果写进 `spec["rsc_verify"]`，收据带 `verified` | ✅ 已实现（`harness/facade.py`），11 个用例 |
 | S24-2 | 适配器接入：`RscSession(verify_cmd=...)` 后 `apply` 自动先跑验证（无需改适配器代码） | ✅ 已生效；sidecar/MCP 响应新增 `verified` |
-| S24-3 | 符号级冲突检测（可选）：删除/改名符号仍被引用 → `Conflict(semantic)`（不依赖执行） | ⬜ 未做 |
+| S24-3 | 符号级语义冲突检测：删除/改名符号仍被引用 → `Deny(semantic_conflict)`（不执行代码、零依赖、仅 Python） | ✅ 已实现（`harness/semantic.py` + `semantic=off|warn|block`），22 个用例 |
 | S24-4 | merge queue 集成：`apply` 成功后 rebase 到队首再验证 | ⬜ 未做 |
 
 ### 5.1 S24-1 实现要点
@@ -164,13 +164,28 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 [4] B 改对     B=Receipt  verified=True         ← 放行
 ```
 
+### 5.4 S24-3 静态语义检测要点
+
+- **只报「base 有、post 没有」的模块级显式引用**：`from m import x`、`import m as a` 后的
+  `a.x`、相对导入；模块整体消失也报（`removed_module`）。
+- **用召回换精度**：`from m import *`、`__getattr__`、`getattr/globals/exec/importlib`、
+  条件定义（`if`/`try` 内）、注解、`try/except ImportError`、`TYPE_CHECKING` 一律跳过；
+  语法错误只跳过该文件，不拒绝提交。
+- **三态**：`off`（默认，不跑）/ `warn`（只写 `spec["rsc_semantic"]`）/ `block`（`Deny`）。
+  非法值构造即 `ValueError`。
+- **顺序**：静态检查在 `verify` **之前**（便宜、给出 `path:line:符号`，可行动）；
+  动态验证仍是权威判据。
+- **性能**：上限 2000 文件 / 5 MiB 单文件；200 文件约 2 万行 < 2s（有用例）。
+- **实测**：`examples/semantic_conflict` 增加 `[3b]`，不跑任何代码即返回
+  `code=semantic_conflict reason=removed_symbol:app.core:compute_rate@app/feature.py:1`。
+
 ### 5.3 已知边界
 
 | 边界 | 说明 |
 |---|---|
 | 验证的是**文件视图** | 只叠加「路径已存在于候选副本」的账本资源；纯 JSON/非文件资源不参与合并视图 |
 | 不替代 CI | 只跑你给的一条命令；耗时 = 一次全量检查，接受不了就配更快的子集 |
-| 语义冲突的**静态**检测没做 | S24-3；当前只能靠「跑起来」发现 |
+| 静态检测只覆盖「名字消失」 | 签名/行为变化、类成员、动态引用查不到（S24-3 明确不做，交给 `verify`） |
 | merge queue 没做 | S24-4；当前没有 rebase 到队首再验的串行化 |
 | 副本复制成本 | 大仓库每次 `apply` 复制一棵树；可用 `verify_cmd=None` + 显式 `verify()` 控制频率 |
 
