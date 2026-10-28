@@ -42,7 +42,7 @@
 | 宿主 | 真实可插入点 | 关键限制（评审纠正） |
 |---|---|---|
 | **LangGraph** | `create_agent(middleware=[...])`；`AgentMiddleware.wrap_tool_call` **与** `awrap_tool_call`；`BaseCheckpointSaver`；`BaseStore` | ① `BaseStore` 的抽象方法只有 **`batch` / `abatch`**（`get/put/search` 是基类基于 `batch` 的具体实现）→ 只写三个方法**实例化即 TypeError**；② 只写同步钩子，在 `ainvoke/astream` 下**直接 NotImplementedError**；③ `wrap_tool_call` 只能看到 `tool_call{name,args,id}` 与 `ToolMessage`，**看不到工具内部写了哪个 resource** |
-| **CrewAI** | `@on(PRE_TOOL_CALL)` / `POST_TOOL_CALL`；`ToolCallHookContext`；`HookAborted`；per-run 用 `scoped_hooks(...)` | ① **没有 `tool_call_id`**（字段只有 `tool_name/tool_input/tool/agent/task/crew/tool_result`）；② `Crew(...)` **没有 `hooks=` 参数**；③ 阻断是**软拒绝**：返回固定文案 `"Tool execution blocked by hook..."`，reason 不透传，agent 继续跑 |
+| **CrewAI** | `@on(PRE_TOOL_CALL)` / `POST_TOOL_CALL`；`ToolCallHookContext`；`HookAborted`；per-run **没有** `scoped_hooks`（S23 实测 1.15.32 无此 API） | ① **没有 `tool_call_id`**（字段只有 `tool_name/tool_input/tool/agent/task/crew/tool_result`）；② `Crew(...)` **没有 `hooks=` 参数**；③ 阻断是**软拒绝**：`HookAborted`/`False` 只让工具不执行并回固定文案 `"Tool execution blocked by hook..."`，reason 不透传，agent 继续跑；④ hook 抛普通异常被**吞掉（fail-open）**，正确性不能放在 hook 上 |
 | **OpenAI Agents SDK** | `tool_input_guardrails`（FunctionTool 执行前）；`tool_output_guardrails`；`RunHooks`（只观测）；MCP 工具 | ① `Session` 是**会话历史**（4 个 async 方法 + `session_settings`），**不能**承载资源版本快照；② guardrail **只对 FunctionTool 生效**，MCP 工具走不到 → 必须由我们 server 端 gate 兜底 |
 | **AG2** | `on_tool_execution`（beta，async，可短路/改写入参） | `AssemblyPolicy` 是**上下文组装策略**（compact/aggregate），**不是预算树**；beta 通道需锁版本，且只承诺 AG2 不是 MS AutoGen |
 | **MCP** | `FastMCP.tool(name=..., description=...)`、`resource(uri, ...)`、`Context`；stdio / Streamable HTTP（SSE 已 deprecated） | ① `resource("rsc://snapshot/{agent_id}")` 会变成 **resource template**，且很多客户端不主动读 resources → 需同时给工具；② 模型**不会**可靠地按 5 步顺序调用 |
@@ -153,17 +153,20 @@ request -> writes = tool.rsc_writes            # 无声明 → 直接放行（�
 
 **不做**：`RscStore`（需 `batch/abatch` 且只读侧无价值）、接管 `BaseCheckpointSaver`（语义不等价：我们存 ACB，不存 graph channel）。
 
-### 2.2 CrewAI（S23）
+### 2.2 CrewAI（S23，**v0.1 此段已被 S23 实测修正**）
+
+> 1.15.32 **没有** `scoped_hooks`；hook 普通异常 fail-open。正确性放在**包装 `BaseTool.run`**，
+> hook 只做观测。详见 [s23-integration-plan.md](s23-integration-plan.md) §1/§3.1。
 
 ```python
-from harness.integrations.crewai import rsc_hooks
-with rsc_hooks(harness, writes_map={...}):     # scoped_hooks 上下文管理器
-    crew.kickoff()
+from harness.integrations.crewai import rsc_tools
+
+tools = rsc_tools(session, wraps={"write_file": ("docs/a.md",)}, tools=[...])
+agent = Agent(role=..., tools=tools)        # 包装后的 BaseTool（覆写 run）
 ```
-- `PRE_TOOL_CALL` → `begin + gate`；`POST_TOOL_CALL` → `apply + finish`。
-- 无 `tool_call_id` → 幂等键用业务键。
+- `PRE_TOOL_CALL` → 仅观测（`begin + gate` 的*结果*记录），**不承担阻断**。
+- 无 `tool_call_id` → 幂等键用业务键 + `task.id` + args 哈希。
 - 阻断是**软拒绝**：把 typed reason 编进文案（`RSC_WAIT: budget` / `RSC_DENY: capability`），并承认"模型可能重试"。
-- 注意 `crew.cache` 命中时工具不执行但 PRE hook 已跑 → 按"是否真的执行"判定。
 
 ### 2.3 OpenAI Agents SDK（S23）
 
