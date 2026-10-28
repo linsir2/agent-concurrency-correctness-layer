@@ -1125,6 +1125,29 @@ class RunCoordinator:
                 return Status.OK                   # **幂等**：已暂停 = 目标态
             self.h.pause_run(run_id, reason=str(cmd.get("reason", "") or ""))
             return Status.OK
+        if kind == "KILL_RUN":
+            rid = str(cmd.get("run_id", "") or "")
+            if not rid:
+                return Status.INVALID_INPUT
+            self.h.kill_run(rid)
+            return Status.OK                    # 幂等：已全终态则无操作
+        if kind == "PURGE_RUN":
+            rid = str(cmd.get("run_id", "") or "")
+            if not rid:
+                return Status.INVALID_INPUT
+            # 有未终态任务 → 拒绝（不静默丢状态）
+            return (Status.OK if self.h.purge_run(rid) else Status.INVALID_INPUT)
+        if kind == "DLQ_REDRIVE":
+            aid = str(cmd.get("acb_id", "") or "")
+            acb = self.h.acbs.get(aid)
+            if acb is None:
+                return Status.INVALID_INPUT
+            return (Status.OK if self.h.redrive_dead_letter(acb) is not None
+                    else Status.INVALID_INPUT)
+        if kind == "PRUNE":
+            self.h.prune_budget(
+                max_age_s=cmd.get("max_age_s"))
+            return Status.OK
         if kind == "RESUME_RUN":
             run_id = str(cmd.get("run_id", "") or "")
             if not run_id:

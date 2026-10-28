@@ -293,6 +293,35 @@ class RaftCluster:
         cls_._thread.start()
         return cls_
 
+    def verify_connected(self) -> None:
+        """S20 K-96：`wait_ready` 之后复核**真实连通性**。
+
+        为什么需要：`precheck` 只证明 TCP 能建连（SYN 可达），**不等于**
+        pysyncobj 能通信（密码 / 版本 / 集群不一致时仍会失败，但 `wait_ready`
+        可能因为「本地已就绪」而通过）。这里用 `isNodeConnected` 逐 peer 复核，
+        失败即列出断连地址。
+        """
+        lead = self.leader()
+        if lead is None:
+            raise RaftUnavailable("verify_connected：无 leader（集群未真正就绪）")
+        probe = getattr(lead, "isNodeConnected", None)
+        if not callable(probe):
+            return                      # pysyncobj 版本不支持 → 跳过（不假报）
+        # 注意：pysyncobj 的 `isNodeConnected(node)` 接收的是 **Node 对象**
+        # （不是地址字符串），peer 列表在 `otherNodes` 里。
+        peers = list(getattr(lead, "otherNodes", []) or [])
+        bad = []
+        for node in peers:
+            try:
+                ok = bool(probe(node))
+            except Exception:  # noqa: BLE001  # 探测异常按「未连通」处理
+                ok = False
+            if not ok:
+                bad.append(str(getattr(node, "address", node)))
+        if bad:
+            raise RaftUnavailable(
+                f"以下 peer 未连通（TCP 可达但 Raft 不通，检查密码/版本）：{bad}")
+
     def compact(self) -> None:
         """对全部节点触发日志压缩（S17 K-86；配合 `fullDumpFile` 落快照）。"""
         for nd in self.nodes:
@@ -571,6 +600,10 @@ if _HAS_PYSYNCOBJ:
             # S19 K-89：每个 ACB 的**最大** claim_epoch（单调）；旧 worker 的低
             # epoch 会被永久拒（fencing），无需额外 set_claim 调用。
             self.claims = {}
+            # S20 K-94：已剪 ACB 的 claim 墓碑（**有界 LRU**）。裸删会让旧 worker
+            # 复活（`claims.get` 回 0 → 任何 epoch 都通过）。
+            self.claim_tombstones = {}
+            self.claim_tombstone_max = 1024
 
         @replicated
         def create_node(self, node_id: str, limits: int,
@@ -598,7 +631,9 @@ if _HAS_PYSYNCOBJ:
             「校验 claim + 变更账本」，副本间确定。
             单调：`claim_epoch < 已记录` → 拒绝（旧 worker 被 fence）。
             """
-            if acb_id and int(claim_epoch) < int(self.claims.get(acb_id, 0)):
+            floor = max(int(self.claims.get(acb_id, 0)),
+                        int(self.claim_tombstones.get(acb_id, 0)))
+            if acb_id and int(claim_epoch) < floor:
                 self.last_ok = False
                 self.version += 1
                 return
@@ -638,8 +673,8 @@ if _HAS_PYSYNCOBJ:
             self.version += 1
 
         @replicated
-        def prune(self, now: float, live_rids: tuple,
-                  retention_s: float) -> None:
+        def prune(self, now: float, live_rids: tuple | None,
+                  retention_s: float, live_acb_ids: tuple | None = None) -> None:
             """S19 K-88：`now` / `live_rids` / **生效保留期**都随命令复制 → 确定。
 
             **为什么传 `retention_s` 而不是让副本自己读 `_tombstone_ttl_s`**：
@@ -648,6 +683,18 @@ if _HAS_PYSYNCOBJ:
             """
             self.removed = int(self.bm.prune(
                 now, live_rids, retention_s=retention_s))
+            # S20 K-94：只剪「不在活 ACB 集合」的 claim，且**先写墓碑**再删。
+            if live_acb_ids is not None:
+                live_ids = set(live_acb_ids)
+                for aid in list(self.claims):
+                    if aid in live_ids:
+                        continue
+                    self.claim_tombstones[aid] = int(self.claims.pop(aid))
+                # 有界：按插入顺序挤出最旧（dict 保序）
+                overflow = len(self.claim_tombstones) - int(
+                    self.claim_tombstone_max)
+                for old in list(self.claim_tombstones)[:max(0, overflow)]:
+                    self.claim_tombstones.pop(old, None)
             self.version += 1
 else:                                                     # pragma: no cover
     class _ReplicatedBudget:                              # type: ignore[no-redef]
@@ -771,14 +818,25 @@ class RaftBudgetManager:
         self._bump_and_wait(self._replica.gc, float(now))
         return int(getattr(self._replica, "removed", 0) or 0)
 
-    def prune(self, now: float, live_rids=(), *,
-              max_age_s: float | None = None) -> int:
-        """S19 K-88：三栅栏剪枝（走共识；参数全部随命令复制）。"""
+    def prune(self, now: float, live_rids=None, *,
+              max_age_s: float | None = None,
+              live_acb_ids=None) -> int:
+        """S19/S20：三栅栏剪枝 + claim 墓碑清理（参数全部随命令复制）。
+
+        `live_rids=None` → **fail-safe 不剪**（K-95）；`live_acb_ids=None` →
+        不动 claims（同样 fail-safe）。
+        """
+        if live_rids is None and live_acb_ids is None:
+            return 0
         ttl = float(self._bm._tombstone_ttl_s)
         retention = ttl if max_age_s is None else min(ttl, float(max_age_s))
-        self._bump_and_wait(self._replica.prune, float(now),
-                            tuple(sorted(str(r) for r in (live_rids or ()))),
-                            retention)
+        rids = ("__none__",) if live_rids is None else tuple(
+            sorted(str(r) for r in live_rids))
+        self._bump_and_wait(
+            self._replica.prune, float(now),
+            None if live_rids is None else rids, retention,
+            None if live_acb_ids is None else tuple(
+                sorted(str(a) for a in live_acb_ids)))
         return int(getattr(self._replica, "removed", 0) or 0)
 
     def remaining(self, node_id: str) -> int:

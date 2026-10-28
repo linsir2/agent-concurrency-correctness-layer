@@ -779,7 +779,8 @@ exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\.", "raise No
 | **S17** | ✅ 完成（2026-10-27） | **K-81**（确定性 id → `RaftBudgetManager`，三副本一致 + 重启续号）+ **K-82**（`require_leader`）+ **K-83**（`production_conf`）+ **K-84**（共享集群提速）+ **K-85**（`bump_epoch` 显式抛错）+ **K-86**（journal/快照 + `compact()`，重启完整恢复）；**MS10**：`observability`（SpanSink/Memory/OTel 适配）+ `drain` + 毒任务 DLQ + `kill_run`/`purge_run` + 三条出口命名用例 | **590 passed**（+4 xfail，+27）；S17 核对 **56/56**；连跑 5 轮全绿；详见 [S17 方案 v1.1](s17-boundaries-and-ms10.md) §6 |
 | **S18** | ✅ 完成（2026-10-27） | **K-87**（`RaftBudgetManager` 升级为**真 RSM**：树/归档折叠/gc/不变量全走共识）+ **K-82**（`barrier()` 读穿日志 → 线性一致读）+ **K-83**（`from_addrs` 外部集群）；终审修 **4 P0**（barrier 不刷新视图 / consume 丢 claim fencing / archive 恒 True / create_node 静默返回旧节点） | **604 passed**（+4 xfail，+14）；S18 核对 **37/37**；连跑 3 轮全绿；详见 [S18 方案 v1.1](s18-budget-rsm-and-linearizable-read.md) §6 |
 | **S19** | ✅ 完成（2026-10-27） | **K-88**（账本**三栅栏精密修剪**：状态/精确引用/时间 + 剪前折账，100 轮后残留 ≤1）+ **K-89**（claim fencing 复制，单调 fence 旧 worker）+ **K-90**（归档事件带 `expires_at`，重放不取 wall clock）+ **K-91**（`remaining()` + `check` 标 ANY）+ **K-92**（`precheck="auto"` + 可配密码）+ **K-93**（`remove_node` owner 走共识） | **620 passed**（+4 xfail，+16）；S19 核对 **40/40**；连跑 3 轮全绿；详见 [S19 方案 v1.1](s19-budget-gc-and-hardening.md) §6 |
-| S20 | 📋 待开工 | K-94 `claims` 表随 prune 清理 · K-95 `prune` 调用方契约 · 多租户/计量（阶段三） | — |
+| **S20** | ✅ 完成（2026-10-27） | **K-94**（claims **有界墓碑**，不裸删 → 不复活旧 worker）+ **K-95**（`prune` fail-safe 默认）+ **K-96**（`verify_connected` 就绪后复核）+ **阶段三**：多租户（预算树租户层，配额隔离）、计量（事件派生，幂等）、统一 Admin 命令面（KILL/PURGE/DLQ/PRUNE） | **631 passed**（+4 xfail，+11）；S20 核对 **35/35**；连跑 3 轮全绿；详见 [S20 方案 v1.1](s20-tenant-metering-and-k94.md) §6 |
+| S21 | 📋 待开工 | K-97（tenant 自动接准入）· K-99（分布式租约，除非真有多 leader）· K-100 墓碑窗口量化 · 多租户优先级份额（tier reservation） | — |
 
 **S0–S4 的已知偏差（记录在案）**：
 1. `EventLog.append` 的 `run_id` 目前是**关键字默认值**而非必填 —— S1 的 WAL 会强制它（因为跨进程恢复必须能按 run 归档）。

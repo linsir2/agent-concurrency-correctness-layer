@@ -2849,11 +2849,73 @@ class Harness:
         """
         now_s = (int(self.clock.now_ms()) if now_ms is None else int(now_ms)) / 1000.0
         live: set[str] = set()
+        live_ids: set[str] = set()
         for acb in self.acbs.values():
             if acb.state in TASK_TERMINAL:
                 continue
+            live_ids.add(acb.id)
             live.update(acb.reservation_ids or ())
-        return self.budget.prune(now_s, live, max_age_s=max_age_s)
+        # S20 K-94：同时传 live_acb_ids（Raft 副本据此把已剪 ACB 的 claim 转为墓碑）
+        try:
+            return self.budget.prune(now_s, live, max_age_s=max_age_s,
+                                     live_acb_ids=live_ids)
+        except TypeError:
+            # 单机 BudgetManager 没有该参数 → 退回旧签名（不影响既有语义）
+            return self.budget.prune(now_s, live, max_age_s=max_age_s)
+
+    # ---- S20 阶段三：多租户（**配额隔离**，非安全隔离）----------------
+    def ensure_tenant(self, tenant: str, quota: int, *,
+                      parent: str = "run"):
+        """确保存在 `tenant:<t>` 预算节点（幂等）。挂在它下面的节点共享受配额约束。
+
+        **诚实边界**：这只有**配额**隔离；同进程仍共享内存（安全隔离靠 egress/沙箱）。
+        自动把 `plan["tenant"]` 接到准入的接线见 K-97（未做）。
+        """
+        tid = str(tenant or "")
+        if not tid:
+            return None
+        return self.budget.create_node(f"tenant:{tid}", int(quota), parent,
+                                       tenant=tid)
+
+    # ---- S20 阶段三：计量（**从事件派生**，天然幂等）------------------
+    def usage_report(self, *, tenant: str | None = None) -> dict:
+        """按租户归集的用量（从 EventLog 重算，**幂等**）。
+
+        为什么不用原子计数器：AWS Builders' Library 指出原子计数器**不幂等**
+        （重试会重复计数）；EventLog 是唯一提交点（I1），从它重算天然幂等。
+
+        归集口径（**明确写死，避免歧义**）：
+        - `actions`：`RESOURCE_COMMITTED` 事件数（全局）
+        - `runs`：出现过的 `run_id` 去重数
+        - `by_tenant[t]`：**预算预留事件数**（`BUDGET_RESERVED`），按事件的
+          `subject`（= 预算节点 id）映射到该节点上的 `tenant` 标签归集
+        - `tenant=` 给定时只返回该租户的切片
+        """
+        node_tenant: dict[str, str] = {}
+        for nid, node in (getattr(self.budget, "_nodes", {}) or {}).items():
+            t = getattr(node, "tenant", "") or ""
+            if t:
+                node_tenant[nid] = t
+
+        actions = 0
+        runs: set[str] = set()
+        by_tenant: dict[str, int] = {}
+        for ev in self.event_log.all():
+            kind = ev.kind.value if hasattr(ev.kind, "value") else str(ev.kind)
+            if ev.run_id:
+                runs.add(ev.run_id)
+            if kind == "RESOURCE_COMMITTED":
+                actions += 1
+            elif kind == "BUDGET_RESERVED":
+                t = node_tenant.get(str(ev.subject), "")
+                if t:
+                    by_tenant[t] = by_tenant.get(t, 0) + 1
+
+        if tenant is not None:
+            t = str(tenant)
+            return {"tenant": t, "reservations": int(by_tenant.get(t, 0)),
+                    "runs": len(runs), "actions": actions}
+        return {"actions": actions, "runs": len(runs), "by_tenant": by_tenant}
 
     def export_observability(self, sink=None) -> int:
         """把事件流 + metrics 推给 `SpanSink`（默认 `MemorySpanSink`）。

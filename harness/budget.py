@@ -61,6 +61,7 @@ class BudgetNode:
         parent: BudgetNode | None = None,
         owner: str = "",
         run_id: str = "",
+        tenant: str = "",
     ) -> None:
         self.node_id = node_id
         self.limits = limits
@@ -72,6 +73,8 @@ class BudgetNode:
         self.reservations: dict[str, Reservation] = {}
         self.owner = owner
         self.run_id = run_id          # K-40：预算事件按 run 归属（per-run 过滤）
+        # S20 阶段三：租户标签（**只做配额隔离**，不是安全隔离 —— 见 S20 §1.4）
+        self.tenant = tenant
         self.parent = parent
         if parent is not None:
             parent.children.append(self)
@@ -140,6 +143,7 @@ class BudgetManager:
         self._epoch_store = epoch_store      # run 层 epoch（Harness 注入）
         # `run_scope="run"` 才启用 per-run fencing；默认 "global" 保持旧语义
         self._run_scope = run_scope if run_scope in ("run", "global") else "global"
+        self._prune_refused = 0              # S20 K-95：因缺 live_rids 而拒绝剪枝的次数
         self._suppress_depth = 0             # 事件抑制深度（准入事务用）
         self._pending: list[dict] = []       # 被抑制的事件草稿（set 语义）
         self._last_budget_seq = 0            # 最近一条已 append 预算事件的 seq
@@ -515,7 +519,7 @@ class BudgetManager:
     # ------------------------------------------------------------------ #
     def create_node(
         self, node_id: str, limits: int, parent_id: str = "run",
-        run_id: str = ""
+        run_id: str = "", tenant: str = ""
     ) -> BudgetNode | None:
         if limits <= 0:
             return None
@@ -528,7 +532,8 @@ class BudgetManager:
             parent = self._nodes.get(parent_id)
             if parent is None:
                 return None
-            node = BudgetNode(node_id, limits, parent, run_id=run_id or self._run_id)
+            node = BudgetNode(node_id, limits, parent,
+                              run_id=run_id or self._run_id, tenant=tenant)
             self._nodes[node_id] = node
             self._emit(EventKind.BUDGET_NODE_CREATED, node_id,
                        {"node_id": node_id, "parent_id": parent_id, "limits": limits,
@@ -929,7 +934,7 @@ class BudgetManager:
                 f"tree integrity broken: node {nid!r} declared by EventLog "
                 f"but not rebuilt")
 
-    def prune(self, now: float, live_rids=(), *,
+    def prune(self, now: float, live_rids=None, *,
               max_age_s: float | None = None,
               retention_s: float | None = None) -> int:
         """剪掉「已终结 + 无人引用 + 超过保留期」的预留条目（S19 K-88）。
@@ -950,7 +955,13 @@ class BudgetManager:
 
         返回删除条数。
         """
-        live = set(live_rids or ())
+        # S20 K-95：**fail-safe 默认** —— 不知道活引用就一律不剪。
+        # 原默认 `()`（空集）= 全部可剪，忘记传参会静默剪掉活引用 →
+        # 后续 settle/release 变 no-op（账目永久偏差）。默认必须安全。
+        if live_rids is None:
+            self._prune_refused = int(getattr(self, "_prune_refused", 0)) + 1
+            return 0
+        live = set(live_rids)
         ttl = float(self._tombstone_ttl_s)
         # ③ 保留期：显式 `retention_s` 优先（**Raft 副本必须用它** —— 各副本的
         # `_tombstone_ttl_s` 是本地配置，若被剪枝逻辑直接读取，配置漂移会让
