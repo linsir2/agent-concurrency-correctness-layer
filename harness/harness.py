@@ -76,6 +76,7 @@ from .storage.lease import (
     LeaseUnavailable,
 )
 from .subscription import SubscriptionRegistry
+from .timer import DurableTimer
 from .types import (
     ACB,
     TASK_TERMINAL,
@@ -223,6 +224,9 @@ class Harness:
                  writer_id: str | None = None,
                  lease_store: LeaseStore | None = None,
                  entropy=None,
+                 definitions=None,
+                 timers=None,
+                 durable_timers: bool = False,
                  egress_required: bool | None = None,
                  epoch_scope: str = "global",
                  replan_budget: int = 2,
@@ -250,6 +254,10 @@ class Harness:
             if scheduler_mode != "sync":
                 raise ValueError("确定性模式只支持 scheduler_mode='sync'（并发交错不可重放）")
         self.entropy = entropy
+        # S24-11：定义版本化（默认 None → 无 definition 键时零影响）
+        self.definitions = definitions
+        if timers is not None and durable_timers:
+            raise ValueError("timers 与 durable_timers 不能同时提供")
         if isinstance(replan_budget, bool) or not isinstance(replan_budget, int) \
                 or replan_budget < 0:
             raise ValueError(f"非法 replan_budget：{replan_budget!r}（>=0 的整数）")
@@ -335,6 +343,16 @@ class Harness:
             if callable(setter):
                 setter(entropy)
             self.event_log._clock = entropy
+        # S24-11：DurableTimer（默认关闭；开启时要求可持久事件日志）
+        if timers is None and durable_timers:
+            durable_log = (getattr(self.event_log, "_wal", None) is not None
+                           or type(self.event_log).__name__ == "RaftEventLog")
+            if not durable_log:
+                raise ValueError(
+                    "durable_timers=True 需要 WAL/Raft 事件日志（内存日志无法持久）")
+            timers = DurableTimer(self.event_log, self.clock)
+        self.timers = timers
+        self._timers_fired: list = []
         # S12 K-43：run 层 epoch store。WAL 模式 → `wal.log.epoch.<run_id>`；
         # 文件 checkpoint 模式 → `store.epoch.<run_id>`（与 store.json 同目录）；
         # 均无 → 纯内存（旧用例）。
@@ -1177,6 +1195,10 @@ class Harness:
                 "writer": self._writer_id,
                 "lease_epoch": int(self._writer_epoch),
             })
+        # S24-11：定义版本钉住 —— 写共享态前复验（热更新后旧 ACB 必须被拒）。
+        definition_error = self.check_definition((acb.spec or {}).get("definition"))
+        if definition_error:
+            return Result(Status.DENIED, {"reason": definition_error})
         # S13d §2.5 P0-10：claim fencing —— 旧 worker（fence_epoch 落后）的写一律拒绝
         # （sync 模式无 claim → 守卫恒 False，既有语义不变）。
         if self._claim_fenced(acb):
@@ -1637,6 +1659,28 @@ class Harness:
         if epoch != int(self.intents.get_epoch() or 0):
             self.intents.set_epoch(epoch)
             self.budget.set_epoch(epoch, emit=False)
+
+    # ---- S24-11：定义版本化 + DurableTimer 便捷入口 ----------------
+    def check_definition(self, ref) -> str:
+        """校验 ACB/plan 钉住的定义引用；空串 = 通过（fail-closed）。"""
+        if not ref:
+            return ""
+        if self.definitions is None:
+            return "DEFINITION_REGISTRY_MISSING"
+        try:
+            return str(self.definitions.check(ref))
+        except Exception:  # noqa: BLE001  # 非法 ref → 拒绝
+            return "DEFINITION_MALFORMED"
+
+    def set_timer(self, timer_id: str, fire_at_ms: int, **kwargs):
+        if self.timers is None:
+            raise RuntimeError("未启用 timers（Harness(timers=...) / durable_timers=True）")
+        return self.timers.schedule(timer_id, fire_at_ms, **kwargs)
+
+    def cancel_timer(self, timer_id: str, *, reason: str = "") -> bool:
+        if self.timers is None:
+            raise RuntimeError("未启用 timers")
+        return self.timers.cancel(timer_id, reason=reason)
 
     def _lease_failure_reason(self) -> str:
         """写入口被拒时的可观测原因（区分「别人持有」与「后端不可用」）。"""
@@ -2836,6 +2880,9 @@ class Harness:
         F4：`advance` 返回值必须校验（非法迁移 → 不结算）。
         """
         now = int(self.clock.now_ms() if now_ms is None else now_ms)
+        # S24-11：先结算到期定时器（只标记 + 返回记录，handler 由宿主幂等执行）
+        if self.timers is not None:
+            self._timers_fired = self.timers.fire_due(now)
         # K-69：候选集 = 内存 ∪ **持久真相**（未 `recover` 的等待态也要能结算）。
         # 锁序红线（S14 §2.2）：`_tick_candidates` 读完即返回，下面的 `_finalize`
         # **不持 store 锁** —— 否则 budget(1) 套 store(5) 反向获取 → LockOrderViolation。
@@ -2942,8 +2989,12 @@ class Harness:
         供外部驱动器**精确定时**（睡到最近到期点），而不是固定间隔轮询
         （对齐 K8s 的 level-triggered resync 只作兜底）。
         """
-        pending = self._pending_deadlines()
-        return min((d for d, _ in pending), default=None)
+        candidates = [d for d, _ in self._pending_deadlines()]
+        if self.timers is not None:
+            timer_deadline = self.timers.next_deadline_ms()
+            if timer_deadline is not None:
+                candidates.append(int(timer_deadline))
+        return min(candidates, default=None)
 
     def pump(self, now_ms: int | None = None) -> int:
         """驱动器入口：`tick()` 后返回**仍待结算**项数（`0` = 可退出）。
@@ -2956,7 +3007,10 @@ class Harness:
         注：`now_ms` 透传给 `tick`，便于 `ManualClock` 精确构造（不用 sleep）。
         """
         self.tick(now_ms)
-        return len(self._pending_deadlines())
+        pending = len(self._pending_deadlines())
+        if self.timers is not None:
+            pending += len(self.timers.pending())
+        return pending
 
     # ---- S15 D3：Admin pause / resume（持久化、不丢状态）-------------
     def is_paused(self, run_id: str) -> bool:

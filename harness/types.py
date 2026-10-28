@@ -123,6 +123,10 @@ class EventKind(str, Enum):
     TASK_COMPLETED = "TASK_COMPLETED"
     # S13c C1：spawn 两阶段落盘的孤儿回收留痕（绝不静默跳过）。
     SPAWN_ORPHAN_RECLAIMED = "SPAWN_ORPHAN_RECLAIMED"
+    # S24-11：DurableTimer（deadline 持久化，重启后可重建并触发）
+    TIMER_SET = "TIMER_SET"
+    TIMER_FIRED = "TIMER_FIRED"
+    TIMER_CANCELLED = "TIMER_CANCELLED"
 
 
 class TaskState(str, Enum):

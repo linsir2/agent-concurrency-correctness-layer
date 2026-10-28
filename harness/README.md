@@ -34,6 +34,8 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `harness/storage/lease.py` | L1 | S24-8（可复制写者租约：`LeaseState` 纯状态机 + `MemoryLeaseStore`；Raft 后端见 `storage/raft.py` 的 `RaftLeaseStore`） |
 | `bench/llm_replay.py` | 基准 | S24-9（真实模型 usage 录制 + 离线回放：token 倍数 / rework_rate；无 key 显式 skip） |
 | `harness/entropy.py` | L1 | S24-10（确定性原语：域隔离 seeded uuid/token + 严格单调模拟时钟） |
+| `harness/timer.py` | L1 | S24-11（DurableTimer：SET/FIRED/CANCELLED 事件溯源，重启重建、幂等触发） |
+| `harness/definitions.py` | L2 | S24-11（定义版本化：content-hash 钉住，未知/异 hash 拒绝） |
 | `harness/worktree.py` | L1 | S22（Z3 私有工作区） |
 | `harness/facade.py` | L5 | S22/S24（`RscSession` 门面；S24 增加 `verify` 提交前验证 + `semantic` 静态门禁） |
 | `harness/semantic.py` | L2 | S24-3（符号级语义冲突：零依赖 `ast`，仅 Python） |
@@ -108,6 +110,8 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s24_llm_usage.py` | S24-9 LLM usage：OpenAI/Anthropic 字段、缺 usage 标 `usage_missing`（不估算）、`chat()` 兼容、重试 attempts |
 | `tests/test_s24_replay.py` | S24-9 token 回放：fixture 算术自检、指标精确重算、删重试 turn 的必杀变异、CLI JSON/报告、无 key skip 且无数字 |
 | `tests/test_s24_determinism.py` | S24-10 确定性：同 seed WAL 逐字节相等、换 seed/默认模式必不同、域隔离/单调时钟、拒绝 auth/pool/merge_queue |
+| `tests/test_s24_timer.py` | S24-11 timer：到期才触发、取消、重复调度拒绝、WAL 重启重建、已触发不双触发、tick/pump 收敛、默认关闭无事件 |
+| `tests/test_s24_definitions.py` | S24-11 定义：content hash、同名异内容冲突、未知/异 hash 准入拒绝（零残留）、热更新后旧 ACB 提交被拒 |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

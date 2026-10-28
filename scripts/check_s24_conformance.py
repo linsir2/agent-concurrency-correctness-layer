@@ -351,6 +351,33 @@ def _det_wal(root, seed):
     return (root / "wal.log").read_bytes()
 
 
+# ---------------------------------------------------------------- S24-11 timer + 定义
+chk("timer 模块存在", (_ROOT / "harness/timer.py").exists())
+chk("definitions 模块存在", (_ROOT / "harness/definitions.py").exists())
+chk("TIMER 事件已登记", "TIMER_SET" in _src("harness/types.py")
+    and "TIMER_FIRED" in _src("harness/types.py")
+    and "TIMER_CANCELLED" in _src("harness/types.py"))
+chk("tick 驱动 timer", "self.timers.fire_due(now)" in _src("harness/harness.py"))
+chk("内存日志拒绝 durable_timers",
+    "需要 WAL/Raft 事件日志" in _src("harness/harness.py"))
+chk("定义在准入前校验",
+    "占预算/槽位之前" in _src("harness/orchestration.py"))
+chk("定义在提交前校验",
+    "定义版本钉住" in _src("harness/harness.py"))
+chk("同名异内容冲突", "class DefinitionConflict" in _src("harness/definitions.py"))
+_det_t = _src("tests/test_s24_timer.py")
+_det_d = _src("tests/test_s24_definitions.py")
+for token in ("test_fires_only_when_due", "test_cancel_prevents_fire",
+              "test_rebuild_from_wal_survives_restart",
+              "test_harness_tick_drives_and_restarts",
+              "test_default_off_has_no_timer_state"):
+    chk(f"timer 用例 {token}", f"def {token}(" in _det_t)
+for token in ("test_unknown_definition_rejected_before_budget",
+              "test_hot_definition_change_blocks_old_acb_commit",
+              "test_missing_registry_is_fail_closed",
+              "test_plan_and_admit_pin_definition"):
+    chk(f"定义用例 {token}", f"def {token}(" in _det_d)
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)
@@ -430,6 +457,37 @@ with tempfile.TemporaryDirectory() as tmp:
     _store.set_fail(True)
     chk("租约后端故障 fail-closed",
         _h1._renew_writer_lease() is False and _h1._lease_outcome == "unavailable")
+
+    # S24-11 运行期：timer 只触发一次；定义未知在准入前拒绝
+    from harness.clock import ManualClock as _MC
+    from harness.event_log import EventLog as _EL
+    from harness.timer import DurableTimer as _DT
+    _clock = _MC(start_ms=1_000)
+    _tlog = _EL(clock=_clock)
+    _timer = _DT(_tlog, _clock)
+    _timer.schedule("t1", 1_500)
+    chk("timer 到期前不触发", _timer.fire_due(1_400) == [])
+    chk("timer 到期触发一次", len(_timer.fire_due(1_500)) == 1
+        and _timer.fire_due(9_999) == [])
+    chk("timer 取消后不触发", _timer.cancel("t1") is False)
+
+    from harness.definitions import DefinitionRegistry as _DR
+    _reg = _DR()
+    _ref = _reg.register({"p": "v1"}, name="coder", version="1")
+    chk("定义 content hash", len(_ref.content_hash) == 64 and _reg.check(_ref) == "")
+    chk("未知定义拒绝", _reg.check({"name": "coder", "version": "2",
+                                    "content_hash": _ref.content_hash})
+        == "DEFINITION_UNKNOWN")
+    _bad_task = {"task_id": "t", "logical_subgoal_id": "g",
+                 "min_budget": 1, "definition": {"name": "coder", "version": "9",
+                                                 "content_hash": _ref.content_hash}}
+    _bad_plan = {"run_id": "r", "tasks": {"t": _bad_task}}
+    _hdef = make_harness(definitions=_reg, run_limits=10)
+    _bad_acb = _hdef.dispatcher.try_admit(_bad_task, "r", plan=_bad_plan)
+    chk("定义未知 → 准入拒绝（零残留）",
+        _bad_acb.state.value == "INADMISSIBLE"
+        and _bad_acb.failure == "DEFINITION_UNKNOWN"
+        and _hdef.budget._reservations == {})
 
     # S24-10 运行期：同 seed 的 WAL 逐字节相等；换 seed 必不同
     _det_root = pathlib.Path(tmp)

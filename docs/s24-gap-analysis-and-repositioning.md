@@ -61,7 +61,7 @@ python3 -m pytest -q tests/test_s24_determinism.py    # 同 seed 逐字节重放
 | 宿主适配（LangGraph/CrewAI/OpenAI/AG2/MCP/HTTP） | 定位 §6.2 阶段一交付物、§6.4 MVP | ✅ S22/S23 |
 | 基准五指标 | phase1 §9.3 | ✅ S24-9：真实调用录制 → 离线回放，token 倍数 **1.39**、rework_rate **0.33**（n=1，`bench/fixtures/llm_replay.json`）；其余四指标见 S7 |
 | 确定性原语（seeded uuid/now） | 定位 §4.3 第 3 条 | ✅ S24-10：`Deterministic`（域隔离 uuid/token + 单调模拟时钟）注入 event_id/run_id/预算 id/WAL generation；同 seed 单线程 WAL **逐字节相同** |
-| DurableTimer / 定义版本化 | design §14 | ❌ 仅 `tick` 轮询 |
+| DurableTimer / 定义版本化 | design §14 | ✅ S24-11：`TIMER_SET/FIRED/CANCELLED` 事件溯源定时器（重启重建、只触发一次）+ 定义 content-hash 钉住（准入前/提交前拒绝未知/异 hash） |
 
 ### 里程碑状态（按 phase1 实录，非 milestones 旧表）
 
@@ -150,6 +150,7 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 | S24-8 | 跨主机租约复制：`LeaseState` 纯状态机 + `MemoryLeaseStore` + `RaftLeaseStore`；接管 epoch+1，旧 epoch 续租/提交被拒；缺依赖 fail-closed | ✅ 已实现，18 个用例（含真实 3 节点 Raft） |
 | S24-9 | 真实 token 基准：`LLMReply` 保留上游 usage → `bench/llm_replay.py` 录制 + 离线回放；报 token 倍数与返工率（n=1，不声称显著） | ✅ 已实现（实测 1.39× / 0.33），17 个用例 |
 | S24-10 | 确定性原语：`Deterministic(seed)` 域隔离 id + 单调时钟，注入 event_id/run_id/预算/WAL generation；同 seed 逐字节重放 | ✅ 已实现，11 个用例 |
+| S24-11 | DurableTimer + 定义版本化：timer 三事件持久化（重启重建、幂等触发）；定义 content hash 钉住（plan/准入/提交三处 fail-closed） | ✅ 已实现，19 个用例 |
 
 ### 5.1 S24-1 实现要点
 
@@ -318,6 +319,25 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 - **诚实边界**：不承诺多线程交错、真实网络、真实 LLM、子进程 verify 的可复现；
   确定性 id **不是安全随机**，不得用作能力令牌。checkpoint `store_uuid`/ref 文件名
   与 worktree 绝对路径不在 v1 承诺内（它们不进 WAL 记录）。
+
+### 5.12 S24-11 DurableTimer + 定义版本化
+
+- **DurableTimer（`harness/timer.py`）**：`TIMER_SET / TIMER_FIRED / TIMER_CANCELLED`
+  与业务事件写同一 EventLog；`rebuild()` 按 seq 重建；`fire_due(now)` **只标记**
+  并返回到期记录（handler 由宿主幂等执行）；同 id 改期/复活 → `ValueError`；
+  时钟回拨不复活（watermark）。
+- **接线**：`Harness(durable_timers=True)` 要求 WAL/Raft 日志（内存日志构造即拒）；
+  `tick()` 先结算到期 timer；`next_deadline_ms`/`pump` 把 pending timer 计入。
+  默认 `timers=None` → 事件字节不变。
+- **定义版本化（`harness/definitions.py`）**：`DefinitionRegistry.register(name,
+  version, definition)` → `DefinitionRef(content_hash)`；同名同版本异内容 →
+  `DefinitionConflict`；`check(ref)` 返回 `DEFINITION_UNKNOWN / HASH_MISMATCH /
+  MALFORMED`。
+- **三处 fail-closed**：建 plan（未知 → `ValueError`）、准入（占预算/槽位前 →
+  `INADMISSIBLE`，零残留）、提交（写共享态前 → `DENIED`，热更新后旧 ACB 被拒）。
+  没有 `definition` 键时所有旧路径字节不变。
+- **v1 边界**：不把 HITL/aging 改造成 timer（避免语义漂移）；timer 不做 cron/
+  重复/分布式分片；定义注册表仅内存，进程重启需重新注册；不自动迁移/不跟随 latest。
 
 ---
 

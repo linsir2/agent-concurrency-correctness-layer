@@ -15,6 +15,7 @@ import itertools
 import threading
 from dataclasses import dataclass
 
+from .definitions import DefinitionRef
 from .storage.blob import canonical_bytes
 from .types import ACB, TASK_TERMINAL, EventKind, Status, TaskState, advance
 
@@ -169,7 +170,7 @@ class Planner:
                 footprint["tenant"] = str(spec["tenant"])
             if spec.get("tier"):
                 footprint["tier"] = str(spec["tier"])
-            plan["tasks"][task_id] = {
+            entry = {
                 "task_id": task_id,
                 "logical_subgoal_id": subgoal,
                 "footprint": footprint,
@@ -177,6 +178,14 @@ class Planner:
                 "state": TaskState.PLANNED,
                 "plan_version": 1,
             }
+            # S24-11：定义版本在**建 plan 时**就校验（未知/异 hash → 拒绝建 plan）
+            definition = spec.get("definition")
+            if definition:
+                error = self.h.check_definition(definition)
+                if error:
+                    raise ValueError(f"{error}: 定义未注册或内容不匹配")
+                entry["definition"] = DefinitionRef.from_dict(definition).as_dict()
+            plan["tasks"][task_id] = entry
         self._validate_subgoals(plan["tasks"])
         self.h.event_log.append(EventKind.PLAN_CREATED, run_id, {"tasks": list(plan["tasks"])})
         return plan
@@ -539,6 +548,14 @@ class Dispatcher:
         # 按 `(run_id, task_id, plan_version)` 解析「当前版本唯一 ACB」，
         # 避免 replan 后旧代际 ACB 被误跑（双跑）。
         acb.spec["plan_version"] = plan_version
+        # S24-11：定义版本在**占预算/槽位之前**校验（失败零残留）
+        definition = task.get("definition")
+        if definition:
+            error = self.h.check_definition(definition)
+            if error:
+                acb.spec["admission_error"] = error
+                return self._deny(acb, error)
+            acb.spec["definition"] = DefinitionRef.from_dict(definition).as_dict()
         if token is not None:                 # 显式 token 绑定到 ACB（§5.9）
             acb.capability = token
 
