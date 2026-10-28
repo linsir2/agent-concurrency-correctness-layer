@@ -10,6 +10,7 @@ import hashlib
 import itertools
 import os
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 
@@ -68,6 +69,12 @@ from .storage._lock import (
 from .storage.atomic import atomic_write
 from .storage.blob import InMemoryBlobStore, canonical_bytes
 from .storage.codec import CodecError, dumps, loads
+from .storage.lease import (
+    UNAVAILABLE,
+    LeaseGrant,
+    LeaseStore,
+    LeaseUnavailable,
+)
 from .subscription import SubscriptionRegistry
 from .types import (
     ACB,
@@ -214,6 +221,7 @@ class Harness:
                  receipts_enabled: bool = True,
                  checkpoint_root=None,
                  writer_id: str | None = None,
+                 lease_store: LeaseStore | None = None,
                  egress_required: bool | None = None,
                  epoch_scope: str = "global",
                  replan_budget: int = 2,
@@ -473,12 +481,22 @@ class Harness:
         # 单写者形同虚设。acquire 失败 → `_writer_lease_ok=False`，写入口拒绝服务。
         # S11b / 终审 7-1：**取租约前先恢复 durable epoch**。否则干净重启
         # （lease 已释放但 WAL epoch 仍为 N）时本地 epoch=0 → 首写被 fence。
-        self._restore_epoch()
+        # S24-8：`lease_store` 提供时，租约走**可复制后端**（Raft/内存），
+        # 不再读写本地 `writer_lease.json`；未提供时既有路径字节不变。
+        self._lease_store = lease_store
+        self._lease_instance = (f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                                if lease_store is not None else "")
         self._writer_id = writer_id or f"harness-{os.getpid()}"
-        self._durable = self._lease_path() is not None
+        self._writer_epoch = 0
+        self._lease_outcome = ""
+        self._lease_reason = ""
+        self._restore_epoch()
+        self._durable = (self._lease_path() is not None
+                         or self._lease_store is not None)
         self._writer_lease_ok = True
         if self._durable:
             self._try_acquire_writer_lease()
+            self._wire_lease_fence()
             on_close = getattr(self.event_log, "on_close", None)
             if callable(on_close):
                 on_close(self._release_writer_lease)
@@ -749,6 +767,26 @@ class Harness:
             return
         setter(lock=epoch_lock, epoch_reader=read_epoch,
                epoch_provider=lambda: int(self.intents.get_epoch() or 0))
+
+    def _wire_lease_fence(self) -> None:
+        """S24-8：租约与 Raft 事件日志**共享同一 RSM** 时，在提交点复核旧 epoch。
+
+        条件不满足（事件日志不是 Raft，或 cluster 未启用租约状态）→ **不注入**，
+        由 `_ensure_writer_lease` 在写入口拒绝；这一边界在文档里如实标注
+        （写入口检查 + 租约 TTL，不是零窗口）。绝不假装「提交点已 fence」。
+        """
+        if self._lease_store is None:
+            return
+        setter = getattr(self.event_log, "set_lease_fence", None)
+        replica = getattr(self.event_log, "_replica", None)
+        if not callable(setter) or not hasattr(replica, "lease"):
+            return
+        setter(lambda: {
+            "owner": self._writer_id,
+            "instance": self._lease_instance,
+            "epoch": int(self._writer_epoch),
+            "now_ms": int(self.clock.now_ms()),
+        })
 
     def _receipt_secret(self) -> str:
         """收据签名密钥来源：构造参数优先，否则读 env（开关独立于 secret 是否存在）。"""
@@ -1105,7 +1143,9 @@ class Harness:
         # S10a §2.5：提交前续租（心跳）；租约被其他写者持有时拒绝服务。
         if not self._ensure_writer_lease():
             return Result(Status.UPSTREAM_FAILED, {
-                "reason": "writer_lease_held", "writer": self._writer_id,
+                "reason": self._lease_failure_reason(),
+                "writer": self._writer_id,
+                "lease_epoch": int(self._writer_epoch),
             })
         # S13d §2.5 P0-10：claim fencing —— 旧 worker（fence_epoch 落后）的写一律拒绝
         # （sync 模式无 claim → 守卫恒 False，既有语义不变）。
@@ -1552,7 +1592,28 @@ class Harness:
             finally:
                 self._unbind_claim_epoch(acb.id, prev)
 
-    # ---- 单写者租约 + fencing epoch（S10a §2.5 / §3.4）------------------
+    # ---- 单写者租约 + fencing epoch（S10a §2.5 / §3.4 / S24-8）----------
+    def _apply_lease_grant(self, grant: LeaseGrant) -> None:
+        """把可复制后端的 grant 落到 Harness 内部状态（epoch 同步到 intents/budget）。"""
+        self._lease_outcome = grant.outcome
+        self._lease_reason = grant.reason
+        if not grant.ok:
+            self._writer_lease_ok = False
+            return
+        self._writer_lease_ok = True
+        epoch = int(grant.epoch)
+        self._writer_epoch = epoch
+        # 只在推进时写 intents/budget，避免每次续租都触发预算事件。
+        if epoch != int(self.intents.get_epoch() or 0):
+            self.intents.set_epoch(epoch)
+            self.budget.set_epoch(epoch, emit=False)
+
+    def _lease_failure_reason(self) -> str:
+        """写入口被拒时的可观测原因（区分「别人持有」与「后端不可用」）。"""
+        if self._lease_outcome == UNAVAILABLE:
+            return "writer_lease_unavailable"
+        return "writer_lease_held"
+
     def _lease_path(self):
         root = getattr(self.checkpoints, "root", None)
         if root is None:
@@ -1584,6 +1645,18 @@ class Harness:
         K-46：`bump_epoch` 只取独立 `epoch` 锁，**必须在 `store.lock` 之外**
         调用（否则 store(5) → epoch(4) 反向获取 → `LockOrderViolation`，接管崩）。
         """
+        if self._lease_store is not None:
+            try:
+                grant = self._lease_store.acquire(
+                    owner=self._writer_id, instance=self._lease_instance,
+                    now_ms=int(self.clock.now_ms()), ttl_ms=self.lease_ms)
+            except LeaseUnavailable:
+                self._lease_outcome = UNAVAILABLE
+                self._lease_reason = "lease_store_unavailable"
+                self._writer_lease_ok = False
+                return False
+            self._apply_lease_grant(grant)
+            return grant.ok
         path = self._lease_path()
         if not path:
             self._writer_lease_ok = True
@@ -1629,7 +1702,24 @@ class Harness:
         return True
 
     def _renew_writer_lease(self) -> bool:
-        """续租（仅当本写者仍是持有者）；过期则走接管。"""
+        """续租（仅当本写者仍是持有者）。
+
+        S24-8 的可复制后端**不做自动重取**：已丢失租约的旧写者必须被拒绝
+        （否则它可以用新 epoch 抢回锁，违背「接管后旧写者退出」的预期）。
+        """
+        if self._lease_store is not None:
+            try:
+                grant = self._lease_store.renew(
+                    owner=self._writer_id, instance=self._lease_instance,
+                    epoch=self._writer_epoch, now_ms=int(self.clock.now_ms()),
+                    ttl_ms=self.lease_ms)
+            except LeaseUnavailable:
+                self._lease_outcome = UNAVAILABLE
+                self._lease_reason = "lease_store_unavailable"
+                self._writer_lease_ok = False
+                return False
+            self._apply_lease_grant(grant)
+            return grant.ok
         path = self._lease_path()
         if not path:
             self._writer_lease_ok = True
@@ -1654,6 +1744,14 @@ class Harness:
 
     def _release_writer_lease(self) -> None:
         """释放本写者的租约（EventLog 关闭 = 写者会话结束）。"""
+        if self._lease_store is not None:
+            try:
+                self._lease_store.release(
+                    owner=self._writer_id, instance=self._lease_instance,
+                    epoch=self._writer_epoch)
+            except LeaseUnavailable:
+                pass          # 关闭阶段后端不可用：不阻断关闭（租约自然过期）
+            return
         path = self._lease_path()
         if not path:
             return
@@ -1674,6 +1772,12 @@ class Harness:
 
     def _restore_epoch(self) -> int:
         """从持久化存储读 run 级 epoch（RMW 语义，§3.4）。"""
+        if self._lease_store is not None:
+            epoch = int(self._lease_store.read_epoch())
+            self._writer_epoch = epoch
+            self.intents.set_epoch(epoch)
+            self.budget.set_epoch(epoch, emit=False)
+            return epoch
         reader = getattr(self._epoch_backend(), "read_epoch", None)
         epoch = 0
         if callable(reader):
@@ -1681,6 +1785,7 @@ class Harness:
                 epoch = int(reader())
             except Exception:  # noqa: BLE001
                 epoch = 0
+        self._writer_epoch = epoch
         self.intents.set_epoch(epoch)
         self.budget.set_epoch(epoch, emit=False)
         return epoch
@@ -1699,6 +1804,19 @@ class Harness:
         """
         scope = self.epoch_scope if epoch_scope is None else epoch_scope
         if run_id is None or scope == "global":
+            if self._lease_store is not None:
+                # S24-8：epoch 只能由共识推进；调用者必须是当前持有者，
+                # 否则说明自己已被接管 —— 拒绝而不是静默自增。
+                grant = self._lease_store.advance(
+                    owner=self._writer_id, instance=self._lease_instance,
+                    epoch=self._writer_epoch, now_ms=int(self.clock.now_ms()),
+                    ttl_ms=self.lease_ms)
+                if not grant.ok:
+                    raise FencingRejected(
+                        f"lease advance 被拒：{grant.outcome}:{grant.reason}")
+                self._apply_lease_grant(grant)
+                self.budget.set_epoch(self._writer_epoch, emit=True)
+                return self._writer_epoch
             bumper = getattr(self._epoch_backend(), "bump_epoch", None)
             epoch = None
             if callable(bumper):
@@ -1708,6 +1826,7 @@ class Harness:
                     epoch = None
             if epoch is None:
                 epoch = self.intents.get_epoch() + 1
+            self._writer_epoch = epoch
             self.intents.set_epoch(epoch)
             self.budget.set_epoch(epoch, emit=True)
             return epoch

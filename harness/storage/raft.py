@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from ..budget import BudgetManager
 from ..event_log import _draft, _event, _EventLogBase
 from ..types import Event
+from ._lock import FencingRejected
+from .lease import LeaseGrant, LeaseState, LeaseStore, LeaseUnavailable
 
 try:                                                    # pragma: no cover
     from pysyncobj import SyncObj, SyncObjConf, replicated
@@ -366,6 +368,84 @@ else:                                                   # pragma: no cover
             require_pysyncobj()
 
 
+if _HAS_PYSYNCOBJ:
+    class _ReplicatedLeaseLog(_ReplicatedLog):          # pragma: no cover
+        """事件日志 + **租约**放在同一个复制状态机里（S24-8）。
+
+        为什么必须同一个 RSM：租约接管与「提交事件」之间不能有窗口 ——
+        旧 epoch 的写必须在**应用日志项的同一临界区**里被拒，而不是先查一次
+        租约再 append（TOCTOU）。因此把 `LeaseState` 与 `records` 放在一起，
+        `append_record` 在复制时复核 stamp。
+
+        **确定性**：`now_ms` 一律由命令参数传入，副本内不取墙钟。
+        """
+
+        def __init__(self, addr, partners, conf) -> None:
+            super().__init__(addr, partners, conf)
+            self.lease = LeaseState()
+            self.lease_version = 0
+            self.lease_last: dict = {}
+            self.rejected = 0          # 被 fence 拒绝的 append 次数（可观测）
+
+        # ---- 租约（全部确定性）----------------------------------
+        @replicated
+        def lease_acquire(self, owner: str, instance: str, now_ms: int,
+                          ttl_ms: int, expected_epoch: int | None) -> None:
+            grant = self.lease.acquire(owner=owner, instance=instance,
+                                       now_ms=now_ms, ttl_ms=ttl_ms,
+                                       expected_epoch=expected_epoch)
+            self.lease_last = grant.as_dict()
+            self.lease_version += 1
+
+        @replicated
+        def lease_renew(self, owner: str, instance: str, epoch: int,
+                        now_ms: int, ttl_ms: int) -> None:
+            grant = self.lease.renew(owner=owner, instance=instance,
+                                     epoch=epoch, now_ms=now_ms, ttl_ms=ttl_ms)
+            self.lease_last = grant.as_dict()
+            self.lease_version += 1
+
+        @replicated
+        def lease_release(self, owner: str, instance: str, epoch: int) -> None:
+            grant = self.lease.release(owner=owner, instance=instance, epoch=epoch)
+            self.lease_last = grant.as_dict()
+            self.lease_version += 1
+
+        @replicated
+        def lease_advance(self, owner: str, instance: str, epoch: int,
+                          now_ms: int, ttl_ms: int) -> None:
+            grant = self.lease.advance(owner=owner, instance=instance, epoch=epoch,
+                                       now_ms=now_ms, ttl_ms=ttl_ms)
+            self.lease_last = grant.as_dict()
+            self.lease_version += 1
+
+        def _stamp_ok(self, stamp: dict) -> bool:
+            """提交点复核（在复制状态机内执行，不得取墙钟）。"""
+            try:
+                return bool(self.lease.authorizes(
+                    owner=str(stamp["owner"]), instance=str(stamp["instance"]),
+                    epoch=int(stamp["epoch"]), now_ms=int(stamp["now_ms"])))
+            except (KeyError, TypeError, ValueError):
+                return False
+
+        # ---- 事件（带 stamp 时原子复核）---------------------------
+        @replicated
+        def append_record(self, rec: dict, stamp: dict | None = None) -> None:
+            if stamp is not None and not self._stamp_ok(stamp):
+                self.rejected += 1
+                return
+            self.records.append(dict(rec, seq=len(self.records) + 1))
+
+        @replicated
+        def append_records(self, recs: list[dict],
+                           stamp: dict | None = None) -> None:
+            if stamp is not None and not self._stamp_ok(stamp):
+                self.rejected += 1
+                return
+            for rec in recs:
+                self.records.append(dict(rec, seq=len(self.records) + 1))
+
+
 class RaftEventLog(_EventLogBase):
     """`EventLog` 的 Raft 后端：**seq 分配走 leader + quorum 提交**。
 
@@ -376,7 +456,7 @@ class RaftEventLog(_EventLogBase):
       `wal.log.epoch`，调用点无需改（语义变化见文档）
     """
 
-    def __init__(self, clock=None, *, base_port: int, nodes: int = 3,
+    def __init__(self, clock=None, *, base_port: int = 45_000, nodes: int = 3,
                  cluster: RaftCluster | None = None,
                  timeout: float = 20.0,
                  require_leader: bool = False) -> None:
@@ -387,6 +467,8 @@ class RaftEventLog(_EventLogBase):
         self._require_leader = require_leader
         self._lock = threading.RLock()
         self._applied = 0                 # 已索引到 `_events` 的 records 数
+        # S24-8：可选的事件层 lease fencing（stamp provider）。
+        self._lease_fence = None
         self._cluster = cluster or RaftCluster(
             _ReplicatedLog, base_port=base_port, nodes=nodes)
         self._owns_cluster = cluster is None
@@ -403,13 +485,36 @@ class RaftEventLog(_EventLogBase):
             self._index(_event(recs[self._applied]))
             self._applied += 1
 
-    def _wait_committed(self, target: int, what: str) -> None:
-        if not self._cluster.wait_until(
-                lambda: len(getattr(self._replica, "records", ())) >= target,
-                self._timeout):
+    def _wait_committed(self, target: int, what: str,
+                        rejected_before: int | None = None) -> None:
+        """等目标记录数被应用；若 RSM 拒绝了本次写入（旧 epoch）→ `FencingRejected`。"""
+        def done() -> bool:
+            if len(getattr(self._replica, "records", ())) >= target:
+                return True
+            return (rejected_before is not None
+                    and int(getattr(self._replica, "rejected", 0) or 0)
+                    > rejected_before)
+
+        if not self._cluster.wait_until(done, self._timeout):
             raise RaftUnavailable(
                 f"{what}: {self._timeout}s 内未提交（target={target}，"
                 f"applied={len(getattr(self._replica, 'records', ()))}）")
+        if rejected_before is not None and int(
+                getattr(self._replica, "rejected", 0) or 0) > rejected_before:
+            raise FencingRejected(
+                f"{what}: 旧 epoch 写入被 RSM 拒绝（lease fencing）")
+
+    def set_lease_fence(self, provider) -> None:
+        """注入「写入 stamp」回调（S24-8）。
+
+        要求该集群由 `_ReplicatedLeaseLog` 构建（租约与事件同一 RSM），
+        否则拒绝 —— 绝不假装「有 fence」而实际只做了进程内检查。
+        """
+        if provider is not None and not hasattr(self._replica, "lease"):
+            raise RaftUnavailable(
+                "事件层 lease fencing 需要 _ReplicatedLeaseLog 集群"
+                "（租约与日志必须同一 RSM，否则存在 TOCTOU）")
+        self._lease_fence = provider
 
     # ---- 读一致性（S17 K-82）--------------------------------------
     def _is_leader(self) -> bool:
@@ -497,8 +602,13 @@ class RaftEventLog(_EventLogBase):
             rec = _draft(kind, subject, payload, producer, caused_by,
                          idempotency_key, run_id, self._clock)
             target = len(getattr(self._replica, "records", ())) + 1
-            self._replica.append_record(rec)        # 异步：交 Raft
-            self._wait_committed(target, "append")
+            stamp = self._lease_fence() if self._lease_fence is not None else None
+            rejected0 = int(getattr(self._replica, "rejected", 0) or 0)
+            if stamp is None:
+                self._replica.append_record(rec)    # 异步：交 Raft
+            else:
+                self._replica.append_record(rec, stamp)
+            self._wait_committed(target, "append", rejected_before=rejected0)
             self._sync_applied()
             ev = self._events[-1]
         if notify:
@@ -516,8 +626,13 @@ class RaftEventLog(_EventLogBase):
                     for d in drafts]
             before = len(self._events)
             target = len(getattr(self._replica, "records", ())) + len(recs)
-            self._replica.append_records(recs)
-            self._wait_committed(target, "append_batch")
+            stamp = self._lease_fence() if self._lease_fence is not None else None
+            rejected0 = int(getattr(self._replica, "rejected", 0) or 0)
+            if stamp is None:
+                self._replica.append_records(recs)
+            else:
+                self._replica.append_records(recs, stamp)
+            self._wait_committed(target, "append_batch", rejected_before=rejected0)
             self._sync_applied()
             evs = self._events[before:]
         if notify:
@@ -569,6 +684,101 @@ class RaftEpochSource:
         """
         raise EpochNotBumpable(
             "Raft 的 epoch 由共识 term 推进，应用层不得自增（见 S17 K-85）")
+
+
+class RaftLeaseStore(LeaseStore):
+    """S24-8：跨主机写者租约（共识复制）。
+
+    - 每次 acquire/renew/release/advance 都是一条 Raft 日志项 → 多 host 竞争时
+      只有一个能拿到有效租约；
+    - 接管必然 `epoch + 1`；旧 epoch 的续租/写入被拒（不是静默成功）；
+    - 与 `RaftEventLog` **共享同一个 `cluster`** 时，事件日志的 `append_record`
+      在复制状态机内复核 stamp → 旧 epoch 的提交在**提交点**被拒（无 TOCTOU）。
+
+    未安装 `pysyncobj` → 构造即 `RaftUnavailable`（fail-closed，绝不退回本地文件）。
+    """
+
+    replicated = True
+
+    def __init__(self, *, base_port: int = 45_000, nodes: int = 3,
+                 cluster: RaftCluster | None = None,
+                 timeout: float = 20.0) -> None:
+        require_pysyncobj()
+        self._timeout = float(timeout)
+        self._cluster = (cluster if cluster is not None else
+                         RaftCluster(_ReplicatedLeaseLog, base_port=base_port,
+                                     nodes=nodes))
+        self._owns_cluster = cluster is None
+        self._replica = self._cluster.nodes[0]
+        if not hasattr(self._replica, "lease"):
+            raise RaftUnavailable(
+                "RaftLeaseStore 需要由 _ReplicatedLeaseLog 构建的集群")
+        if not self._cluster.wait_ready(self._timeout):
+            raise RaftUnavailable(
+                f"Raft 租约集群 {self._timeout}s 内未就绪（端口 {base_port}）")
+
+    @property
+    def cluster(self) -> RaftCluster:
+        """共享给 `RaftEventLog(cluster=...)`，让租约与事件落在同一 RSM。"""
+        return self._cluster
+
+    # ---- 内部 -----------------------------------------------------
+    def _apply(self, fn, *args) -> LeaseGrant:
+        before = int(getattr(self._replica, "lease_version", 0) or 0)
+        fn(*args)
+        if not self._cluster.wait_until(
+                lambda: int(getattr(self._replica, "lease_version", 0) or 0) > before,
+                self._timeout):
+            raise LeaseUnavailable(
+                f"租约操作 {getattr(fn, '__name__', fn)} {self._timeout}s 内未提交")
+        last = dict(getattr(self._replica, "lease_last", {}) or {})
+        return LeaseGrant(outcome=str(last.get("outcome", "")),
+                          owner=str(last.get("owner", "")),
+                          instance=str(last.get("instance", "")),
+                          epoch=int(last.get("epoch", 0) or 0),
+                          expires_at_ms=int(last.get("expires_at_ms", 0) or 0),
+                          reason=str(last.get("reason", "")))
+
+    # ---- 接口 -----------------------------------------------------
+    def acquire(self, *, owner: str, instance: str, now_ms: int, ttl_ms: int,
+                expected_epoch: int | None = None) -> LeaseGrant:
+        return self._apply(self._replica.lease_acquire, str(owner), str(instance),
+                           int(now_ms), int(ttl_ms), expected_epoch)
+
+    def renew(self, *, owner: str, instance: str, epoch: int,
+              now_ms: int, ttl_ms: int) -> LeaseGrant:
+        return self._apply(self._replica.lease_renew, str(owner), str(instance),
+                           int(epoch), int(now_ms), int(ttl_ms))
+
+    def release(self, *, owner: str, instance: str, epoch: int) -> LeaseGrant:
+        return self._apply(self._replica.lease_release, str(owner), str(instance),
+                           int(epoch))
+
+    def advance(self, *, owner: str, instance: str, epoch: int,
+                now_ms: int, ttl_ms: int) -> LeaseGrant:
+        return self._apply(self._replica.lease_advance, str(owner), str(instance),
+                           int(epoch), int(now_ms), int(ttl_ms))
+
+    def authorizes(self, *, owner: str, instance: str, epoch: int,
+                   now_ms: int) -> bool:
+        """本地副本上的**诊断读**（可能略微陈旧）。
+
+        真正的提交点复核在 `_ReplicatedLeaseLog.append_record` 内完成，
+        这里只用于观测/测试，不得替代事件层的原子检查。
+        """
+        return bool(self._replica.lease.authorizes(
+            owner=str(owner), instance=str(instance), epoch=int(epoch),
+            now_ms=int(now_ms)))
+
+    def current(self) -> dict:
+        return dict(self._replica.lease.snapshot())
+
+    def read_epoch(self) -> int:
+        return int(self._replica.lease.epoch)
+
+    def close(self) -> None:
+        if self._owns_cluster:
+            self._cluster.close()
 
 
 # =====================================================================

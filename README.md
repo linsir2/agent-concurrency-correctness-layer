@@ -22,7 +22,7 @@
 | [S10 方案 v1.2](docs/s10-cross-process-reconciliation.md) | 跨进程预算对账（事件溯源 + 全量重放 + 树完整性 + 单写者 lease）+ 跨进程 flock（`_FileLock` 下沉 + 三锁全序 + WAL seq fstat + fencing）+ `FinalitySink` 接口草案 |
 | [S22 方案 v1.1](docs/s22-implementation-plan.md) | **被集成层**：内核收口（abort/finish/外部幂等键/token 回收/懒恢复）+ Z3 私有工作区（git worktree + copy）+ `RscSession` 六动作门面 + LangGraph 中间件（sync/async）+ MCP server；`dependencies = []` 不变（适配器走 extras） |
 | [S23 方案 v1.0](docs/s23-integration-plan.md) | **集成面第二轮**：CrewAI（包装 `BaseTool.run`）、OpenAI Agents（guardrail + root 注入）、AG2（`on_tool_execution` 短路）、纯 stdlib HTTP sidecar（每 agent 密钥、1 MiB/并发上限）；含 [三 agent 示例](examples/three_agents/README.md)（naive 丢写 vs RSC 保全）、79 条一致性核对与对抗式评审记录（1 P0 + 5 P1 + 3 P2 已修） |
-| [S24 差距分析与重定位](docs/s24-gap-analysis-and-repositioning.md) | **里程碑对账 + 定位复核 + S24-1..7**：最初承诺 vs 现状逐条对照、8 项差距排序、文档矛盾清单；`RscSession(verify_cmd=...)` 在「候选副本 + 账本合并视图 + pending」上跑命令，红则拒绝提交（收据带 `verified`）；`semantic=block` 静态拦「改名/删名仍被引用」（不执行代码）；`apply_queued` 单写者队列把「出队→重验→提交」串成一步；**[合规语料](harness/spec/conformance/README.md)**（35 条语言无关向量）、**[只读诊断](harness/diagnose.py)**（`python3 -m harness.diagnose`）、**[TLA+ 四模型](spec/tla/README.md)**（I1/I2/I4/I7，TLC 实跑 4 正确 + 4 反例）；[语义冲突实验](examples/semantic_conflict/run.py) 从「拦不住」变成「拦住」 |
+| [S24 差距分析与重定位](docs/s24-gap-analysis-and-repositioning.md) | **里程碑对账 + 定位复核 + S24-1..8**：最初承诺 vs 现状逐条对照、8 项差距排序、文档矛盾清单；`RscSession(verify_cmd=...)` 在「候选副本 + 账本合并视图 + pending」上跑命令，红则拒绝提交（收据带 `verified`）；`semantic=block` 静态拦「改名/删名仍被引用」（不执行代码）；`apply_queued` 单写者队列把「出队→重验→提交」串成一步；**[合规语料](harness/spec/conformance/README.md)**（35 条语言无关向量）、**[只读诊断](harness/diagnose.py)**（`python3 -m harness.diagnose`）、**[TLA+ 四模型](spec/tla/README.md)**（I1/I2/I4/I7，TLC 实跑 4 正确 + 4 反例）；**跨主机租约**（`LeaseState` + `RaftLeaseStore`，接管后旧 epoch 续租/提交被拒）；[语义冲突实验](examples/semantic_conflict/run.py) 从「拦不住」变成「拦住」 |
 | [S21 方案 v1.1](docs/s21-tenant-admission-and-leases.md) | K-97 tenant 自动接准入 + K-99 失效租约回收器（状态复制 → K-103）+ K-100 墓碑窗口量化（逐墓碑年龄 + 上限随命令复制）+ 多租户优先级份额（reserved 池 / 超额借用） |
 | [S20 方案 v1.1](docs/s20-tenant-metering-and-k94.md) | K-94 claims 有界墓碑 + K-95 prune fail-safe + K-96 就绪复核 + 阶段三：多租户配额 / 事件派生计量 / 统一 Admin 命令面 |
 | [S19 方案 v1.1](docs/s19-budget-gc-and-hardening.md) | K-88 账本三栅栏精密修剪 + K-89 claim fencing 复制 + K-90 重放时间戳 + K-91 `remaining` + K-92 预检/可配密钥 + K-93 owner 共识 |
@@ -52,15 +52,15 @@
 - L4 编排：`planner` / `dispatcher` / `scheduler` / `run_coordinator` / `reconcile` / `hitl`
 - L5 门面：`harness`（组装 + `commit_batch` + `compensate` + `recover`）
 - L2 规范：`harness/spec/`（资源模型 / 协调协议 GRANT-WAIT-DIE / 收据 hash-chain / 不变量语料）
-- 对外资产：`harness/spec/conformance/`（语言无关合规语料）、`harness/diagnose.py`（只读体检）、`spec/tla/`（I1/I2/I4/I7 形式化模型）
+- 对外资产：`harness/spec/conformance/`（语言无关合规语料）、`harness/diagnose.py`（只读体检）、`spec/tla/`（I1/I2/I4/I7 形式化模型）、`harness/storage/lease.py`（可复制写者租约）
 
 详见 [harness/README.md](harness/README.md)。
 
 ## 运行测试
 
 ```bash
-python3 -m pytest tests/ -q                      # 810 passed / 11 skipped / 4 xfailed
-TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 818 passed（TLA 实测）
+python3 -m pytest tests/ -q                      # 828 passed / 11 skipped / 4 xfailed
+TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 836 passed（TLA 实测）
 python3 -m harness.spec.corpus --check           # 合规语料无漂移（35 / 0）
 python3 -m harness.diagnose --state-dir <dir>    # 只读诊断，退出码 0/1/2
 python3 scripts/check_tla.py --jar /tmp/tla2tools.jar   # 4 正确 + 4 反例

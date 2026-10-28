@@ -218,6 +218,49 @@ else:
         subprocess.run([sys.executable, str(_ROOT / "scripts/check_tla.py")],
                        capture_output=True, text=True, check=False).returncode == 0)
 
+# ---------------------------------------------------------------- S24-8 跨主机租约
+chk("租约模块存在", (_ROOT / "harness/storage/lease.py").exists())
+_lease_src = _src("harness/storage/lease.py")
+chk("纯状态机（规则只写一份）", "class LeaseState" in _lease_src)
+chk("单调 epoch + 接管", "self.epoch += 1" in _lease_src)
+chk("旧视图 expected_epoch 被拒", "expected_epoch" in _lease_src
+    and "fenced" in _lease_src)
+from harness.storage.lease import LeaseState, MemoryLeaseStore
+
+_st = LeaseState()
+_g1 = _st.acquire(owner="a", instance="i1", now_ms=0, ttl_ms=10)
+_g2 = _st.acquire(owner="b", instance="i2", now_ms=1, ttl_ms=10)
+_g3 = _st.acquire(owner="b", instance="i2", now_ms=11, ttl_ms=10,
+                  expected_epoch=1)
+_g4 = _st.renew(owner="a", instance="i1", epoch=1, now_ms=12, ttl_ms=10)
+chk("同一资源单持有者", _g1.epoch == 1 and _g2.outcome == "held")
+chk("接管 epoch+1", _g3.epoch == 2)
+chk("旧 epoch 续租被拒", _g4.outcome == "fenced")
+_facade_h = _src("harness/harness.py")
+chk("Harness 接受 lease_store", "lease_store: LeaseStore | None = None" in _facade_h)
+chk("存储模式不写本地租约文件", "self._lease_store is not None" in _facade_h)
+chk("写入口原因可观测", "writer_lease_unavailable" in _facade_h)
+_raft_src = _src("harness/storage/raft.py")
+chk("租约与事件同一 RSM", "class _ReplicatedLeaseLog" in _raft_src)
+chk("提交点复核 stamp", "def append_record(self, rec: dict, stamp" in _raft_src)
+chk("提交点拒绝旧 epoch", "旧 epoch 写入被 RSM 拒绝" in _raft_src)
+chk("共享集群要求（不共享即拒绝注入）",
+    "set_lease_fence" in _raft_src
+    and "租约与日志必须同一 RSM" in _raft_src)
+chk("RaftLeaseStore 存在", "class RaftLeaseStore" in _raft_src)
+chk("缺 pysyncobj fail-closed", "require_pysyncobj()" in _raft_src)
+_lease_tests = _src("tests/test_s24_lease.py")
+_raft_tests = _src("tests/test_s24_raft_lease.py")
+for token in ("test_second_harness_is_held_and_cannot_write",
+              "test_takeover_fences_old_writer_commit",
+              "test_store_failure_is_fail_closed_and_no_file_fallback",
+              "test_bump_epoch_advances_store_and_self_stays_valid"):
+    chk(f"租约用例 {token}", f"def {token}(" in _lease_tests)
+for token in ("test_only_one_host_can_hold_lease",
+              "test_shared_cluster_rejects_stale_append",
+              "test_missing_pysyncobj_refuses_to_start"):
+    chk(f"Raft 租约用例 {token}", f"def {token}(" in _raft_tests)
+
 # ---------------------------------------------------------------- 运行期
 with tempfile.TemporaryDirectory() as tmp:
     h = make_harness(run_limits=10)
@@ -288,6 +331,15 @@ with tempfile.TemporaryDirectory() as tmp:
                        idempotency_key="k3", agent_id="a2")
     chk("通过后可提交", isinstance(r, Receipt))
     chk("收据带 verified", getattr(r, "verified", False) is True)
+
+    # S24-8 运行期：两个 Harness 共享内存租约，只有一个写者
+    _store = MemoryLeaseStore()
+    _h1 = make_harness(lease_store=_store)
+    _h2 = make_harness(lease_store=_store)
+    chk("第二个 Harness 被租约拒绝", _h2._writer_lease_ok is False)
+    _store.set_fail(True)
+    chk("租约后端故障 fail-closed",
+        _h1._renew_writer_lease() is False and _h1._lease_outcome == "unavailable")
 
     # S24-6 运行期：空状态 → 0；无参数 → 2（用法错误）
     from harness.diagnose import main as diag_main

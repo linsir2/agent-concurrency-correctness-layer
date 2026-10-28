@@ -31,6 +31,7 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `harness/spec/` | L2 | MS8（资源模型 / 协调协议 / 收据 / 不变量语料） |
 | `harness/spec/corpus.py` + `harness/spec/conformance/` | L2 | S24-5（对外合规语料：语言无关 JSON 向量 + manifest + runner，`--check` 防漂移） |
 | `harness/diagnose.py` | 运维 | S24-6（只读诊断：WAL / 收据链 / 版本流 / effect / 租约 / token，`python3 -m harness.diagnose`） |
+| `harness/storage/lease.py` | L1 | S24-8（可复制写者租约：`LeaseState` 纯状态机 + `MemoryLeaseStore`；Raft 后端见 `storage/raft.py` 的 `RaftLeaseStore`） |
 | `harness/worktree.py` | L1 | S22（Z3 私有工作区） |
 | `harness/facade.py` | L5 | S22/S24（`RscSession` 门面；S24 增加 `verify` 提交前验证 + `semantic` 静态门禁） |
 | `harness/semantic.py` | L2 | S24-3（符号级语义冲突：零依赖 `ast`，仅 Python） |
@@ -100,6 +101,8 @@ cd /workspace && python3 -m pytest tests/ -q     # 546 passed
 | `tests/test_s24_corpus.py` | S24-5 语料：磁盘无漂移、向量可执行、manifest 计数/sha、冻结 HMAC、变异检测、CLI 0/1、不变量测试指针存在 |
 | `tests/test_s24_diagnose.py` | S24-6 诊断：干净状态、只读（目录哈希不变）、中段 CRC、尾部截断、seq 断档、断链/重复 id、版本跳跃、重复幂等键、租约 epoch 落后、CLI 0/1/2 |
 | `tests/test_s24_tla.py` | S24-7 TLA+：四模型资产 + 正确/反例 TLC 实测（缺 java/jar 时显式 skip） |
+| `tests/test_s24_lease.py` | S24-8 租约（内存后端）：单持有者/接管 epoch+1/旧 epoch 续租被拒/Harness 第二写者被拒/存储故障不回退 |
+| `tests/test_s24_raft_lease.py` | S24-8 租约（真实 3 节点 Raft）：竞争唯一 winner、旧 append 在提交点被拒且 tail 不变、共享集群要求、缺 pysyncobj fail-closed |
 | `tests/test_s12_audit_and_isolation.py` | S12：K-45 fail-closed（三路径注入 + 粘滞 + 静默分叉负对照）/ 预算事件 run_id / per-run epoch·retention 参数化 / `unshare -Urn` 与 `runsc` / Landlock errno 38·95 / 生产 gate |
 | `tests/_s10_child.py` | S10 子进程脚本（scope-lock / wal-append 两模式，pytest 不收集） |
 | `tests/test_real_cases.py` | U1（2 个）、U2、U3、U4 |

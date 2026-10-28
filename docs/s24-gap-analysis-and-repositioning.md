@@ -12,8 +12,8 @@
 ## 0. 真跑证据（可复现）
 
 ```bash
-python3 -m pytest -q                                  # 810 passed / 11 skipped / 4 xfailed
-TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest -q # 818 passed / 3 skipped（TLA 实测）
+python3 -m pytest -q                                  # 828 passed / 11 skipped / 4 xfailed
+TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest -q # 836 passed / 3 skipped（TLA 实测）
 python3 scripts/check_s23_conformance.py              # 80 / 0
 python3 examples/three_agents/run.py                  # [PASS] naive 丢写 vs RSC 保全
 python3 examples/semantic_conflict/run.py             # [结论] 我们能拦住语义冲突
@@ -54,7 +54,7 @@ python3 -m harness.diagnose --state-dir <dir>         # 只读体检，退出码
 | 收据签名链 | design §18.3 | ✅ `harness/spec/receipt.py` |
 | **VerifierRunner / 语义验证** | design §4.2、milestones §「VerifierRunner（独立上下文校验）」标 P2/MS5「当前无」 | ✅ S24-1：`session.verify` + `verify_cmd` 自动门禁；语义冲突由 `harness/semantic.py` 静态拦截 |
 | 四件套对外（TLA+ / corpus / CLI） | 定位 §6.3、design §18.4 | ✅ `harness/spec/conformance/`（35 条语言无关向量 + manifest）、`python3 -m harness.diagnose`、`spec/tla/`（I1/I2/I4/I7 + TLC 反例） |
-| 跨主机租约复制 | 定位 §6.5、S21 明确「不做 → K-103」 | 🟡 Raft 事件/预算已跨主机，租约未复制 |
+| 跨主机租约复制 | 定位 §6.5、S21 明确「不做 → K-103」 | ✅ S24-8：`LeaseState` 纯状态机 + `MemoryLeaseStore`（同进程）/ `RaftLeaseStore`（共识复制，与 `_ReplicatedLeaseLog` 同一 RSM）；旧 epoch 的续租与提交被拒；缺 pysyncobj 时 fail-closed |
 | 多租户 / 计量 / Admin | 定位 §6.5 | ✅ S20/S15/S17 |
 | 宿主适配（LangGraph/CrewAI/OpenAI/AG2/MCP/HTTP） | 定位 §6.2 阶段一交付物、§6.4 MVP | ✅ S22/S23 |
 | 基准五指标 | phase1 §9.3 | 🟡 token 指标 N/A、LLM 用 scripted |
@@ -145,6 +145,7 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 | S24-5 | 合规语料：`harness/spec/conformance/`（manifest + 35 条语言无关向量 + runner 协议），`python3 -m harness.spec.corpus --check` 防漂移 | ✅ 已实现，17 个用例 |
 | S24-6 | 只读诊断 `rsc-diagnose`：WAL 完整性/seq、租约 epoch、收据链、版本流、幂等键、token、store；退出码 0/1/2 | ✅ 已实现，16 个用例 |
 | S24-7 | TLA+ 最小模型 I1/I2/I4/I7 + TLC 反例（jar/Java 可选，主门禁不依赖 Java） | ✅ 已实现，4 正确 + 4 broken 实跑 |
+| S24-8 | 跨主机租约复制：`LeaseState` 纯状态机 + `MemoryLeaseStore` + `RaftLeaseStore`；接管 epoch+1，旧 epoch 续租/提交被拒；缺依赖 fail-closed | ✅ 已实现，18 个用例（含真实 3 节点 Raft） |
 
 ### 5.1 S24-1 实现要点
 
@@ -249,6 +250,30 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
   broken 期望报不变量违反（实测 exit 12）；`--require` 缺 Java/jar 时 exit 2，否则显式 SKIP。
 - **主门禁不依赖 Java**：jar 只在开发机/可选 CI job 提供；`tests/test_s24_tla.py` 在缺
   jar 时 `skip`（带原因），设置了 `TLA2TOOLS_JAR` 却没 Java 时 `fail`（不假绿）。
+
+### 5.9 S24-8 跨主机租约复制（`harness/storage/lease.py` + `RaftLeaseStore`）
+
+- **规则只写一份**：`LeaseState` 是纯状态机（无锁、无 I/O、`now_ms` 由调用方传入）；
+  `MemoryLeaseStore`（同进程/测试）与 `_ReplicatedLeaseLog`（Raft）都调它，
+  避免两个后端语义漂移。
+- **接口**：`acquire / renew / release / advance / authorizes / current / read_epoch`；
+  `LeaseGrant` 的 `ok` 仅在「操作后仍持有租约」时为真（`released` 不算）。
+  传 `expected_epoch` 时，epoch 不符 → `fenced`（旧视图不得复活）。
+- **Harness 接线**：`Harness(lease_store=...)` → `_durable` 为真，五个租约方法走
+  store；`writer_lease.json` **完全不生成**（有测试）。未传 `lease_store` 时
+  既有路径字节不变。
+- **旧 fence 被拒的两条路径**：
+  1. 写入口 `_ensure_writer_lease` → `renew` 返回 `fenced` → `UPSTREAM_FAILED`
+     （reason `writer_lease_held`），事件不 append；
+  2. 若 `RaftEventLog` 与租约**共享同一 cluster**，`_ReplicatedLeaseLog.append_record`
+     在复制状态机内复核 stamp → 旧 epoch 在**提交点**被拒（`FencingRejected`，无 TOCTOU）。
+  不共享集群时**不注入**事件层 fence（不假装零窗口），边界在代码注释与本节写明。
+- **失败语义**：后端不可用 → `writer_lease_unavailable`，**绝不**回退本地文件租约；
+  缺 `pysyncobj` → `RaftLeaseStore` 构造即 `RaftUnavailable`。
+- **实测**：7 条真实 Raft 用例（47xxx 端口 3 节点），含「接管后旧 append 被拒且 tail 不变」；
+  11 条内存后端用例在主门禁常跑（不依赖 pysyncobj）。
+- **不做**：per-resource/分片租约、跨主机 worktree/文件同步、网络分区下的活性保证、
+  真实多机跨网络验证（沙箱只做本地 3 节点）。
 
 ---
 
