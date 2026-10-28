@@ -1336,18 +1336,22 @@ class ReconcileLoop:
                 fixed += 1
         return fixed
 
-    def scan_deadlines(self, now_ms: int) -> int:
+    def scan_deadlines(self, now_ms: int, *, candidates=None) -> int:
         """S13d §2.5：aging（**墙钟**）扫描 —— 唯一超时驱动面的调度侧入口。
 
         `aging_ms` 与步数语义的 `aging_max` 是**两套**东西（B-4）：这里只看
         `aging_deadline`（`try_admit` 成功后设 `now + aging_ms`），到点 →
         `Harness._aging_timeout`（`ADMITTED → INADMISSIBLE` + 结算）。
 
+        S24-P0：`candidates` 由 `tick()` 传入（含**持久水合**但未 `recover`
+        的 ACB）—— 旧实现只遍历 `self.h.acbs`，这类期限永远扫不到。
+
         返回本次处理的 ACB 数（供调用方观测；0 = 无到期项）。
         """
         now = int(now_ms)
         acted = 0
-        for acb in list(self.h.acbs.values()):
+        source = self.h.acbs.values() if candidates is None else candidates
+        for acb in list(source):
             if acb.state is not TaskState.ADMITTED:
                 continue
             deadline = getattr(acb, "aging_deadline", None)

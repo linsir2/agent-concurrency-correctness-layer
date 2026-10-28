@@ -2886,7 +2886,8 @@ class Harness:
         # K-69：候选集 = 内存 ∪ **持久真相**（未 `recover` 的等待态也要能结算）。
         # 锁序红线（S14 §2.2）：`_tick_candidates` 读完即返回，下面的 `_finalize`
         # **不持 store 锁** —— 否则 budget(1) 套 store(5) 反向获取 → LockOrderViolation。
-        for acb in self._tick_candidates(persist_scan=persist_scan):
+        candidates = self._tick_candidates(persist_scan=persist_scan)
+        for acb in candidates:
             if acb.state is not TaskState.WAITING_APPROVAL:
                 continue
             with self.hitl._lock:
@@ -2921,11 +2922,13 @@ class Harness:
         # S22：回收过期的门面 token（只作用于 `spec["rsc_token"]`，不动普通 ACB）
         self._reap_expired_tokens(now)
         # S13d §2.5 / B-4：aging（墙钟）与 HITL 超时共用**唯一**驱动面；
-        # 扫描入口在 ReconcileLoop（`scan_deadlines`），便于观测/替换。
-        self.reconcile.scan_deadlines(now)
+        # 扫描入口在 ReconcileLoop（`scan_deadlines`）。S24-P0：复用本轮的
+        # 候选集（含持久水合项），否则未 `recover` 的 aging 期限永远扫不到。
+        self.reconcile.scan_deadlines(now, candidates=candidates)
 
     # ---- S14 K-69：tick 的持久候选集 + 外部驱动器 ---------------------
-    def _tick_candidates(self, *, persist_scan: bool = True) -> list[ACB]:
+    def _tick_candidates(self, *, persist_scan: bool = True,
+                         for_sweep: bool = False) -> list[ACB]:
         """`tick` 的候选集 = 内存 ∪ **持久真相**（`persist_scan=False` 时仅内存）。
 
         为什么必须含持久：S13a 的 `tick` 只遍历 `self.acbs`，而 `recover()` 一次
@@ -2963,7 +2966,7 @@ class Harness:
                 self._tick_skipped.append((acb_id, "tick_load_failed"))
                 continue
             try:
-                out.append(self._restore_acb(payload))
+                out.append(self._restore_acb(payload, for_sweep=for_sweep))
             except Exception:                   # noqa: BLE001
                 self._tick_skipped.append((acb_id, "tick_hydrate_failed"))
         return out
@@ -2971,7 +2974,8 @@ class Harness:
     def _pending_deadlines(self) -> list[tuple[int, str]]:
         """当前**待结算**项 `[(deadline_ms, acb_id)]`（HITL 超时 ∪ aging）。"""
         out: list[tuple[int, str]] = []
-        for acb in self._tick_candidates():
+        # S24-P0：**只读**扫描 —— 不得 bump epoch / 占槽位（否则旁观者会 fence 写者）
+        for acb in self._tick_candidates(for_sweep=True):
             if acb.state is TaskState.WAITING_APPROVAL:
                 _, deadline = self._approval_slot(acb)
             elif acb.state is TaskState.ADMITTED and acb.aging_deadline is not None:
@@ -4486,7 +4490,7 @@ class Harness:
             return acb
 
     def _restore_acb(self, data: dict, resume_policy: str = "RESUME", *,
-                     bump_epoch: bool = True) -> ACB:
+                     bump_epoch: bool = True, for_sweep: bool = False) -> ACB:
         """从 checkpoint 重建 ACB；失败改 `needs_readmit`（**不抛**，§4.3）。
 
         S22：`bump_epoch=False` 供**门面 token 的懒恢复**使用 —— 全局 epoch
@@ -4530,6 +4534,12 @@ class Harness:
             acb.replan_attempts = int(data.get("replan_attempts", 0) or 0)
             # S13d §2.5：aging 计数跨恢复继承（否则重规划/重准入会无限超时）
             acb.aging_count = int(data.get("aging_count", 0) or 0)
+            # S24-P0：`aging_deadline` 被 checkpoint 写入（checkpoint.py:388）
+            # 却从未被读回 —— 重启后持久期限凭空消失，`pump()` 无法结算。
+            aging_deadline = data.get("aging_deadline")
+            acb.aging_deadline = (int(aging_deadline)
+                                  if isinstance(aging_deadline, (int, float))
+                                  else None)
             acb.redrive_count = int(data.get("redrive_count", 0) or 0)
             acb.consecutive_failures = int(
                 data.get("consecutive_failures", 0) or 0)
@@ -4601,11 +4611,12 @@ class Harness:
                     and acb.id not in snap_active):
                 acb.needs_readmit = True
             # F5：等待态不占槽位（与 `_finalize` 一致）；其它状态恢复即重新占用。
-            if (acb.state is not TaskState.WAITING_APPROVAL
+            # S24-P0：`for_sweep=True` 只水合字段（只读扫描），不得改槽位/epoch。
+            if (not for_sweep and acb.state is not TaskState.WAITING_APPROVAL
                     and not self.slots.try_acquire(acb.id)):
                 acb.state = TaskState.QUARANTINED
                 acb.failure = "NO_SLOT"
-            if bump_epoch:
+            if bump_epoch and not for_sweep:
                 self.bump_epoch()
             return acb
         except Exception:  # noqa: BLE001  # 恢复失败 → needs_readmit，不抛

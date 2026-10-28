@@ -250,7 +250,8 @@ def test_s13_12_aging_disabled_still_runs_and_scan_is_wired():
 
     scans: list[int] = []
     orig_scan = h.reconcile.scan_deadlines
-    h.reconcile.scan_deadlines = lambda now: (scans.append(int(now)), orig_scan(now))[1]
+    h.reconcile.scan_deadlines = (
+        lambda now, **kw: (scans.append(int(now)), orig_scan(now, **kw))[1])
 
     clock.advance(10_000)                           # 远超任何 aging 阈值
     st = h.run_task(acb, [decision(1, finish())])
