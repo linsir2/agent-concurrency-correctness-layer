@@ -701,6 +701,13 @@ class ChildManager:
             self.deps.finalize(parent_acb)
         return env
 
+    # ---- S3.2：跨服务公开接缝 ---------------------------------------
+    # `TaskService`（replan / requeue_readmit）需要在父树中替换子身份。跨服务
+    # 只走**公开**名，不去碰本类的 `_` 私有（实现仍是同一份，无第二套逻辑）。
+    def replace_child_ref(self, old: ACB, fresh: ACB) -> None:
+        """`_replace_child_ref` 的公开别名（S3.2：TaskService 的唯一入口）。"""
+        self._replace_child_ref(old, fresh)
+
     # ---- X6：跨 run 子索引 -----------------------------------------
     def _index_child(self, child_id: str, parent_id: str) -> None:
         if parent_id and str(child_id) != str(parent_id):

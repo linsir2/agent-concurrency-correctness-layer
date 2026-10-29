@@ -13,6 +13,14 @@ import sys
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
+def _method(name: str) -> str:
+    """`Harness.<name>` 的**实现**源码（S3.2：准入/终态簇已迁至 kernel/tasks.py）。"""
+    from harness import Harness
+    from harness.kernel.tasks import TaskService
+    owner = TaskService if hasattr(TaskService, name) else Harness
+    return inspect.getsource(getattr(owner, name))
+
+
 def _impl() -> str:
     """内核实现全文：harness/harness.py + harness/kernel/*.py（拆分后不再固定单文件）。"""
     parts = [(_ROOT / "harness/harness.py").read_text(encoding="utf-8")]
@@ -54,10 +62,10 @@ chk("K-97 Planner 透传 tenant 到 footprint",
     'footprint["tenant"]' in _pl)
 chk("K-97 Planner 透传 tier 到 footprint",
     'footprint["tier"]' in _pl)
-_dar = inspect.getsource(Harness._admit_and_register)
+_dar = _method("_admit_and_register")
 chk("K-97 生产入口先登记 plan 再准入",
-    _dar.index("self.plans[run_id] = plan")
-    < _dar.index("self.dispatcher.try_admit"))
+    _dar.index("self.state.plans[run_id] = plan")
+    < _dar.index("self.deps.dispatcher.try_admit"))
 _rcn = inspect.getsource(raft_mod._ReplicatedBudget.create_node)
 chk("K-97 Raft 复制 create_node 携带 tenant", "tenant" in _rcn)
 _rcn2 = inspect.getsource(raft_mod.RaftBudgetManager.create_node)

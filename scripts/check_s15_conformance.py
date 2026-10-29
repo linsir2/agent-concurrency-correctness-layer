@@ -23,10 +23,20 @@ from harness import (
     protocols,
 )
 from harness.ingress import Ingress, IngressResult, fingerprint
+from harness.kernel.tasks import TaskService
 from harness.protocols import CheckpointStore as CheckpointProto
 
 ok: list[str] = []
 bad: list[tuple[str, str]] = []
+
+
+def _impl(name: str) -> str:
+    """`Harness.<name>` 的**实现**源码（S3.2：DLQ redrive 已迁至 kernel/tasks.py）。
+
+    拆分后 Harness 只留旧名委托；直接取 Harness 上的属性只剩一行转发。
+    """
+    owner = TaskService if hasattr(TaskService, name) else Harness
+    return inspect.getsource(getattr(owner, name))
 
 
 def chk(name: str, cond: bool, detail: str = "") -> None:
@@ -108,7 +118,7 @@ chk("D1 submit_command 不再无条件 OK 空壳",
 # D2：DLQ redrive
 chk("D2 redrive_dead_letter 存在",
     callable(getattr(Harness, "redrive_dead_letter", None)))
-src_r = inspect.getsource(Harness.redrive_dead_letter)
+src_r = _impl("redrive_dead_letter")
 chk("D2 仅 DEAD_LETTER 可重放",
     "TaskState.DEAD_LETTER" in src_r and "return None" in src_r)
 chk("D2 有界（max_redrives）",

@@ -13,10 +13,22 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT)); sys.path.insert(0, str(_ROOT / 'tests'))
 from harness import Harness, TaskState
 from harness.checkpoint import CheckpointStore, FileCheckpointStore
+from harness.kernel.tasks import TaskService
 from harness.orchestration import PREDECESSOR_SATISFIED, Planner
 from harness.types import TRANSITIONS, ResultEnvelope
 
 ok, bad = [], []
+
+
+def _impl(name: str) -> str:
+    """`Harness.<name>` 的**实现**源码（S3.2：重规划簇已迁至 kernel/tasks.py）。
+
+    拆分后 Harness 只留旧名委托，单看 `inspect.getsource(Harness.<name>)` 会
+    只剩一行 `return self.tasks.…` → 源码文本断言假绿/假红。
+    """
+    owner = TaskService if hasattr(TaskService, name) else Harness
+    return inspect.getsource(getattr(owner, name))
+
 def chk(name, cond, detail=""):
     (ok if cond else bad).append((name, detail))
 
@@ -56,11 +68,11 @@ p = inspect.getsource(Planner.patch)
 chk("K-67B patch 物化 edges", '_canon(' in p and 'new_plan["edges"] = materialized' in p)
 # --- K-67(A) 剪枝
 chk("K-67A _prune_id_aliases 存在", hasattr(Harness, "_prune_id_aliases"))
-rp = inspect.getsource(Harness.replan)
+rp = _impl("replan")
 i_readmit = rp.find("_readmit_after_replan(acb, new_plan)")
 i_prune = rp.find("_prune_id_aliases(acb.run_id, new_plan)")
 chk("K-67A 剪枝在 readmit 之后", 0 < i_readmit < i_prune, f"readmit@{i_readmit} prune@{i_prune}")
-pa = inspect.getsource(Harness._prune_id_aliases)
+pa = _impl("_prune_id_aliases")
 chk("K-67A 判据含活跃 ACB task_id", "acb.task_id" in pa)
 chk("K-67A 判据含 logical_subgoal_id", "acb.logical_subgoal_id" in pa)
 
