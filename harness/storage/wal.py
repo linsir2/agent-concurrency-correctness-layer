@@ -33,6 +33,7 @@ import os
 import struct
 import uuid
 import zlib
+from enum import Enum
 from pathlib import Path
 from typing import Self
 
@@ -51,6 +52,21 @@ from .atomic import atomic_write, fsync_dir, write_all
 
 MAGIC = b"MWAL"
 HEADER = struct.Struct(">4sII")
+
+
+def _canon_default(obj):
+    """WAL 规范编码：集合排序、Enum 取值、bytes 十六进制；其余 fail-closed。
+
+    不能用 `default=str`：set/frozenset 的 repr 依赖 hash seed，跨进程不可重放。
+    """
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj, key=lambda x: json.dumps(
+            x, sort_keys=True, ensure_ascii=False, default=_canon_default))
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, bytes):
+        return obj.hex()
+    raise TypeError(f"WAL payload 含不可规范序列化对象：{type(obj).__name__}")
 
 
 class WalCorrupt(Exception):
@@ -272,7 +288,8 @@ class Wal:
                     item["fencing_epoch"] = fencing_epoch
                 assigned.append(item)
             body = json.dumps(assigned, sort_keys=True, separators=(",", ":"),
-                              ensure_ascii=False, default=str).encode("utf-8")
+                              ensure_ascii=False,
+                              default=_canon_default).encode("utf-8")
             header = HEADER.pack(MAGIC, len(body), zlib.crc32(body) & 0xFFFFFFFF)
             write_all(self._fd, header + body)
             if self._fsync:
