@@ -15,6 +15,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+class _NullLock:
+    """空上下文管理器（无外部幂等键时占位，避免分支里写两套 `with`）。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _SpawnAbort(Exception):
+    """C1：spawn ② 事务的「明确拒绝」信号（非崩溃），由回滚分支转成 failure。"""
+
+
 @dataclass
 class KernelState:
     # ---- 身份 / 签名（SigningService）----

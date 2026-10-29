@@ -27,6 +27,7 @@ import threading
 import pytest
 from _egress_env import FEATURE_UNSHARE, probe_environment, register, unshare_available
 
+from harness.kernel.receipts import ReceiptChain
 from harness import (
     ACB,
     EpochStore,
@@ -149,7 +150,7 @@ def test_s12_1_receipt_scan_failure_is_fail_closed(tmp_path, monkeypatch, path):
     if path == "_receipt_records":
         def boom(self, watermark: int = 0):
             raise RuntimeError("fake: receipt scan failed")
-        monkeypatch.setattr(Harness, "_receipt_records", boom)
+        monkeypatch.setattr(ReceiptChain, "_receipt_records", boom)
     elif path == "receipts_from":
         def boom(self, watermark: int = 0):
             raise RuntimeError("fake: wal receipts_from failed")
@@ -243,7 +244,7 @@ def test_s12_1_negative_control_silent_fallback_forks_chain(tmp_path, monkeypatc
 
     # 静默实现：回扫「成功」但返回空（等价于旧 `except Exception: return`
     # 与 v1.0 的静默回退）→ h1 用陈旧 head 续链
-    monkeypatch.setattr(Harness, "_receipt_records", lambda self, watermark=0: [])
+    monkeypatch.setattr(ReceiptChain, "_receipt_records", lambda self, watermark=0: [])
     assert _commit(h1, ACB(id="A3", run_id=run_id, task_id="T3",
                            logical_subgoal_id=sub),
                    resource="r", content={"v": 3}) == Status.OK

@@ -46,7 +46,11 @@ def _declared(proto_name: str) -> set[str]:
 
 
 def _holder_and_comp(node: ast.AST) -> str | None:
-    """若 `node` 形如 `self.<comp>` 或 `self.h.<comp>`，返回 comp。"""
+    """若 `node` 形如 `self.<comp>` / `self.h.<comp>` / `self.deps.<comp>`，返回 comp。
+
+    S1 起组件访问迁入 kernel 服务（`self.deps.workspace`）。若不认这一形，
+    服务层的漂移将**不可见** → 扫描变空绿（由 `test_drift_check_is_not_vacuous` 兜底）。
+    """
     if not isinstance(node, ast.Attribute):
         return None
     # self.<comp>
@@ -57,6 +61,12 @@ def _holder_and_comp(node: ast.AST) -> str | None:
             and isinstance(node.value.value, ast.Name)
             and node.value.value.id == "self"
             and node.value.attr == "h"):
+        return node.attr
+    # self.deps.<comp>（kernel 服务的统一持有形；见 harness/kernel/*.py）
+    if (isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "self"
+            and node.value.attr == "deps"):
         return node.attr
     return None
 
@@ -120,6 +130,23 @@ def test_negative_control_removing_declaration_is_detected():
     missing = sorted(set(accessed["checkpoints"]) - reduced)
     assert sample in missing, (
         f"删掉 {sample} 后未被检出 —— 负对照失效（检查不可信）")
+
+
+def test_negative_control_deps_form_is_scanned():
+    """**负对照**：`self.deps.<comp>.<member>` 必须被识别。
+
+    若不识别，S1 之后组件访问全部迁到 `self.deps.*` → 扫描面归零，
+    契约漂移将静默不可见（这是"变空绿"的具体形态）。
+    """
+    tree = ast.parse("self.deps.workspace.version('x')")
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.Attribute) and n.attr == "version")
+    assert _holder_and_comp(node.value) == "workspace"
+
+    accessed = _collect_accessed()
+    kernel_files = [f for f in accessed["workspace"]
+                    if any("kernel/" in path for path, _ in accessed["workspace"][f])]
+    assert kernel_files, "kernel 服务里的 self.deps.<comp> 访问未被扫描到"
 
 
 def test_protocols_are_runtime_checkable():
