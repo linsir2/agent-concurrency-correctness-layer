@@ -375,15 +375,19 @@ def test_final_7_2_takeover_bumps_epoch_before_writing_lease(tmp_path, monkeypat
     assert h1._read_lease()["owner"] == "w1"
 
     observed: list[str | None] = []
-    orig_bump = Harness.bump_epoch
+    # S1：bump_epoch 已迁至 WriterLeaseService（服务内部直接调自身方法，
+    # 打桩 Harness 委托不会生效 —— 必须打在服务类上）。
+    from harness.kernel.leases import WriterLeaseService
 
-    def spy(self, reason: str = ""):
-        if getattr(self, "_writer_id", None) == "w2":
+    orig_bump = WriterLeaseService.bump_epoch
+
+    def spy(self, reason: str = "", run_id=None, *, epoch_scope=None):
+        if self.state.writer_id == "w2":
             lease = self._read_lease()
             observed.append(None if lease is None else lease.get("owner"))
-        return orig_bump(self, reason)
+        return orig_bump(self, reason, run_id, epoch_scope=epoch_scope)
 
-    monkeypatch.setattr(Harness, "bump_epoch", spy)
+    monkeypatch.setattr(WriterLeaseService, "bump_epoch", spy)
     clock.advance(2000)                       # w1 租约过期 → w2 接管
     h2 = Harness(checkpoint_root=cp, writer_id="w2", clock=clock, lease_ms=1000)
 

@@ -58,3 +58,4 @@ class KernelState:
     lease_outcome: str = ""
     lease_reason: str = ""
     durable: bool = False
+    writer_lease_ok: bool = True
