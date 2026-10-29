@@ -570,7 +570,7 @@ class Harness:
     def _apply_lease_grant(self, *args, **kwargs):
         return self.leases._apply_lease_grant(*args, **kwargs)
     def _lease_failure_reason(self, *args, **kwargs):
-        return self.leases._lease_failure_reason(*args, **kwargs)
+        return self.leases.failure_reason(*args, **kwargs)
     def _lease_path(self, *args, **kwargs):
         return self.leases._lease_path(*args, **kwargs)
     def _read_lease(self, *args, **kwargs):
@@ -582,7 +582,7 @@ class Harness:
     def _renew_writer_lease(self, *args, **kwargs):
         return self.leases._renew_writer_lease(*args, **kwargs)
     def _ensure_writer_lease(self, *args, **kwargs):
-        return self.leases._ensure_writer_lease(*args, **kwargs)
+        return self.leases.ensure_writer_lease(*args, **kwargs)
     def _release_writer_lease(self, *args, **kwargs):
         return self.leases._release_writer_lease(*args, **kwargs)
     def _epoch_backend(self, *args, **kwargs):

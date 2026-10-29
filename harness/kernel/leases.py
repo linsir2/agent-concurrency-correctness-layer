@@ -151,7 +151,7 @@ class WriterLeaseService:
         """S24-8：租约与 Raft 事件日志**共享同一 RSM** 时，在提交点复核旧 epoch。
 
         条件不满足（事件日志不是 Raft，或 cluster 未启用租约状态）→ **不注入**，
-        由 `_ensure_writer_lease` 在写入口拒绝；这一边界在文档里如实标注
+        由 `ensure_writer_lease` 在写入口拒绝；这一边界在文档里如实标注
         （写入口检查 + 租约 TTL，不是零窗口）。绝不假装「提交点已 fence」。
         """
         if self.state.lease_store is None:
@@ -188,7 +188,7 @@ class WriterLeaseService:
         if epoch != int(self.deps.intents.get_epoch() or 0):
             self.deps.intents.set_epoch(epoch)
             self.deps.budget.set_epoch(epoch, emit=False)
-    def _lease_failure_reason(self) -> str:
+    def failure_reason(self) -> str:
         """写入口被拒时的可观测原因（区分「别人持有」与「后端不可用」）。"""
         if self.state.lease_outcome == UNAVAILABLE:
             return "writer_lease_unavailable"
@@ -310,7 +310,7 @@ class WriterLeaseService:
                 return True
         # 非本写者：**释放 store.lock 后**再走接管（接管内可能 bump epoch）
         return self._try_acquire_writer_lease()
-    def _ensure_writer_lease(self) -> bool:
+    def ensure_writer_lease(self) -> bool:
         """写入口守卫：durable 模式下必须持有/可续租；失败 → 拒绝服务。"""
         if not self.state.durable:
             return True
