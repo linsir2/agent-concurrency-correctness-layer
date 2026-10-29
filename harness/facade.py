@@ -161,6 +161,34 @@ def _norm_rel(value: str, *, wildcard: bool) -> str:
     return text.rstrip("/")
 
 
+def _normalize_capability(harness, capability):
+    """把 capability 归一为 `CapabilityToken`（None → None）。
+
+    接受三种形态（`policy.issue` 的实际签名，见 policy.py）：
+    - CapabilityToken：直接用；
+    - str：已签名 token，必须可解析（否则 fail-closed）；
+    - dict：必须含 `agent_id`，其余按 issue 的关键字参数展开。
+    """
+    if capability is None:
+        return None
+    if isinstance(capability, dict):
+        spec = dict(capability)
+        agent = str(spec.pop("agent_id", "") or "")
+        if not agent:
+            raise ValueError("capability 字典必须包含 agent_id")
+        return harness.policy.issue(
+            agent, tools=set(spec.get("tools") or ()),
+            paths=set(spec.get("paths") or ()),
+            network=set(spec.get("network") or ()),
+            data_class=str(spec.get("data_class", "public")))
+    if isinstance(capability, str):
+        resolved = harness.policy.resolve_token(capability)
+        if resolved is None:
+            raise ValueError("capability 字符串无法解析（未签名/过期/缺 secret）")
+        return resolved
+    return capability
+
+
 def _norm_scope(include, exclude) -> tuple[tuple[str, ...], tuple[str, ...]]:
     inc = tuple(_norm_rel(x, wildcard=False) for x in (include or ()))
     exc = tuple(_norm_rel(x, wildcard=True) for x in (exclude or ()))
@@ -225,7 +253,8 @@ class RscSession:
                  verify_diagnostics: bool = False,
                  semantic: str = "off",
                  semantic_ignore: tuple[str, ...] = (),
-                 merge_queue: dict | None = None) -> None:
+                 merge_queue: dict | None = None,
+                 capability=None, capability_required: bool = False) -> None:
         self.h = harness
         self.tenant = str(tenant or "")
         self.token_ttl_ms = max(1, int(token_ttl_ms))
@@ -244,6 +273,11 @@ class RscSession:
         if self.semantic not in ("off", "warn", "block"):
             raise ValueError(f"semantic 必须是 off|warn|block，得到 {semantic!r}")
         self.semantic_ignore = tuple(str(x) for x in semantic_ignore)
+        # #2：能力令牌（opt-in）。不传 = 完全走旧路径；required 时 fail-closed。
+        if capability_required and capability is None:
+            raise ValueError("capability_required=True 时必须提供 capability")
+        self.capability = _normalize_capability(harness, capability)
+        self.capability_required = bool(capability_required)
         # S24-4：可选单写者队列（默认关闭 → `apply` 路径字节不变）。
         self._queue: MergeQueue | None = None
         if merge_queue is not None:
@@ -318,6 +352,16 @@ class RscSession:
         agent_id, intent_key = str(agent_id), str(intent_key)
         if not agent_id or not intent_key:
             return Deny("bad_agent_or_intent")
+        # #2：能力令牌（opt-in）—— 身份绑定 + 声明写集 fail-fast。
+        cap = self.capability
+        if cap is not None:
+            if str(getattr(cap, "agent_id", "")) != agent_id:
+                return Deny("capability_identity_mismatch",
+                            code="capability_identity_mismatch")
+            for r in writes:
+                if not cap.allows_path(str(r)):
+                    return Deny(f"capability_path_denied:{r}",
+                                code=f"capability_path_denied:{r}")
         # S24-10：确定性模式下 run_id 可重放（它进入 commit_key / 收据 id）
         entropy = getattr(self.h, "entropy", None)
         run_id = (f"rsc-{entropy.uuid('run_id')[:12]}" if entropy is not None
@@ -334,6 +378,10 @@ class RscSession:
             if type(exc).__name__ in _KNOWN_EXC:
                 return Deny(f"coordinator_unavailable:{type(exc).__name__}")
             raise
+        if acb.state is TaskState.ADMITTED and cap is not None:
+            # 门面路径的 token 按业务 agent 签发，不能交给准入期（按 acb.id 校验）；
+            # 准入通过后再绑定，供 apply/gate 的能力门禁使用。
+            acb.capability = cap
         if acb.state is not TaskState.ADMITTED:
             reason = str(acb.failure or "not_admitted")
             self._discard(acb, run_id)           # 评审 P1-8：不留僵尸 ACB
@@ -367,7 +415,8 @@ class RscSession:
                      worktree=worktree, deadline_ms=deadline)
 
     def apply(self, token: str, writes: list, *, idempotency_key: str,
-              cost: int = 1, agent_id: str = "") -> Receipt | Conflict | Deny | Wait:
+              cost: int = 1, agent_id: str = "",
+              tool: str = "") -> Receipt | Conflict | Deny | Wait:
         """提交：按外部键重放 → CAS 提交 → 消费预算 → 落盘快照。"""
         writes = list(writes)
         if not writes:
@@ -378,9 +427,9 @@ class RscSession:
             return Deny("cost_exceeds_reservation")
         with self._op_lock(token):
             return self._apply_locked(token, writes, idempotency_key,
-                                      int(cost), str(agent_id))
+                                      int(cost), str(agent_id), str(tool))
 
-    def _apply_locked(self, token, writes, key, cost, agent_id):
+    def _apply_locked(self, token, writes, key, cost, agent_id, tool=""):
         acb = self.resolve(token)
         if isinstance(acb, Deny):
             return acb
@@ -408,6 +457,10 @@ class RscSession:
                     return Deny(f"bad_content:{type(exc).__name__}")
             batch.append(Write(str(resource), content))
         pending = [(w.resource, w.content) for w in batch]
+        # #2：能力门禁必须早于任何副作用（与 semantic/verify 门禁互不依赖）。
+        blocked = self._capability_gate(acb, pending, tool)
+        if blocked is not None:
+            return blocked
         # S24-3：静态语义冲突先挡（便宜、可行动）；S24-1 动态验证后置（权威）。
         blocked = self._semantic_gate(token, acb, pending)
         if blocked is not None:
@@ -572,6 +625,30 @@ class RscSession:
         self._resave(acb, token)
         return Result(Status.OK if report.ok else Status.SEMANTIC_REJECTED,
                       detail)
+
+    def _capability_gate(self, acb, writes, tool: str) -> Deny | None:
+        """四维能力门禁（path / tool）。opt-in：无 capability → 直接放行。
+
+        principal 用**业务 agent_id**（`acb.spec["rsc_agent"]`），不是 `acb.id`：
+        `policy.check_capability` 做 `resolved.agent_id in (principal, "*")`，
+        而门面的 token 是按业务 agent 签发的（runtime 路径按 acb.id 签发）。
+        """
+        cap = self.capability
+        if cap is None:
+            return None
+        principal = str(acb.spec.get("rsc_agent") or "")
+        for resource, _content in writes:
+            if tool and not cap.allows_tool(tool):
+                return Deny(f"capability_tool_denied:{tool}",
+                            code=f"capability_tool_denied:{tool}")
+            if not cap.allows_path(str(resource)):
+                return Deny(f"capability_path_denied:{resource}",
+                            code=f"capability_path_denied:{resource}")
+            if not self.h.policy.check_capability(
+                    principal, cap, tool or "", str(resource)):
+                return Deny("capability_denied",
+                            code=f"capability_denied:{resource}")
+        return None
 
     def _semantic_gate(self, token: str, acb: ACB, pending=None) -> Deny | None:
         """`off` 不跑；`warn` 只记录；`block` 返回 Deny（不可重试，需改代码）。"""
