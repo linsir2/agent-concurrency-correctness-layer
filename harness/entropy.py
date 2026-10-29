@@ -41,8 +41,10 @@ class Entropy(Protocol):
 class Deterministic:
     """种子化熵源（测试/重放专用，**不是**安全随机）。"""
 
-    __slots__ = ("_counters", "_lock", "_seed", "_start_ms", "_tick_ms",
-                 "_ticks")
+    __slots__ = (
+        "_counters", "_lock", "_owner", "_owner_name", "_seed",
+        "_start_ms", "_tick_ms", "_ticks",
+    )
 
     def __init__(self, seed: str | bytes, *, start_ms: int = 1_000_000,
                  tick_ms: int = 1) -> None:
@@ -54,6 +56,17 @@ class Deterministic:
         self._lock = threading.RLock()
         self._counters: dict[str, int] = {}
         self._ticks = 0
+        self._owner = threading.get_ident()
+        self._owner_name = threading.current_thread().name
+
+    def _assert_owner(self) -> None:
+        ident = threading.get_ident()
+        if ident != self._owner:
+            raise ValueError(
+                "Deterministic 只能在构造线程使用："
+                f"owner={self._owner_name}({self._owner}) "
+                f"current={threading.current_thread().name}({ident})；"
+                "并发场景请使用 scheduler_mode='sync' 或不要注入 entropy")
 
     # ---- 内部 -----------------------------------------------------
     def _next(self, domain: str) -> int:
@@ -74,14 +87,17 @@ class Deterministic:
     # ---- Entropy 协议 ---------------------------------------------
     def uuid(self, domain: str) -> str:
         """16 字节（32 hex）的确定性 id；同域递增、跨域隔离。"""
+        self._assert_owner()
         return self._digest(domain, self._next(domain), 16)
 
     def token(self, domain: str) -> str:
         """32 字节（64 hex）的确定性 token（**非安全**，勿作能力令牌）。"""
+        self._assert_owner()
         return self._digest(domain, self._next(domain), 32)
 
     def now_ms(self) -> int:
         """严格单调的模拟时钟：每次调用 +`tick_ms`。"""
+        self._assert_owner()
         with self._lock:
             self._ticks += 1
             return self._start_ms + self._ticks * self._tick_ms

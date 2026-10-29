@@ -393,7 +393,8 @@ class Harness:
         self.budget.event_log = self.event_log
         self._run_limits = int(run_limits)
         self.checkpoints = (checkpoints if checkpoints is not None
-                            else (FileCheckpointStore(checkpoint_root)
+                            else (FileCheckpointStore(
+                                checkpoint_root, entropy=entropy, clock=self.clock)
                                   if checkpoint_root is not None
                                   else CheckpointStore()))
         self.checkpoints.event_log = self.event_log      # §2.4：无条件注入全局水位源

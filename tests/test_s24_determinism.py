@@ -152,7 +152,155 @@ def test_entropy_rejects_pool_scheduler():
         Harness(entropy=Deterministic("s"), scheduler_mode="pool")
 
 
+def test_cross_thread_uuid_is_rejected_without_advancing():
+    import threading
+
+    ent = Deterministic("s")
+    errors = []
+
+    def worker():
+        try:
+            ent.uuid("event_id")
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=worker, name="worker-uuid")
+    thread.start()
+    thread.join()
+    assert errors and "Deterministic 只能在构造线程使用" in errors[0]
+    assert "MainThread" in errors[0] and "worker-uuid" in errors[0]
+    assert ent.calls("event_id") == 0
+
+
+def test_cross_thread_clock_is_rejected_without_tick():
+    import threading
+
+    ent = Deterministic("s", start_ms=1_000, tick_ms=1)
+    errors = []
+
+    def worker():
+        try:
+            ent.now_ms()
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=worker, name="worker-clock")
+    thread.start()
+    thread.join()
+    assert errors
+    assert ent.now_ms() == 1_001          # 跨线程调用未推进 ticks
+
+
+def test_constructor_in_worker_is_allowed():
+    import threading
+
+    out = []
+
+    def worker():
+        ent = Deterministic("worker")
+        out.append(ent.uuid("x"))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert out and len(out[0]) == 32
+
+
 def test_entropy_rejects_merge_queue():
     h = Harness(entropy=Deterministic("s"))
     with pytest.raises(ValueError):
         RscSession(h, merge_queue={"capacity": 4})
+
+
+# ---------------------------------------------------------------- checkpoint 确定性
+def _tree_digest(root: pathlib.Path) -> dict[str, str]:
+    import hashlib
+    out = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            out[str(path.relative_to(root))] = hashlib.sha256(
+                path.read_bytes()).hexdigest()
+    return out
+
+
+def _run_with_store(root: pathlib.Path, store):
+    h = Harness(checkpoints=store, run_limits=10)
+    session = RscSession(h, tenant="t", min_budget=1,
+                         state_dir=str(root / "idx"))
+    tok = session.begin("a", "g", writes=["a.md"])
+    session.apply(tok.token, [("a.md", "v1")], idempotency_key="k", agent_id="a")
+    session.finish(tok.token)
+
+
+def test_same_seed_checkpoint_tree_is_byte_identical(tmp_path):
+    _run(tmp_path / "a", "cp-seed")
+    _run(tmp_path / "b", "cp-seed")
+    assert _tree_digest(tmp_path / "a") == _tree_digest(tmp_path / "b")
+
+
+def test_checkpoint_store_uuid_domain(tmp_path):
+    from harness.checkpoint import FileCheckpointStore
+    ent = Deterministic("s")
+    store = FileCheckpointStore(tmp_path / "cp", entropy=ent, clock=ent)
+    assert store.store_uuid == Deterministic("s").uuid("checkpoint_store_uuid")
+
+
+def test_checkpoint_ref_suffix_domain(tmp_path):
+    from harness.checkpoint import FileCheckpointStore
+    ent = Deterministic("s")
+    store = FileCheckpointStore(tmp_path / "cp", entropy=ent, clock=ent)
+    _run_with_store(tmp_path, store)
+    ref = min((tmp_path / "cp/refs").rglob("*.json")).stem
+    assert ref.endswith(Deterministic("s").uuid("checkpoint_ref")[:12])
+
+
+def test_checkpoint_created_at_uses_clock(tmp_path):
+    import json
+
+    from harness.checkpoint import FileCheckpointStore
+    from harness.clock import ManualClock
+
+    store = FileCheckpointStore(tmp_path / "cp", entropy=Deterministic("s"),
+                                clock=ManualClock(1_000))
+    _run_with_store(tmp_path, store)
+    ref = min((tmp_path / "cp/refs").rglob("*.json"))
+    assert json.loads(ref.read_text(encoding="utf-8"))["created_at_ms"] == 1_000
+
+
+def test_default_checkpoint_still_uses_uuid4_and_wall_clock(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    import harness.checkpoint as cp
+
+    monkeypatch.setattr(cp.uuid, "uuid4",
+                        lambda: SimpleNamespace(hex="f" * 32))
+    monkeypatch.setattr(cp.time, "time", lambda: 123.456)
+    store = cp.FileCheckpointStore(tmp_path / "cp")
+    assert store.store_uuid == "f" * 32
+    _run_with_store(tmp_path, store)
+    ref = min((tmp_path / "cp/refs").rglob("*.json"))
+    doc = json.loads(ref.read_text(encoding="utf-8"))
+    assert doc["ref"].endswith("f" * 12)
+    assert doc["created_at_ms"] == 123456
+
+
+def test_entropy_error_fails_closed_without_store(tmp_path):
+    class Bad:
+        def uuid(self, domain):
+            raise RuntimeError("boom")
+
+        def now_ms(self):
+            return 0
+
+    from harness.checkpoint import FileCheckpointStore
+    with pytest.raises(RuntimeError):
+        FileCheckpointStore(tmp_path / "cp", entropy=Bad())
+    assert not (tmp_path / "cp/store.json").exists()
+
+
+def test_different_seed_different_store_uuid(tmp_path):
+    from harness.checkpoint import FileCheckpointStore
+    a = FileCheckpointStore(tmp_path / "a", entropy=Deterministic("s1"))
+    b = FileCheckpointStore(tmp_path / "b", entropy=Deterministic("s2"))
+    assert a.store_uuid != b.store_uuid
