@@ -246,6 +246,117 @@ def test_malformed_tokens_index(tmp_path):
     assert any(f["code"] == "TOKENS_MALFORMED" for f in report["findings"])
 
 
+# ---------------------------------------------------------------- checkpoint 信封 / aging
+def _ref_files(root: pathlib.Path) -> list[pathlib.Path]:
+    return sorted((root / "refs").rglob("*.json"))
+
+
+def _codes(report: dict) -> set[str]:
+    return {f["code"] for f in report["findings"]}
+
+
+def test_checkpoint_payload_checksum_tamper(tmp_path):
+    root, wal, _h, session = _durable_session(tmp_path)
+    session.begin("a", "g", writes=["a.md"])
+    ref = _ref_files(root)[0]
+    doc = json.loads(ref.read_text(encoding="utf-8"))
+    doc["payload"]["state"] = "TAMPERED"
+    ref.write_text(json.dumps(doc), encoding="utf-8")
+    report = diagnose(state_dir=root, secret=SECRET)
+    assert "CHECKPOINT_PAYLOAD_CHECKSUM" in _codes(report)
+    assert report["ok"] is False
+    wal.close()
+
+
+def test_checkpoint_header_checksum_tamper(tmp_path):
+    root, wal, _h, session = _durable_session(tmp_path)
+    session.begin("a", "g", writes=["a.md"])
+    ref = _ref_files(root)[0]
+    doc = json.loads(ref.read_text(encoding="utf-8"))
+    doc["created_at_ms"] = int(doc["created_at_ms"]) + 1
+    ref.write_text(json.dumps(doc), encoding="utf-8")
+    report = diagnose(state_dir=root, secret=SECRET)
+    assert "CHECKPOINT_HEADER_CHECKSUM" in _codes(report)
+    wal.close()
+
+
+def test_legacy_flat_ref_is_not_a_checksum_error(tmp_path):
+    root = tmp_path / "cp"
+    (root / "refs/ab/cd").mkdir(parents=True)
+    (root / "store.json").write_text(json.dumps(
+        {"store_uuid": "u", "next_seq": 1}), encoding="utf-8")
+    ref = ("CP-abcdef12-00000000000000000001-abcdef123456")
+    (root / "refs/ab/cd" / f"{ref}.json").write_text(json.dumps(
+        {"acb_id": "a", "state": "ADMITTED", "aging_deadline": 1}),
+        encoding="utf-8")
+    report = diagnose(checkpoint_root=root, now_ms=10 ** 13)
+    assert "CHECKPOINT_HEADER_CHECKSUM" not in _codes(report)
+    assert "CHECKPOINT_PAYLOAD_CHECKSUM" not in _codes(report)
+
+
+def test_unreadable_ref_is_error_but_others_continue(tmp_path):
+    root = tmp_path / "cp"
+    (root / "refs/ab/cd").mkdir(parents=True)
+    (root / "store.json").write_text(json.dumps(
+        {"store_uuid": "u", "next_seq": 2}), encoding="utf-8")
+    refs = ["CP-abcdef12-00000000000000000001-abcdef123456",
+            "CP-abcdef12-00000000000000000002-abcdef123456"]
+    (root / "refs/ab/cd" / f"{refs[0]}.json").write_text("{bad", encoding="utf-8")
+    (root / "refs/ab/cd" / f"{refs[1]}.json").write_text("{bad2", encoding="utf-8")
+    report = diagnose(checkpoint_root=root)
+    unreadable = [f for f in report["findings"]
+                  if f["code"] == "CHECKPOINT_UNREADABLE"]
+    assert len(unreadable) == 2
+
+
+def test_aging_overdue_reports_warn_with_hint(tmp_path):
+    root = tmp_path / "state"
+    root.mkdir()
+    wal = WalEventLog(str(root / "wal.log"), fsync=False)
+    h = Harness(event_log=wal, checkpoint_root=str(root), run_limits=10, aging_ms=50)
+    session = RscSession(h, tenant="t", min_budget=1, state_dir=str(root))
+    session.begin("a", "g", writes=["a.md"])
+    report = diagnose(state_dir=root, now_ms=10 ** 13)
+    aging = [f for f in report["findings"] if f["code"] == "AGING_OVERDUE"]
+    assert aging and aging[0]["severity"] == "warn"
+    assert "hint" in aging[0]["locator"]
+    assert report["ok"] is True          # 非 strict：warn 不算失败
+    assert diagnose(state_dir=root, now_ms=10 ** 13, strict=True)["ok"] is False
+    wal.close()
+
+
+def test_aging_ignores_terminal_and_readmit(tmp_path):
+    root, wal, _h, session = _durable_session(tmp_path)
+    tok = session.begin("a", "g", writes=["a.md"])
+    session.apply(tok.token, [("a.md", "v")], idempotency_key="k", agent_id="a")
+    session.finish(tok.token)
+    report = diagnose(state_dir=root, now_ms=10 ** 13)
+    assert "AGING_OVERDUE" not in _codes(report)
+
+    cp = tmp_path / "cp"
+    (cp / "latest").mkdir(parents=True)
+    (cp / "refs/ab/cd").mkdir(parents=True)
+    (cp / "store.json").write_text(json.dumps(
+        {"store_uuid": "u", "next_seq": 1}), encoding="utf-8")
+    ref = "CP-abcdef12-00000000000000000001-abcdef123456"
+    (cp / "refs/ab/cd" / f"{ref}.json").write_text(json.dumps(
+        {"acb_id": "a", "state": "ADMITTED", "aging_deadline": 1,
+         "needs_readmit": True}), encoding="utf-8")
+    (cp / "latest/x.json").write_text(json.dumps({"ref": ref}), encoding="utf-8")
+    assert "AGING_OVERDUE" not in _codes(diagnose(checkpoint_root=cp,
+                                                  now_ms=10 ** 13))
+    wal.close()
+
+
+def test_new_checks_are_read_only(tmp_path):
+    root, wal, _h, session = _durable_session(tmp_path)
+    session.begin("a", "g", writes=["a.md"])
+    before = _tree_digest(root)
+    diagnose(state_dir=root, secret=SECRET)
+    assert _tree_digest(root) == before
+    wal.close()
+
+
 # ---------------------------------------------------------------- CLI
 def test_cli_usage_error(tmp_path):
     assert main([]) == 2

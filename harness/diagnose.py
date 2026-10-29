@@ -31,7 +31,9 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .checkpoint import envelope_problems, ref_path
 from .spec.receipt import Receipt, ReceiptMalformed, verify_chain_detailed
+from .storage.codec import decode
 from .storage.wal import HEADER, MAGIC
 
 TOOL = "rsc-diagnose"
@@ -376,6 +378,83 @@ def check_checkpoint(root: Path) -> Check:
     return chk
 
 
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def check_checkpoint_envelopes(root: Path) -> Check:
+    """逐 ref 校验 header/payload 双 checksum（只读，不构造 store）。"""
+    chk = Check("checkpoint.envelopes")
+    refs = root / "refs"
+    if not refs.is_dir():
+        chk.status = "skip"
+        chk.summary = "无 checkpoint refs"
+        return chk
+    count = 0
+    for path in sorted(refs.rglob("*.json")):
+        if path.name.endswith((".part", ".corrupt")):
+            continue
+        count += 1
+        doc = _read_json(path)
+        if not isinstance(doc, dict):
+            chk.add(Finding("CHECKPOINT_UNREADABLE", "error",
+                            f"{path.name} 不可解析或顶层不是对象",
+                            locator={"ref": path.name[:-5]}))
+            continue
+        for problem in envelope_problems(doc):
+            code = ("CHECKPOINT_HEADER_CHECKSUM" if problem == "header_checksum"
+                    else "CHECKPOINT_PAYLOAD_CHECKSUM")
+            chk.add(Finding(code, "error", f"{path.name}: {problem} 不匹配",
+                            locator={"ref": path.name[:-5]}))
+    chk.summary = f"refs={count}"
+    return chk
+
+
+def check_aging(root: Path, now_ms: int) -> Check:
+    """latest 指针指向的 ADMITTED ACB 是否超过 aging_deadline（只读）。"""
+    chk = Check("checkpoint.aging")
+    latest = root / "latest"
+    if not latest.is_dir():
+        chk.status = "skip"
+        chk.summary = "无 latest 指针"
+        return chk
+    seen: set[str] = set()
+    for pointer in sorted(latest.glob("*.json")):
+        meta = _read_json(pointer)
+        ref = meta.get("ref") if isinstance(meta, dict) else None
+        if not isinstance(ref, str) or not ref or ref in seen:
+            continue
+        seen.add(ref)
+        try:
+            doc = _read_json(ref_path(root, ref))
+        except ValueError:
+            continue
+        payload = doc.get("payload", doc) if isinstance(doc, dict) else None
+        try:
+            payload = decode(payload)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("state") != "ADMITTED":
+            continue
+        if payload.get("needs_readmit") or payload.get("superseded"):
+            continue
+        deadline = payload.get("aging_deadline")
+        if not isinstance(deadline, int) or not (0 < deadline < now_ms):
+            continue
+        chk.add(Finding(
+            "AGING_OVERDUE", "warn",
+            f"ACB {payload.get('acb_id', '')} 超过 aging_deadline",
+            invariant="I12",
+            locator={"ref": ref,
+                     "hint": f"检查 tick()/pump()；aging_count="
+                             f"{payload.get('aging_count', 0)}"}))
+    chk.summary = f"refs={len(seen)}"
+    return chk
+
+
 # ---------------------------------------------------------------- tokens
 def check_tokens(path: Path, now_ms: int) -> Check:
     """token 索引：可解析、必填键齐全、过期 token 提示。"""
@@ -450,6 +529,8 @@ def diagnose(*, state_dir: Path | None = None, wal: Path | None = None,
     if cp_root is not None:
         cp = check_checkpoint(cp_root)
         checks.append(cp)
+        checks.append(check_checkpoint_envelopes(cp_root))
+        checks.append(check_aging(cp_root, now))
         if cp_root.is_dir():
             stats["refs"] = sum(1 for p in (cp_root / "refs").rglob("*")
                                 if p.is_file()) if (cp_root / "refs").is_dir() else 0

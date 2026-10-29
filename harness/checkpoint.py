@@ -52,6 +52,38 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _is_envelope_doc(doc) -> bool:
+    return isinstance(doc, dict) and (
+        ("header_checksum" in doc and "payload_checksum" in doc)
+        or ("format_version" in doc and "payload" in doc))
+
+
+def envelope_problems(doc) -> tuple[str, ...]:
+    """信封双 checksum 校验；旧扁平 payload → `()`（不是信封，不报）。"""
+    if not _is_envelope_doc(doc):
+        return ()
+    header = {name: doc.get(name) for name in _HEADER_FIELDS}
+    try:
+        if _sha256(dumps(header).encode("utf-8")) != doc.get("header_checksum"):
+            return ("header_checksum",)
+    except Exception:                          # noqa: BLE001
+        return ("header_checksum",)
+    try:
+        if _sha256(dumps(doc.get("payload")).encode("utf-8")) \
+                != doc.get("payload_checksum"):
+            return ("payload_checksum",)
+    except Exception:                          # noqa: BLE001
+        return ("payload_checksum",)
+    return ()
+
+
+def ref_path(root, ref: str) -> Path:
+    """ref → 文件路径（与 `FileCheckpointStore._ref_path` 同一规则）。"""
+    if not _REF_RE.match(ref):
+        raise ValueError(f"非法 checkpoint ref：{ref!r}")
+    return Path(root) / "refs" / ref[:2] / ref[2:4] / f"{ref}.json"
+
+
 def _fenced(store, acb) -> None:
     """S13d §2.5 P0-10：checkpoint 落盘前的 claim fencing。
 
@@ -511,9 +543,11 @@ class FileCheckpointStore(CheckpointStore):
     **先盘后缓存**：ref 文件成功落盘后才填 `_store`；`load_strict` 绕过缓存。
     """
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, entropy=None, clock=None) -> None:
         super().__init__(root=root)
         self.root = Path(root)
+        self._entropy = entropy          # 必须先于 _init_meta（store_uuid 要用）
+        self._clock = clock
         self._thread_lock = threading.RLock()
         # store.lock：三锁全序的第 3 位（resource → receipts → wal → store → eventlog）
         self._flock = _FileLock(self.root / "store.lock", order=STORE_ORDER)
@@ -528,6 +562,21 @@ class FileCheckpointStore(CheckpointStore):
     @property
     def store_uuid(self) -> str:
         return str(self._meta["store_uuid"])
+
+    def _new_store_uuid(self) -> str:
+        if self._entropy is not None:
+            return str(self._entropy.uuid("checkpoint_store_uuid"))
+        return uuid.uuid4().hex
+
+    def _new_ref_suffix(self) -> str:
+        if self._entropy is not None:
+            return str(self._entropy.uuid("checkpoint_ref"))[:12]
+        return uuid.uuid4().hex[:12]
+
+    def _now_ms(self) -> int:
+        if self._clock is not None:
+            return int(self._clock.now_ms())
+        return int(time.time() * 1000)
 
     def _init_meta(self) -> None:
         with self._thread_lock, self._flock():
@@ -557,7 +606,7 @@ class FileCheckpointStore(CheckpointStore):
                 self._ensure_dir(self.root)
                 meta = {
                     "format_version": _FORMAT_VERSION,
-                    "store_uuid": uuid.uuid4().hex,
+                    "store_uuid": self._new_store_uuid(),
                     "next_seq": max_seq + 1,
                 }
                 atomic_write(meta_path, dumps(meta).encode("utf-8"))
@@ -775,9 +824,7 @@ class FileCheckpointStore(CheckpointStore):
 
     # ---- 路径 -------------------------------------------------------
     def _ref_path(self, ref: str) -> Path:
-        if not _REF_RE.match(ref):
-            raise ValueError(f"非法 checkpoint ref：{ref!r}")
-        return (self.root / "refs" / ref[:2] / ref[2:4] / f"{ref}.json")
+        return ref_path(self.root, ref)
 
     def _latest_path(self, kind: str, key: str) -> Path:
         return self.root / kind / f"{_sha16(key)}.json"
@@ -916,8 +963,9 @@ class FileCheckpointStore(CheckpointStore):
                 seq = int(meta.get("next_seq", 0) or 0)
                 meta["next_seq"] = seq + 1
                 atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
-                ref = f"CP-{str(meta['store_uuid'])[:8]}-{seq:020d}-{uuid.uuid4().hex[:12]}"
-                now_ms = int(time.time() * 1000)
+                ref = (f"CP-{str(meta['store_uuid'])[:8]}-{seq:020d}-"
+                       f"{self._new_ref_suffix()}")
+                now_ms = self._now_ms()
                 header = {
                     "format_version": _FORMAT_VERSION,
                     "schema_version": _SCHEMA_VERSION,
@@ -972,21 +1020,12 @@ class FileCheckpointStore(CheckpointStore):
         doc = self._read_document(ref)
         if not self._is_envelope(doc):
             return self._decode_payload(doc, ref, {})
-        header = {name: doc.get(name) for name in _HEADER_FIELDS}
-        try:
-            expected_header = _sha256(dumps(header).encode("utf-8"))
-        except Exception as exc:
-            raise CheckpointCorrupt(ref, header, "header_checksum") from exc
-        if expected_header != doc.get("header_checksum"):
-            raise CheckpointCorrupt(ref, header, "header_checksum")
-        payload = doc.get("payload")
-        try:
-            actual = _sha256(dumps(payload).encode("utf-8"))
-        except Exception as exc:
-            raise CheckpointCorrupt(ref, header, "payload_checksum") from exc
-        if actual != doc.get("payload_checksum"):
-            raise CheckpointCorrupt(ref, header, "payload_checksum")
-        return self._decode_payload(payload, ref, header)
+        problems = envelope_problems(doc)
+        if problems:
+            header = {name: doc.get(name) for name in _HEADER_FIELDS}
+            raise CheckpointCorrupt(ref, header, problems[0])
+        return self._decode_payload(doc.get("payload"), ref,
+                                    {name: doc.get(name) for name in _HEADER_FIELDS})
 
     def _read_document(self, ref: str) -> Any:
         """读 ref 文件；非法 ref → `CheckpointCorrupt(bad_ref)`；缺失 → 头部兜底。"""
@@ -1202,8 +1241,8 @@ class FileCheckpointStore(CheckpointStore):
         meta["next_seq"] = seq + 1
         atomic_write(self._meta_path, dumps(meta).encode("utf-8"))
         ref = (f"CP-{str(meta['store_uuid'])[:8]}-{seq:020d}-"
-               f"{uuid.uuid4().hex[:12]}")
-        now_ms = int(time.time() * 1000)
+               f"{self._new_ref_suffix()}")
+        now_ms = self._now_ms()
         header = {
             "format_version": _FORMAT_VERSION,
             "schema_version": _SCHEMA_VERSION,
