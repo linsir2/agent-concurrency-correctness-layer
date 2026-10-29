@@ -162,7 +162,7 @@ class Harness:
                 or replan_budget < 0:
             raise ValueError(f"非法 replan_budget：{replan_budget!r}（>=0 的整数）")
         self.epoch_scope = epoch_scope
-        self.replan_budget = replan_budget       # S13b §2.3：replan 预算（写前计数）
+        self.state.replan_budget = replan_budget  # S13b §2.3：replan 预算（写前计数）
         # S13c §2.4 C-5：有界 spawn（Codex 默认 1 层 / fanout 6）
         if isinstance(spawn_depth, bool) or not isinstance(spawn_depth, int) \
                 or spawn_depth < 0:
@@ -175,9 +175,9 @@ class Harness:
                 or min_budget_per_child < 1):
             raise ValueError(
                 f"非法 min_budget_per_child：{min_budget_per_child!r}（>=1 的整数）")
-        self.spawn_depth = spawn_depth
-        self.max_fanout = max_fanout
-        self.min_budget_per_child = min_budget_per_child
+        self.state.spawn_depth = spawn_depth
+        self.state.max_fanout = max_fanout
+        self.state.min_budget_per_child = min_budget_per_child
         self._spawn_counter = itertools.count(1)
         # ---- S13d §2.5：Scheduler 模式 + claim 租约 + aging（墙钟）----
         if scheduler_mode not in ("sync", "pool"):
@@ -192,9 +192,9 @@ class Harness:
                 or aging_max_attempts < 1):
             raise ValueError(
                 f"非法 aging_max_attempts：{aging_max_attempts!r}（>=1 的整数）")
-        self.scheduler_mode = scheduler_mode
-        self.aging_ms = int(aging_ms)
-        self.aging_max_attempts = int(aging_max_attempts)
+        self.state.scheduler_mode = scheduler_mode
+        self.state.aging_ms = int(aging_ms)
+        self.state.aging_max_attempts = int(aging_max_attempts)
         # claim 租约 TTL 必须覆盖「单 action 上界」：至少 >= 资源租约 `lease_ms`，
         # 否则一个慢 action 期间 claim 就会过期 → 第二个 worker 合法重 claim。
         if int(lease_ms) <= 0:
@@ -205,9 +205,9 @@ class Harness:
             raise ValueError(
                 f"claim_lease_ms({claim_ttl}) 必须 >= lease_ms({lease_ms})"
                 "（否则单 action 未完成即可被重 claim）")
-        self.claim_lease_ms = claim_ttl
-        self.pool_workers = int(pool_workers)
-        self.pool_timeout_s = float(pool_timeout_s)
+        self.state.claim_lease_ms = claim_ttl
+        self.state.pool_workers = int(pool_workers)
+        self.state.pool_timeout_s = float(pool_timeout_s)
         self._tls = threading.local()             # in_worker / depth / worker_id
         self._worker_ids = itertools.count(1)
         self._pool = (ThreadPoolExecutor(max_workers=self.pool_workers,
@@ -218,8 +218,8 @@ class Harness:
         self.aging_max = aging_max
         self.max_steps = max_steps
         self.max_concurrent = max_concurrent
-        self.hitl_timeout_ms = int(hitl_timeout_ms)   # S13a：审批超时（tick 判定）
-        self.retention = retention
+        self.state.hitl_timeout_ms = int(hitl_timeout_ms)  # S13a：审批超时（tick 判定）
+        self.state.retention = retention
         self.per_action_delay = per_action_delay   # §2.5：基准配对用注入点
         # S12 K-33：per-run 高水位游标（每 run 独立推进，见 `floor_for`）
         self.state.run_cursors = {}
@@ -332,9 +332,9 @@ class Harness:
         self.state.comp_journal = CompensationJournal(self.event_log)
         self._applied_event_ids: set[str] = set()
         self.checkpoints.applied_event_ids = self._applied_event_ids
-        self._drain_skipped: list[tuple[str, str]] = []   # D11：调度跳过原因（不再静默）
+        self.state.drain_skipped = []      # D11：调度跳过原因（不再静默）
         # S14 K-69：`tick` 的跳过原因（水合失败等），与调度跳过分开，避免混淆
-        self._tick_skipped: list[tuple[str, str]] = []
+        self.state.tick_skipped = []
         self.auth_gc_every = max(1, int(auth_gc_every))
         self.gc_every = max(1, int(gc_every))
         self.state.event_count = 0
@@ -373,7 +373,7 @@ class Harness:
         self._sync_run_cursors()          # S12 K-33：从既有事件初始化 per-run 游标
         self.context = (context if context is not None
                         else ContextAssembler(self.event_log, self.workspace, retention,
-                                              floor_for=self.floor_for,
+                                              floor_for=lambda *a, **k: self.floor_for(*a, **k),
                                               run_scoped=(self.epoch_scope == "run")))
         self.decide = decide
         self.resolver = (resolver if resolver is not None
@@ -383,7 +383,7 @@ class Harness:
         self.checkpoints.slots = self.slots        # checkpoint 快照活跃槽位
         # F6：checkpoint 落盘的是**有效 token**（`acb.capability` → `policy._tokens`
         # → `default_token`），否则跨进程 recover 会拿到 `None` → 工具全 DENIED。
-        self.checkpoints.token_provider = self._effective_token
+        self.checkpoints.token_provider = lambda *a, **k: self._effective_token(*a, **k)
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)
         self.scheduler = Scheduler(self, mode=scheduler_mode)
@@ -392,44 +392,46 @@ class Harness:
         self.hitl = HITL()
         # ---- S15 D：生产化（Admin 暂停 / DLQ 重放 / Ingress 幂等）----
         # pause 只阻止**未开始**的调度，资源保留（可恢复）；与 cancel 不同。
-        self._paused_runs: set[str] = set()
-        self.max_redrives = max(0, int(max_redrives))
+        self.state.paused_runs = set()
+        self.state.max_redrives = max(0, int(max_redrives))
         # S17 MS10：毒任务识别阈值（连续失败 >= N → 直接 DLQ，避免无限重试）
-        self.poison_after_failures = max(0, int(poison_after_failures))
-        self.drain_timeout_s = float(drain_timeout_s)
+        self.state.poison_after_failures = max(0, int(poison_after_failures))
+        self.state.drain_timeout_s = float(drain_timeout_s)
         self._draining = False
         # S21 K-100：本部署的最大租约时长（秒）——墓碑窗口的量纲依据。
         # 必须**向上取整**且覆盖 claim 租约：`lease_ms=1500` 的真实租约是 1.5s，
         # 若向下取整成 1s，墓碑会在旧持有者租约仍有效时被忘记 → fencing 被削弱。
         _max_ttl_ms = max(int(self.lease_ms), int(self.claim_lease_ms))
-        self.max_lease_ttl_s = max(1, -(-_max_ttl_ms // 1000))
-        self._claim_window_exceeded = 0
+        self.state.max_lease_ttl_s = max(1, -(-_max_ttl_ms // 1000))
+        self.state.claim_window_exceeded = 0
         # S22：门面 token 回收后的清理钩子（由 `RscSession` 注入，用于销毁 Z3）。
         self._token_cleanup = None
         self.ingress = Ingress(self)
         # S13d §2.5 P0-10：claim 的 fence epoch 接入**写路径**（commit_batch /
         # budget.consume / effects.begin / checkpoints.save）。sync 模式无 claim
         # → 守卫恒为 False（保持既有语义，36 个同步用例零破坏）。
-        self.budget.claim_guard = self._claim_fenced
-        self.effects.claim_guard = self._claim_fenced
-        self.checkpoints.claim_guard = self._claim_fenced
+        # S3.0：late lookup —— 注入 lambda 而非 bound method，保证「构造后替换
+        # `h._claim_fenced` 实例方法仍生效」（tests 会打桩）。
+        self.budget.claim_guard = lambda *a, **k: self._claim_fenced(*a, **k)
+        self.effects.claim_guard = lambda *a, **k: self._claim_fenced(*a, **k)
+        self.checkpoints.claim_guard = lambda *a, **k: self._claim_fenced(*a, **k)
         # X7：claim 三字段随快照落盘（无锁只读，仅作恢复后的观测/租约判定）。
-        self.checkpoints.claim_provider = self._claim_snapshot
+        self.checkpoints.claim_provider = lambda *a, **k: self._claim_snapshot(*a, **k)
 
         self.runtime = AgentRuntime(self)
-        self.plans: dict[str, dict] = {}
-        self.acbs: dict[str, ACB] = {}
+        self.state.plans = {}
+        self.state.acbs = {}
         self.state.lock = threading.RLock()
         # R6：准入唯一性登记 `(run_id, task_id, plan_version) → ACB`。
         # 同一 key 的活跃 ACB 不会被第二次 try_admit 复制出 `A-...-2`（双跑）。
-        self._admission_index: dict[tuple[str, str, int], ACB] = {}
+        self.state.admission_index = {}
         # R7：每 ACB 一把 transition 锁（replan / _finalize / requeue_readmit 共用）
-        self._transition_locks: dict[str, threading.RLock] = {}
+        self.state.transition_locks = {}
         # X6：`parent_id → {child_acb_id}` 反向索引（跨 run 子；父 `children_ids`
         # 缺失的老 checkpoint 也能被取消级联找回）。恢复时按 `spec.spawn.parent_id`
         # 反扫建立；spawn 成功与恢复子时增量更新。
-        self._children_index: dict[str, set[str]] = {}
-        self._children_index_built = False
+        self.state.children_index = {}
+        self.state.children_index_built = False
         # S9 §2.3：收据链（每 scope 一把 RLock；head/id 由 EventLog 重建）
         # 锁序写死：resource → scope → eventlog（docs s9 §2.3.5）。
         # **durable 模式为单写者**：`_scope_lock` 是**进程内** `threading.RLock`，
@@ -849,6 +851,225 @@ class Harness:
     @_event_count.setter
     def _event_count(self, value: int) -> None:
         self.state.event_count = value
+
+    # ---- S3.0 兼容属性（S5 删除）：调度/子任务状态已迁至 KernelState ----
+    @property
+    def plans(self):
+        """`run_id → plan`（旧 `self.plans: dict[str, dict]`）。"""
+        return self.state.plans
+
+    @plans.setter
+    def plans(self, value) -> None:
+        self.state.plans = value
+
+    @property
+    def acbs(self):
+        """`acb_id → ACB` 活跃任务表（旧 `self.acbs: dict[str, ACB]`）。"""
+        return self.state.acbs
+
+    @acbs.setter
+    def acbs(self, value) -> None:
+        self.state.acbs = value
+
+    @property
+    def _paused_runs(self):
+        """S15 D：Admin 暂停的 run 集合（旧 `self._paused_runs: set[str]`）。"""
+        return self.state.paused_runs
+
+    @_paused_runs.setter
+    def _paused_runs(self, value) -> None:
+        self.state.paused_runs = value
+
+    @property
+    def _drain_skipped(self):
+        """D11：调度跳过原因（旧 `self._drain_skipped: list[tuple[str, str]]`）。"""
+        return self.state.drain_skipped
+
+    @_drain_skipped.setter
+    def _drain_skipped(self, value) -> None:
+        self.state.drain_skipped = value
+
+    @property
+    def _tick_skipped(self):
+        """S14 K-69：tick 跳过原因（旧 `self._tick_skipped: list[tuple[str, str]]`）。"""
+        return self.state.tick_skipped
+
+    @_tick_skipped.setter
+    def _tick_skipped(self, value) -> None:
+        self.state.tick_skipped = value
+
+    @property
+    def _admission_index(self):
+        """R6：准入唯一性登记（旧 `self._admission_index: dict[tuple, ACB]`）。"""
+        return self.state.admission_index
+
+    @_admission_index.setter
+    def _admission_index(self, value) -> None:
+        self.state.admission_index = value
+
+    @property
+    def _transition_locks(self):
+        """R7：每 ACB 一把 transition 锁（旧 `dict[str, threading.RLock]`）。"""
+        return self.state.transition_locks
+
+    @_transition_locks.setter
+    def _transition_locks(self, value) -> None:
+        self.state.transition_locks = value
+
+    @property
+    def _children_index(self):
+        """X6：`parent_id → {child_acb_id}`（旧 `dict[str, set[str]]`）。"""
+        return self.state.children_index
+
+    @_children_index.setter
+    def _children_index(self, value) -> None:
+        self.state.children_index = value
+
+    @property
+    def _children_index_built(self) -> bool:
+        return self.state.children_index_built
+
+    @_children_index_built.setter
+    def _children_index_built(self, value: bool) -> None:
+        self.state.children_index_built = value
+
+    # ---- S3.0 兼容属性（S5 删除）：可变配置已迁至 KernelState ----
+    # 一律透传赋值（不做二次强转）：`__init__` 已完成各自类型转换，行为不变。
+    @property
+    def scheduler_mode(self) -> str:
+        return self.state.scheduler_mode
+
+    @scheduler_mode.setter
+    def scheduler_mode(self, value) -> None:
+        self.state.scheduler_mode = value
+
+    @property
+    def aging_ms(self) -> int:
+        return self.state.aging_ms
+
+    @aging_ms.setter
+    def aging_ms(self, value) -> None:
+        self.state.aging_ms = value
+
+    @property
+    def aging_max_attempts(self) -> int:
+        return self.state.aging_max_attempts
+
+    @aging_max_attempts.setter
+    def aging_max_attempts(self, value) -> None:
+        self.state.aging_max_attempts = value
+
+    @property
+    def claim_lease_ms(self) -> int:
+        return self.state.claim_lease_ms
+
+    @claim_lease_ms.setter
+    def claim_lease_ms(self, value) -> None:
+        self.state.claim_lease_ms = value
+
+    @property
+    def pool_workers(self) -> int:
+        return self.state.pool_workers
+
+    @pool_workers.setter
+    def pool_workers(self, value) -> None:
+        self.state.pool_workers = value
+
+    @property
+    def pool_timeout_s(self) -> float:
+        return self.state.pool_timeout_s
+
+    @pool_timeout_s.setter
+    def pool_timeout_s(self, value) -> None:
+        self.state.pool_timeout_s = value
+
+    @property
+    def drain_timeout_s(self) -> float:
+        return self.state.drain_timeout_s
+
+    @drain_timeout_s.setter
+    def drain_timeout_s(self, value) -> None:
+        self.state.drain_timeout_s = value
+
+    @property
+    def hitl_timeout_ms(self) -> int:
+        return self.state.hitl_timeout_ms
+
+    @hitl_timeout_ms.setter
+    def hitl_timeout_ms(self, value) -> None:
+        self.state.hitl_timeout_ms = value
+
+    @property
+    def max_redrives(self) -> int:
+        return self.state.max_redrives
+
+    @max_redrives.setter
+    def max_redrives(self, value) -> None:
+        self.state.max_redrives = value
+
+    @property
+    def poison_after_failures(self) -> int:
+        return self.state.poison_after_failures
+
+    @poison_after_failures.setter
+    def poison_after_failures(self, value) -> None:
+        self.state.poison_after_failures = value
+
+    @property
+    def max_fanout(self) -> int:
+        return self.state.max_fanout
+
+    @max_fanout.setter
+    def max_fanout(self, value) -> None:
+        self.state.max_fanout = value
+
+    @property
+    def min_budget_per_child(self) -> int:
+        return self.state.min_budget_per_child
+
+    @min_budget_per_child.setter
+    def min_budget_per_child(self, value) -> None:
+        self.state.min_budget_per_child = value
+
+    @property
+    def spawn_depth(self) -> int:
+        return self.state.spawn_depth
+
+    @spawn_depth.setter
+    def spawn_depth(self, value) -> None:
+        self.state.spawn_depth = value
+
+    @property
+    def replan_budget(self) -> int:
+        return self.state.replan_budget
+
+    @replan_budget.setter
+    def replan_budget(self, value) -> None:
+        self.state.replan_budget = value
+
+    @property
+    def retention(self) -> int:
+        return self.state.retention
+
+    @retention.setter
+    def retention(self, value) -> None:
+        self.state.retention = value
+
+    @property
+    def max_lease_ttl_s(self) -> int:
+        return self.state.max_lease_ttl_s
+
+    @max_lease_ttl_s.setter
+    def max_lease_ttl_s(self, value) -> None:
+        self.state.max_lease_ttl_s = value
+
+    @property
+    def _claim_window_exceeded(self) -> int:
+        return self.state.claim_window_exceeded
+
+    @_claim_window_exceeded.setter
+    def _claim_window_exceeded(self, value) -> None:
+        self.state.claim_window_exceeded = value
 
     # ---- RSC 提交（文档 §5.5） ------------------------------------
     # ---- RSC 提交（S2：实现已迁至 kernel/commit.py）--------------------

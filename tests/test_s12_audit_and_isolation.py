@@ -487,8 +487,12 @@ def test_s12_4_per_run_retention_parameterized(scope, advanced):
 def test_s12_4_floor_for_uses_per_run_tail_not_global():
     """`floor_for` 在 `epoch_scope="run"` 时用 per-run tail（不是全局 tail）。"""
     h = Harness(retention=3, epoch_scope="run")
-    assert h.context._floor_for.__func__ is Harness.floor_for
-    assert h.context._floor_for.__self__ is h
+    # S3.0：注入改为 late-lookup（lambda），不再是 bound method —— 断言改为
+    # 行为断言：实例上替换 `floor_for` 后必须被 context 侧看见。
+    assert callable(h.context._floor_for)
+    h.floor_for = lambda run_id: 4242
+    assert h.context._floor_for("R-ANY") == 4242, "floor_for 必须是调用时查找"
+    del h.floor_for          # 还原为类方法（仅实例属性）
     h.event_log.append(EventKind.RESOURCE_COMMITTED, "r", {"v": 1}, run_id="R-X")
     assert h.floor_for("R-X") == 0
     for i in range(10):

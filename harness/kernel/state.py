@@ -68,3 +68,34 @@ class KernelState:
     comp_journal: Any = None
     receipts_enabled: bool = True
     lease_ms: int = 60_000
+
+    # ---- S3.0：调度 / 子任务状态容器（dispatch/tasks/children 抽取前置）----
+    # 命名与旧 `self.acbs` / `self._drain_skipped` 一一对应（去掉前导下划线）。
+    acbs: dict = field(default_factory=dict)          # acb_id → ACB（活跃任务表）
+    plans: dict = field(default_factory=dict)         # run_id → plan
+    paused_runs: set = field(default_factory=set)     # S15 D：Admin 暂停的 run
+    drain_skipped: list = field(default_factory=list)  # D11：调度跳过原因（不再静默）
+    tick_skipped: list = field(default_factory=list)   # S14 K-69：tick 跳过原因
+    admission_index: dict = field(default_factory=dict)   # R6：(run,task,ver) → ACB
+    transition_locks: dict = field(default_factory=dict)  # R7：每 ACB 一把 transition 锁
+    children_index: dict = field(default_factory=dict)    # X6：parent_id → {child_acb_id}
+    children_index_built: bool = False
+
+    # ---- S3.0：可变配置（服务/测试在构造后修改，必须调用时读取）----
+    scheduler_mode: str = "sync"
+    aging_ms: int = 0
+    aging_max_attempts: int = 3
+    claim_lease_ms: int = 60_000      # 构造函数默认 None → 取 lease_ms
+    pool_workers: int = 4
+    pool_timeout_s: float = 120.0
+    drain_timeout_s: float = 5.0
+    hitl_timeout_ms: int = 30_000
+    max_redrives: int = 3
+    poison_after_failures: int = 3
+    max_fanout: int = 6
+    min_budget_per_child: int = 1
+    spawn_depth: int = 1
+    replan_budget: int = 2
+    retention: int = 10_000
+    max_lease_ttl_s: int = 60
+    claim_window_exceeded: int = 0
