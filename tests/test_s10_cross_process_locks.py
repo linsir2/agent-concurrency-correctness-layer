@@ -393,6 +393,6 @@ def test_final_7_2_takeover_bumps_epoch_before_writing_lease(tmp_path, monkeypat
 
     assert observed == ["w1"], \
         f"接管窗口未消除：bump 时租约 owner={observed!r}（期望旧写者 w1）"
-    assert h2._writer_lease_ok is True
+    assert h2.state.writer_lease_ok is True
     lease = h2.leases._read_lease()
     assert lease["owner"] == "w2" and lease["epoch"] == 1

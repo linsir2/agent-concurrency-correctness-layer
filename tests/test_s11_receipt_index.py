@@ -193,7 +193,7 @@ def test_s11_3_fencing_bound_to_wal(tmp_path):
     st = h1.commit_batch(acb, [Write("r")])
     assert st.status is Status.REJECT_STALE
     assert st.detail.get("reason") == "fencing_epoch_rejected"
-    assert ("R-S11-3", "S1") not in h1._receipt_heads, "被拒的写不得 ack（改 head）"
+    assert ("R-S11-3", "S1") not in h1.state.receipt_heads, "被拒的写不得 ack（改 head）"
     assert os.path.getsize(wal_path) == before
 
 

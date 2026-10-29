@@ -343,8 +343,8 @@ class Harness:
         self.effects = (effects if effects is not None
                         else EffectJournal(self.event_log))
         self.state.comp_journal = CompensationJournal(self.event_log)
-        self._applied_event_ids: set[str] = set()
-        self.checkpoints.applied_event_ids = self._applied_event_ids
+        self.state.applied_event_ids: set[str] = set()
+        self.checkpoints.applied_event_ids = self.state.applied_event_ids
         self.state.drain_skipped = []      # D11：调度跳过原因（不再静默）
         # S14 K-69：`tick` 的跳过原因（水合失败等），与调度跳过分开，避免混淆
         self.state.tick_skipped = []
@@ -683,37 +683,13 @@ class Harness:
 
 
 
-    @property
-    def _receipt_heads(self):
-        return self.state.receipt_heads
 
-    @_receipt_heads.setter
-    def _receipt_heads(self, value) -> None:
-        self.state.receipt_heads = value
 
-    @property
-    def _receipt_ids(self):
-        return self.state.receipt_ids
 
-    @_receipt_ids.setter
-    def _receipt_ids(self, value) -> None:
-        self.state.receipt_ids = value
 
-    @property
-    def _tainted_scopes(self):
-        return self.state.tainted_scopes
 
-    @_tainted_scopes.setter
-    def _tainted_scopes(self, value) -> None:
-        self.state.tainted_scopes = value
 
-    @property
-    def _malformed_receipts(self):
-        return self.state.malformed_receipts
 
-    @_malformed_receipts.setter
-    def _malformed_receipts(self, value) -> None:
-        self.state.malformed_receipts = value
 
 
 
@@ -757,40 +733,16 @@ class Harness:
         self.commit.compensation_journal = value
 
     # ---- S1 兼容属性（S5 删除）：写者租约状态已迁至 KernelState ----
-    @property
-    def _writer_lease_ok(self) -> bool:
-        return self.state.writer_lease_ok
-
-    @_writer_lease_ok.setter
-    def _writer_lease_ok(self, value: bool) -> None:
-        self.state.writer_lease_ok = value
 
 
 
 
-    @property
-    def _lease_instance(self):
-        return self.state.lease_instance
 
-    @_lease_instance.setter
-    def _lease_instance(self, value) -> None:
-        self.state.lease_instance = value
 
-    @property
-    def _writer_id(self):
-        return self.state.writer_id
 
-    @_writer_id.setter
-    def _writer_id(self, value) -> None:
-        self.state.writer_id = value
 
-    @property
-    def _writer_epoch(self) -> int:
-        return self.state.writer_epoch
 
-    @_writer_epoch.setter
-    def _writer_epoch(self, value: int) -> None:
-        self.state.writer_epoch = value
+
 
 
 
@@ -867,23 +819,9 @@ class Harness:
 
 
 
-    @property
-    def _tick_skipped(self):
-        """S14 K-69：tick 跳过原因（旧 `self._tick_skipped: list[tuple[str, str]]`）。"""
-        return self.state.tick_skipped
 
-    @_tick_skipped.setter
-    def _tick_skipped(self, value) -> None:
-        self.state.tick_skipped = value
 
-    @property
-    def _applied_event_ids(self):
-        """S4：恢复去重集合（旧 `self._applied_event_ids: set[str]`）。"""
-        return self.state.applied_event_ids
 
-    @_applied_event_ids.setter
-    def _applied_event_ids(self, value) -> None:
-        self.state.applied_event_ids = value
 
 
 

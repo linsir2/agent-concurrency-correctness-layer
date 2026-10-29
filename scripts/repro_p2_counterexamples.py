@@ -250,7 +250,7 @@ def p2_4():
 
     # AFTER
     h._rebuild_receipts()
-    print(f"[AFTER]  新实现 _tainted_scopes={h._tainted_scopes}")
+    print(f"[AFTER]  新实现 _tainted_scopes={h.state.tainted_scopes}")
     print(f"[AFTER]  verify_receipts('R','S') → {h.verify_receipts('R', 'S')}")
 
 

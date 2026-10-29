@@ -505,13 +505,23 @@ def test_delegate_scanner_has_teeth():
 # S5-g：状态镜像属性不得再增长
 # ---------------------------------------------------------------------------
 _EXPECTED_PROPERTIES = {
-    "_applied_event_ids", "_lease_instance", "_malformed_receipts",
-    "_receipt_heads", "_receipt_ids", "_tainted_scopes", "_tick_skipped",
-    "_writer_epoch", "_writer_id", "_writer_lease_ok",
-    "acbs", "aging_max_attempts", "aging_ms", "auth", "claim_lease_ms",
-    "comp_journal", "compensation_journal", "definitions", "lease_ms",
-    "lock_timeout_s", "max_fanout", "max_lease_ttl_s", "max_redrives",
-    "min_budget_per_child", "plans", "retention", "timers",
+    "acbs",
+    "aging_max_attempts",
+    "aging_ms",
+    "auth",
+    "claim_lease_ms",
+    "comp_journal",
+    "compensation_journal",
+    "definitions",
+    "lease_ms",
+    "lock_timeout_s",
+    "max_fanout",
+    "max_lease_ttl_s",
+    "max_redrives",
+    "min_budget_per_child",
+    "plans",
+    "retention",
+    "timers",
 }
 
 

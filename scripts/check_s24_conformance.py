@@ -480,7 +480,7 @@ with tempfile.TemporaryDirectory() as tmp:
     _store = MemoryLeaseStore()
     _h1 = make_harness(lease_store=_store)
     _h2 = make_harness(lease_store=_store)
-    chk("第二个 Harness 被租约拒绝", _h2._writer_lease_ok is False)
+    chk("第二个 Harness 被租约拒绝", _h2.state.writer_lease_ok is False)
     _store.set_fail(True)
     chk("租约后端故障 fail-closed",
         _h1.leases._renew_writer_lease() is False and _h1.state.lease_outcome == "unavailable")

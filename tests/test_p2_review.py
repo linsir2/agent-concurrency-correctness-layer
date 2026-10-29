@@ -130,7 +130,7 @@ def test_p2_4_rebuild_detects_duplicate_receipt_id(tmp_path):
                        producer=acb.id, run_id=acb.run_id)
 
     h2 = Harness(event_log=h.event_log, auth_secret="s3cr3t")
-    assert scope in h2._tainted_scopes, "重复 receipt_id 必须标 tainted"
+    assert scope in h2.state.tainted_scopes, "重复 receipt_id 必须标 tainted"
     assert h2.verify_receipts(*scope) is False
     # 拒绝继续扩展坏链
     acb2 = _acb(h2, "r2")
@@ -225,8 +225,8 @@ def test_p2_6_malformed_receipt_does_not_break_startup(tmp_path):
     # 新实例（模拟重启）→ 不得抛
     h2 = Harness(event_log=h.event_log, auth_secret="s3cr3t")
     assert h2.receipts_of("R-BAD") == [], "畸形事件不得进入 receipts_of"
-    assert h2._malformed_receipts, "畸形事件必须被记录（不静默）"
-    assert ("R-BAD", "") in h2._tainted_scopes
+    assert h2.state.malformed_receipts, "畸形事件必须被记录（不静默）"
+    assert ("R-BAD", "") in h2.state.tainted_scopes
     assert h2.verify_receipts("R-BAD", "") is False
 
 

@@ -270,8 +270,8 @@ def test_s9_head_rebuilt_from_event_log(tmp_path):
     head = h.state.receipt_heads[scope]
 
     h2 = Harness(event_log=wal)                 # 模拟重启：只靠 EventLog 重建
-    assert h2._receipt_heads[scope] == head
-    assert h2._receipt_ids == h.state.receipt_ids
+    assert h2.state.receipt_heads[scope] == head
+    assert h2.state.receipt_ids == h.state.receipt_ids
 
     acb2 = _acb(h2, "R-S9-RB", "S-RB", task_id="T-S9-2")
     _staged(h2, acb2, "r2")

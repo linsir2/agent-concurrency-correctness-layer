@@ -210,9 +210,9 @@ def test_s14_5_hydrate_failure_is_recorded_not_silent(tmp_path, monkeypatch):
     h2 = _shared_harness(h)
     h2.tick(now_ms=deadline)
 
-    assert ("", "refs_all_failed") not in h2._tick_skipped
-    assert any(reason == "tick_load_failed" for _, reason in h2._tick_skipped), (
-        f"水合失败未被记录：{h2._tick_skipped}")
+    assert ("", "refs_all_failed") not in h2.state.tick_skipped
+    assert any(reason == "tick_load_failed" for _, reason in h2.state.tick_skipped), (
+        f"水合失败未被记录：{h2.state.tick_skipped}")
 
 
 @pytest.mark.parametrize("resume", ["APPROVED", "TIMEOUT"])

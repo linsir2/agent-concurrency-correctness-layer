@@ -170,7 +170,7 @@ def test_s10_3_replay_anchors_event_identity(tmp_path):
     after = [e for e in h2.budget.budget_events() if e.seq > cursor]
     assert after, "checkpoint 之后未新增预算事件（测试前提不成立）"
     for ev in after:
-        assert ev.event_id in h2._applied_event_ids, \
+        assert ev.event_id in h2.state.applied_event_ids, \
             f"事件 {ev.event_id}（seq={ev.seq}）未入去重集合 → 重放会双份"
     # 每个 rid 能在重建树找到；其 consumed 等于**最后一条** CONSUMED 事件，
     # 且逐条单调递增（set 语义下不会回退）
@@ -422,7 +422,7 @@ def test_s10_writer_lease_blocks_commit_and_recover(tmp_path):
 
     h2 = Harness(run_limits=1000, checkpoint_root=str(root), lease_ms=1000,
                  clock=clock, writer_id="writer-2")
-    assert h2._writer_lease_ok is False, "构造期 acquire 失败必须被记录"
+    assert h2.state.writer_lease_ok is False, "构造期 acquire 失败必须被记录"
     st = h2.commit_batch(ACB(id="A-L2", run_id="R", task_id="T2"),
                          [Write("r", content={"v": 1})])
     assert st == Status.UPSTREAM_FAILED
