@@ -187,7 +187,7 @@ class Harness:
         self.state.spawn_depth = spawn_depth
         self.state.max_fanout = max_fanout
         self.state.min_budget_per_child = min_budget_per_child
-        self._spawn_counter = itertools.count(1)
+        self.state.spawn_counter = itertools.count(1)
         # ---- S13d §2.5：Scheduler 模式 + claim 租约 + aging（墙钟）----
         if scheduler_mode not in ("sync", "pool"):
             raise ValueError(f"未知 scheduler_mode：{scheduler_mode!r}（sync|pool）")
@@ -217,9 +217,9 @@ class Harness:
         self.state.claim_lease_ms = claim_ttl
         self.state.pool_workers = int(pool_workers)
         self.state.pool_timeout_s = float(pool_timeout_s)
-        self._tls = threading.local()             # in_worker / depth / worker_id
-        self._worker_ids = itertools.count(1)
-        self._pool = (ThreadPoolExecutor(max_workers=self.pool_workers,
+        self.state.tls = threading.local()             # in_worker / depth / worker_id
+        self.state.worker_ids = itertools.count(1)
+        self.state.pool = (ThreadPoolExecutor(max_workers=self.state.pool_workers,
                                          thread_name_prefix="harness-worker")
                       if scheduler_mode == "pool" else None)
         self.state.lease_ms = int(lease_ms)
@@ -265,7 +265,7 @@ class Harness:
                     "durable_timers=True 需要 WAL/Raft 事件日志（内存日志无法持久）")
             timers = DurableTimer(self.event_log, self.clock)
         self.timers = timers
-        self._timers_fired: list = []
+        self.state.timers_fired: list = []
         # S12 K-43：run 层 epoch store。WAL 模式 → `wal.log.epoch.<run_id>`；
         # 文件 checkpoint 模式 → `store.epoch.<run_id>`（与 store.json 同目录）；
         # 均无 → 纯内存（旧用例）。
@@ -450,7 +450,7 @@ class Harness:
         # S17 MS10：毒任务识别阈值（连续失败 >= N → 直接 DLQ，避免无限重试）
         self.state.poison_after_failures = max(0, int(poison_after_failures))
         self.state.drain_timeout_s = float(drain_timeout_s)
-        self._draining = False
+        self.state.draining = False
         # S21 K-100：本部署的最大租约时长（秒）——墓碑窗口的量纲依据。
         # 必须**向上取整**且覆盖 claim 租约：`lease_ms=1500` 的真实租约是 1.5s，
         # 若向下取整成 1s，墓碑会在旧持有者租约仍有效时被忘记 → fencing 被削弱。
@@ -673,45 +673,15 @@ class Harness:
 
 
     # ---- S1 兼容属性（S5 删除）：收据链状态已迁至 KernelState ----
-    @property
-    def _lock(self):
-        return self.state.lock
 
-    @_lock.setter
-    def _lock(self, value) -> None:
-        self.state.lock = value
 
-    @property
-    def _run_cursors(self):
-        return self.state.run_cursors
 
-    @_run_cursors.setter
-    def _run_cursors(self, value) -> None:
-        self.state.run_cursors = value
 
-    @property
-    def _receipts_flock(self):
-        return self.state.receipts_flock
 
-    @_receipts_flock.setter
-    def _receipts_flock(self, value) -> None:
-        self.state.receipts_flock = value
 
-    @property
-    def _scope_locks(self):
-        return self.state.scope_locks
 
-    @_scope_locks.setter
-    def _scope_locks(self, value) -> None:
-        self.state.scope_locks = value
 
-    @property
-    def _ext_key_locks(self):
-        return self.state.ext_key_locks
 
-    @_ext_key_locks.setter
-    def _ext_key_locks(self, value) -> None:
-        self.state.ext_key_locks = value
 
     @property
     def _receipt_heads(self):
@@ -745,37 +715,13 @@ class Harness:
     def _malformed_receipts(self, value) -> None:
         self.state.malformed_receipts = value
 
-    @property
-    def _receipt_scan_watermark(self) -> int:
-        return self.state.receipt_scan_watermark
 
-    @_receipt_scan_watermark.setter
-    def _receipt_scan_watermark(self, value: int) -> None:
-        self.state.receipt_scan_watermark = value
 
-    @property
-    def _receipt_refresh_lock(self):
-        return self.state.receipt_refresh_lock
 
-    @_receipt_refresh_lock.setter
-    def _receipt_refresh_lock(self, value) -> None:
-        self.state.receipt_refresh_lock = value
 
-    @property
-    def _receipt_scan_failed(self) -> bool:
-        return self.state.receipt_scan_failed
 
-    @_receipt_scan_failed.setter
-    def _receipt_scan_failed(self, value: bool) -> None:
-        self.state.receipt_scan_failed = value
 
-    @property
-    def receipts_enabled(self) -> bool:
-        return self.state.receipts_enabled
 
-    @receipts_enabled.setter
-    def receipts_enabled(self, value: bool) -> None:
-        self.state.receipts_enabled = bool(value)
 
     @property
     def lease_ms(self) -> int:
@@ -820,13 +766,7 @@ class Harness:
         self.state.writer_lease_ok = value
 
 
-    @property
-    def _lease_store(self):
-        return self.state.lease_store
 
-    @_lease_store.setter
-    def _lease_store(self, value) -> None:
-        self.state.lease_store = value
 
     @property
     def _lease_instance(self):
@@ -852,29 +792,11 @@ class Harness:
     def _writer_epoch(self, value: int) -> None:
         self.state.writer_epoch = value
 
-    @property
-    def _lease_outcome(self):
-        return self.state.lease_outcome
 
-    @_lease_outcome.setter
-    def _lease_outcome(self, value) -> None:
-        self.state.lease_outcome = value
 
-    @property
-    def _lease_reason(self):
-        return self.state.lease_reason
 
-    @_lease_reason.setter
-    def _lease_reason(self, value) -> None:
-        self.state.lease_reason = value
 
-    @property
-    def _durable(self) -> bool:
-        return self.state.durable
 
-    @_durable.setter
-    def _durable(self, value: bool) -> None:
-        self.state.durable = value
 
     # ---- 事件 → 订阅失效（文档 §5.6） ----------------------------
     # S1：实现已迁至 `kernel/identity.py::SigningService`（此处仅委托）
@@ -897,29 +819,11 @@ class Harness:
         self.receipts.track_run_cursor(ev)
 
     # ---- 兼容属性（S5 删除）--------------------------------------
-    @property
-    def _auth(self):
-        return self.state.auth
 
-    @_auth.setter
-    def _auth(self, value) -> None:
-        self.state.auth = value
 
-    @property
-    def _auth_secret(self):
-        return self.state.auth_secret
 
-    @_auth_secret.setter
-    def _auth_secret(self, value) -> None:
-        self.state.auth_secret = value
 
-    @property
-    def _event_count(self) -> int:
-        return self.state.event_count
 
-    @_event_count.setter
-    def _event_count(self, value: int) -> None:
-        self.state.event_count = value
 
     # ---- S3.0 兼容属性（S5 删除）：调度/子任务状态已迁至 KernelState ----
     @property
@@ -940,14 +844,7 @@ class Harness:
     def acbs(self, value) -> None:
         self.state.acbs = value
 
-    @property
-    def _paused_runs(self):
-        """S15 D：Admin 暂停的 run 集合（旧 `self._paused_runs: set[str]`）。"""
-        return self.state.paused_runs
 
-    @_paused_runs.setter
-    def _paused_runs(self, value) -> None:
-        self.state.paused_runs = value
 
     # ---- S5-e：Timer 面的两个组件入口（TimerService 在调用时读 `state`）----
     @property
@@ -968,14 +865,7 @@ class Harness:
     def timers(self, value) -> None:
         self.state.timers = value
 
-    @property
-    def _drain_skipped(self):
-        """D11：调度跳过原因（旧 `self._drain_skipped: list[tuple[str, str]]`）。"""
-        return self.state.drain_skipped
 
-    @_drain_skipped.setter
-    def _drain_skipped(self, value) -> None:
-        self.state.drain_skipped = value
 
     @property
     def _tick_skipped(self):
@@ -995,103 +885,32 @@ class Harness:
     def _applied_event_ids(self, value) -> None:
         self.state.applied_event_ids = value
 
-    @property
-    def _admission_index(self):
-        """R6：准入唯一性登记（旧 `self._admission_index: dict[tuple, ACB]`）。"""
-        return self.state.admission_index
 
-    @_admission_index.setter
-    def _admission_index(self, value) -> None:
-        self.state.admission_index = value
 
-    @property
-    def _transition_locks(self):
-        """R7：每 ACB 一把 transition 锁（旧 `dict[str, threading.RLock]`）。"""
-        return self.state.transition_locks
 
-    @_transition_locks.setter
-    def _transition_locks(self, value) -> None:
-        self.state.transition_locks = value
 
-    @property
-    def _children_index(self):
-        """X6：`parent_id → {child_acb_id}`（旧 `dict[str, set[str]]`）。"""
-        return self.state.children_index
 
-    @_children_index.setter
-    def _children_index(self, value) -> None:
-        self.state.children_index = value
 
-    @property
-    def _children_index_built(self) -> bool:
-        return self.state.children_index_built
 
-    @_children_index_built.setter
-    def _children_index_built(self, value: bool) -> None:
-        self.state.children_index_built = value
 
-    @property
-    def _spawn_counter(self):
-        """S3.1：spawn 子 id 序号源（已迁至 KernelState，随 ChildManager 移交）。"""
-        return self.state.spawn_counter
 
-    @_spawn_counter.setter
-    def _spawn_counter(self, value) -> None:
-        self.state.spawn_counter = value
 
     # ---- S3.3 兼容属性（S5 删除）：执行/调度簇的可变状态已迁至 KernelState ----
     # `_tls` 是**线程本地**对象（`threading.local` 本体不会变，只有其上的字段变），
     # 迁入 state 后 DispatchService 与 Harness 读写的是同一个实例。
-    @property
-    def _tls(self):
-        return self.state.tls
 
-    @_tls.setter
-    def _tls(self, value) -> None:
-        self.state.tls = value
 
-    @property
-    def _pool(self):
-        """S3.3：`ThreadPoolExecutor` 仍在 `__init__` 建一次，服务只读不重建。"""
-        return self.state.pool
 
-    @_pool.setter
-    def _pool(self, value) -> None:
-        self.state.pool = value
 
-    @property
-    def _worker_ids(self):
-        return self.state.worker_ids
 
-    @_worker_ids.setter
-    def _worker_ids(self, value) -> None:
-        self.state.worker_ids = value
 
-    @property
-    def _timers_fired(self) -> list:
-        return self.state.timers_fired
 
-    @_timers_fired.setter
-    def _timers_fired(self, value) -> None:
-        self.state.timers_fired = value
 
-    @property
-    def _draining(self) -> bool:
-        return self.state.draining
 
-    @_draining.setter
-    def _draining(self, value) -> None:
-        self.state.draining = value
 
     # ---- S3.0 兼容属性（S5 删除）：可变配置已迁至 KernelState ----
     # 一律透传赋值（不做二次强转）：`__init__` 已完成各自类型转换，行为不变。
-    @property
-    def scheduler_mode(self) -> str:
-        return self.state.scheduler_mode
 
-    @scheduler_mode.setter
-    def scheduler_mode(self, value) -> None:
-        self.state.scheduler_mode = value
 
     @property
     def aging_ms(self) -> int:
@@ -1117,37 +936,13 @@ class Harness:
     def claim_lease_ms(self, value) -> None:
         self.state.claim_lease_ms = value
 
-    @property
-    def pool_workers(self) -> int:
-        return self.state.pool_workers
 
-    @pool_workers.setter
-    def pool_workers(self, value) -> None:
-        self.state.pool_workers = value
 
-    @property
-    def pool_timeout_s(self) -> float:
-        return self.state.pool_timeout_s
 
-    @pool_timeout_s.setter
-    def pool_timeout_s(self, value) -> None:
-        self.state.pool_timeout_s = value
 
-    @property
-    def drain_timeout_s(self) -> float:
-        return self.state.drain_timeout_s
 
-    @drain_timeout_s.setter
-    def drain_timeout_s(self, value) -> None:
-        self.state.drain_timeout_s = value
 
-    @property
-    def hitl_timeout_ms(self) -> int:
-        return self.state.hitl_timeout_ms
 
-    @hitl_timeout_ms.setter
-    def hitl_timeout_ms(self, value) -> None:
-        self.state.hitl_timeout_ms = value
 
     @property
     def max_redrives(self) -> int:
@@ -1157,13 +952,7 @@ class Harness:
     def max_redrives(self, value) -> None:
         self.state.max_redrives = value
 
-    @property
-    def poison_after_failures(self) -> int:
-        return self.state.poison_after_failures
 
-    @poison_after_failures.setter
-    def poison_after_failures(self, value) -> None:
-        self.state.poison_after_failures = value
 
     @property
     def max_fanout(self) -> int:
@@ -1181,21 +970,9 @@ class Harness:
     def min_budget_per_child(self, value) -> None:
         self.state.min_budget_per_child = value
 
-    @property
-    def spawn_depth(self) -> int:
-        return self.state.spawn_depth
 
-    @spawn_depth.setter
-    def spawn_depth(self, value) -> None:
-        self.state.spawn_depth = value
 
-    @property
-    def replan_budget(self) -> int:
-        return self.state.replan_budget
 
-    @replan_budget.setter
-    def replan_budget(self, value) -> None:
-        self.state.replan_budget = value
 
     @property
     def retention(self) -> int:
@@ -1213,13 +990,7 @@ class Harness:
     def max_lease_ttl_s(self, value) -> None:
         self.state.max_lease_ttl_s = value
 
-    @property
-    def _claim_window_exceeded(self) -> int:
-        return self.state.claim_window_exceeded
 
-    @_claim_window_exceeded.setter
-    def _claim_window_exceeded(self, value) -> None:
-        self.state.claim_window_exceeded = value
 
     # ---- RSC 提交（文档 §5.5） ------------------------------------
     # ---- RSC 提交（S2：实现已迁至 kernel/commit.py）--------------------
@@ -1509,7 +1280,7 @@ class Harness:
             self.checkpoints.save(acb)
             return True
         except FencingRejected:
-            self._drain_skipped.append((acb.id, "save_fenced"))
+            self.state.drain_skipped.append((acb.id, "save_fenced"))
             return False
         except Exception:  # noqa: BLE001  # 契约：落盘失败不得跳过后续结算
             return True

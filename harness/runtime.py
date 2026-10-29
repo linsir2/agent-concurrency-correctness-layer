@@ -344,7 +344,7 @@ class AgentRuntime:
         task = plan.get("tasks", {}).get(acb.task_id) if plan else None
         plan_version = (int(task.get("plan_version", 1))
                         if isinstance(task, dict) else 1)
-        deadline_ms = now_ms + int(getattr(self.h, "hitl_timeout_ms", 30_000))
+        deadline_ms = now_ms + int(self.h.state.hitl_timeout_ms)
         acb.hitl_pending = {
             "approval_id": approval_id,
             "deadline_ms": deadline_ms,

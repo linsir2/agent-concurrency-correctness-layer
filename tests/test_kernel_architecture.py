@@ -499,3 +499,40 @@ def test_delegate_scanner_has_teeth():
     # 用同一判定逻辑（避免依赖模块级 _HARNESS_SRC）
     seg = ast.unparse(m)
     assert "return self.tasks." in seg
+
+
+# ---------------------------------------------------------------------------
+# S5-g：状态镜像属性不得再增长
+# ---------------------------------------------------------------------------
+_EXPECTED_PROPERTIES = {
+    "_applied_event_ids", "_lease_instance", "_malformed_receipts",
+    "_receipt_heads", "_receipt_ids", "_tainted_scopes", "_tick_skipped",
+    "_writer_epoch", "_writer_id", "_writer_lease_ok",
+    "acbs", "aging_max_attempts", "aging_ms", "auth", "claim_lease_ms",
+    "comp_journal", "compensation_journal", "definitions", "lease_ms",
+    "lock_timeout_s", "max_fanout", "max_lease_ttl_s", "max_redrives",
+    "min_budget_per_child", "plans", "retention", "timers",
+}
+
+
+def _harness_properties() -> set[str]:
+    src = _HARNESS_PATH.read_text(encoding="utf-8")
+    cls = next(n for n in ast.parse(src).body
+               if isinstance(n, ast.ClassDef) and n.name == "Harness")
+    return {m.name for m in cls.body if isinstance(m, ast.FunctionDef)
+            and any(isinstance(d, ast.Name) and d.id == "property"
+                    for d in m.decorator_list)}
+
+
+def test_no_new_state_mirror_properties():
+    """Harness 上的 @property 集合必须与白名单**完全相等**（增删都红）。"""
+    got = _harness_properties()
+    assert got == _EXPECTED_PROPERTIES, (
+        f"新增: {sorted(got - _EXPECTED_PROPERTIES)}  删除: "
+        f"{sorted(_EXPECTED_PROPERTIES - got)}\n"
+        "状态读取请直接用 h.state.*；不要为新字段加兼容属性。")
+
+
+def test_property_guard_has_teeth():
+    """负对照：空白名单必须判不相等（证明比较不是恒真）。"""
+    assert _harness_properties() != set()

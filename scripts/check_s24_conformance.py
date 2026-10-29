@@ -483,7 +483,7 @@ with tempfile.TemporaryDirectory() as tmp:
     chk("第二个 Harness 被租约拒绝", _h2._writer_lease_ok is False)
     _store.set_fail(True)
     chk("租约后端故障 fail-closed",
-        _h1.leases._renew_writer_lease() is False and _h1._lease_outcome == "unavailable")
+        _h1.leases._renew_writer_lease() is False and _h1.state.lease_outcome == "unavailable")
 
     # S24-11 运行期：timer 只触发一次；定义未知在准入前拒绝
     from harness.clock import ManualClock as _MC
