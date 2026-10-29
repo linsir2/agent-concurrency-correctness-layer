@@ -6,7 +6,17 @@ build-backend = "setuptools.build_meta"
 name = "agent-concurrency-correctness-layer"
 version = "0.1.0"
 description = "多智能体并发正确性层：RSC = OCC + 租约 fencing + 短临界区 + Saga 补偿"
+license = { text = "MIT" }
 requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
 # S11 §0.4 / Q1：egress 库本应放 `dependencies`（必需）—— 「放 optional 等于不装就绕过」。
 # 但本仓库运行环境实测（见 `docs/s11-egress-enforcement.md` §11 环境探测登记）：
 #   - `sandlock` / `py-landlock` 在当前索引**不存在**（`pip install` 无匹配发行版）；

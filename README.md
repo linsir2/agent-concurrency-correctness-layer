@@ -104,3 +104,10 @@ python3 scripts/check_tla.py --jar /tmp/tla2tools.jar   # 5 正确 + 5 反例 + 
 > `scripts/check_tla.py --require` 才会因缺工具链硬失败。
 
 测试覆盖：U1–U4 真实用例、A1–A13 对抗用例（含背压降级）、MS0 出口（seq 单调 + schema 定稿 + 状态机表驱动）、MS7 出口（能力强制）、MS8 出口（I1–I13 一致性校验）。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 linsir2
+
+> 使用前请读 [docs/quickstart.md](docs/quickstart.md) 的「别用它的场景」一节：
+> 单 agent、写入不重叠、只要 trace 的场景，用 git worktree 或 Langfuse 更合适。
