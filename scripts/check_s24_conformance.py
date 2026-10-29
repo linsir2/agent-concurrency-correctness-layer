@@ -34,11 +34,15 @@ def _src(rel: str) -> str:
     return (_ROOT / rel).read_text(encoding="utf-8")
 
 
-def _impl() -> str:
+def _impl(name: str | None = None) -> str:
     """内核实现全文：harness/harness.py + harness/kernel/*.py。
 
     S1–S5 把这些实现拆到多个文件，源码文本断言若只 grep 单文件会假红。
+    `name` 给出时只取**该服务**的文件（`harness/kernel/<name>.py`）——
+    S3 之后实现按服务分文件，断言应钉在「拥有该实现的服务」上。
     """
+    if name is not None:
+        return (_ROOT / "harness/kernel" / f"{name}.py").read_text(encoding="utf-8")
     parts = [(_ROOT / "harness/harness.py").read_text(encoding="utf-8")]
     parts += [p.read_text(encoding="utf-8")
               for p in sorted((_ROOT / "harness/kernel").glob("*.py"))]
@@ -368,7 +372,8 @@ chk("definitions 模块存在", (_ROOT / "harness/definitions.py").exists())
 chk("TIMER 事件已登记", "TIMER_SET" in _src("harness/types.py")
     and "TIMER_FIRED" in _src("harness/types.py")
     and "TIMER_CANCELLED" in _src("harness/types.py"))
-chk("tick 驱动 timer", "self.timers.fire_due(now)" in _impl())
+chk("tick 驱动 timer",
+    "self.deps.timers.fire_due(now)" in _impl("dispatch"))
 chk("内存日志拒绝 durable_timers",
     "需要 WAL/Raft 事件日志" in _impl())
 chk("定义在准入前校验",

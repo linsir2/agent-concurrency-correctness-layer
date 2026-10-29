@@ -77,6 +77,16 @@ class KernelState:
     # 是**可变状态**，不能冻结进 `ChildDeps`（服务在调用时读 `self.state`）。
     spawn_counter: Any = None
 
+    # ---- S3.3：执行 / 调度 / claim fencing（旧 `self._xxx`，dispatch 抽取前置）----
+    # 全是**可变**对象：`drain` 置 `draining`、`tick` 整块替换 `timers_fired`、
+    # `_run_task_pooled` 推进 `worker_ids`、worker 线程写 `tls`。冻结进
+    # `DispatchDeps` 会读到旧值，故一律留在 KernelState，调用时读。
+    tls: Any = None                                   # 旧 `self._tls`
+    pool: Any = None                                  # 旧 `self._pool`（构造期建一次）
+    worker_ids: Any = None                            # 旧 `self._worker_ids`
+    timers_fired: list = field(default_factory=list)   # 旧 `self._timers_fired`
+    draining: bool = False                            # 旧 `self._draining`
+
     # ---- S3.0：可变配置（服务/测试在构造后修改，必须调用时读取）----
     scheduler_mode: str = "sync"
     aging_ms: int = 0
