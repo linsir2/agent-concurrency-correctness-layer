@@ -84,6 +84,14 @@ def check_docs(root: pathlib.Path | None = None) -> list[dict]:
         if f"{total} 条" not in text:
             out.append({"file": rel,
                         "message": f"未引用当前语料条数 {total}（文档可能已过期）"})
+    # 6) README 不得写**易变**的测试计数（passed/failed/xfailed/skipped）
+    #    计数随依赖（pysyncobj/sandlock/mcp）与平台变化，写进正文必然腐化；
+    #    CI 报告是唯一来源。
+    volatile = re.compile(r"\b\d+\s+(?:passed|failed|xfailed|skipped)\b")
+    for ln in _read(root, "README.md").splitlines():
+        if volatile.search(ln):
+            out.append({"file": "README.md",
+                        "message": f"易变测试计数应移除（CI 报告为唯一来源）：{ln.strip()}"})
     return out
 
 
