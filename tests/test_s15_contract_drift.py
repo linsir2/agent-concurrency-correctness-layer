@@ -161,7 +161,7 @@ def test_kernel_services_access_components_via_deps():
     裸 `self.<comp>` 一律判红：组件访问只允许 `self.deps.<comp>`（唯一注入面）。
     """
     kernel_dir = _HARNESS_DIR / "kernel"
-    files = sorted(kernel_dir.glob("*.py"))
+    files = sorted(p for p in kernel_dir.glob("*.py") if p.name != "kernel.py")
     assert len(files) >= 8, f"kernel 模块数异常（{len(files)}）"
 
     bare: list[str] = []

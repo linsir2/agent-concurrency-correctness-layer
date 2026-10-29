@@ -101,7 +101,8 @@ _BASELINE_PUBLIC_SURFACE: frozenset[str] = frozenset({
 # 共用扫描器（全部接受「任意 AST」，以便负对照可喂合成源码）
 # ===========================================================================
 def _kernel_files() -> list[pathlib.Path]:
-    files = sorted(_KERNEL_DIR.glob("*.py"))
+    """kernel 服务模块（排除组合根 kernel.py：Harness 本体不是服务）。"""
+    files = sorted(p for p in _KERNEL_DIR.glob("*.py") if p.name != "kernel.py")
     assert files, f"找不到 kernel 模块（{_KERNEL_DIR}）"
     return files
 
@@ -458,7 +459,7 @@ def test_service_constructors_emit_no_events():
 # ---------------------------------------------------------------------------
 _SERVICE_ATTRS = {"tasks", "children", "dispatch", "recovery", "commit",
                   "receipts", "leases", "identity"}
-_HARNESS_PATH = _ROOT / "harness/harness.py"
+_HARNESS_PATH = _ROOT / "harness/kernel/kernel.py"
 
 
 def _private_service_delegates(tree, src: str) -> list[str]:
