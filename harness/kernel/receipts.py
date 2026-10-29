@@ -4,7 +4,7 @@
 
 依赖：
 - 组件  `deps.event_log` / `deps.workspace`
-- 配置  `deps.epoch_scope` / `deps.receipts_enabled` / `deps.retention`
+- 配置  `deps.epoch_scope` / `deps.retention` / `state.receipts_enabled`
 - 状态  `state.*`（收据 head/id/tainted、scope 锁、外部键锁、游标、粘滞闩锁）
 """
 
@@ -15,16 +15,14 @@ import os
 import threading
 from dataclasses import dataclass
 
-from .state import _NullLock
 from ..spec.receipt import (
     GENESIS_HASH,
     Receipt,
     ReceiptMalformed,
-    build_receipt,
     receipt_hash,
     verify_chain_detailed,
 )
-from ..types import ACB, EventKind, Mode, ReceiptConflict, Result, Status, Write
+from ..types import ACB, EventKind, Mode, Result, Status
 
 
 @dataclass(frozen=True)
@@ -32,7 +30,6 @@ class ReceiptDeps:
     event_log: object
     workspace: object
     epoch_scope: str
-    receipts_enabled: bool
     retention: int
 
 
@@ -203,7 +200,7 @@ class ReceiptChain:
         `_receipt_scan_failed` 并抛 `ReceiptScanFailed`（专用异常）。
         不 append、不改 head、不加 taint（链未污染，无需隔离）。
         """
-        if not self.deps.receipts_enabled:
+        if not self.state.receipts_enabled:
             return
         with self.state.receipt_refresh_lock:
             watermark = self.state.receipt_scan_watermark
@@ -277,6 +274,30 @@ class ReceiptChain:
         if self.deps.epoch_scope != "run":
             return max(0, self.deps.event_log.tail() - self.deps.retention + 1)
         return max(0, self._run_tail(run_id) - self.deps.retention + 1)
+    # ---- 链状态读写（唯一写入者：CommitService 只能经这些方法改链）----
+    def head_of(self, scope: tuple[str, str]) -> str:
+        return self.state.receipt_heads.get(scope, GENESIS_HASH)
+
+    def has_receipt(self, receipt_id: str) -> bool:
+        return receipt_id in self.state.receipt_ids
+
+    def is_tainted(self, scope: tuple[str, str]) -> bool:
+        return scope in self.state.tainted_scopes
+
+    def taint(self, scope: tuple[str, str]) -> None:
+        self.state.tainted_scopes.add(scope)
+
+    def record_commit(self, scope: tuple[str, str], head: str,
+                      issued: list[str], events) -> None:
+        """提交成功后原子更新 head / ids / 扫描水位（水位必须随 append 同步推进）。"""
+        with self.state.receipt_refresh_lock:
+            if self.state.receipts_enabled:
+                self.state.receipt_heads[scope] = head
+                self.state.receipt_ids.update(issued)
+            for e in events:
+                self.state.receipt_scan_watermark = max(
+                    self.state.receipt_scan_watermark, e.seq)
+
     def receipt_secret(self) -> str:
         """收据签名密钥来源：构造参数优先，否则读 env（开关独立于 secret 是否存在）。"""
         if self.state.auth_secret:

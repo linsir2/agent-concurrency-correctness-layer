@@ -9,21 +9,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import threading
-import uuid
 from contextlib import nullcontext
 
 from dataclasses import dataclass
 
-from .state import _NullLock
 from ..storage._lock import (
-    EPOCH_ORDER,
-    STORE_ORDER,
-    WAL_ORDER,
     FencingRejected,
-    _FileLock,
 )
 from ..storage.atomic import atomic_write
 from ..storage.codec import dumps, loads
@@ -32,7 +25,6 @@ from ..storage.lease import (
     LeaseGrant,
     LeaseUnavailable,
 )
-from ..types import Result, Status
 
 
 class EpochStore:
@@ -116,7 +108,6 @@ class LeaseDeps:
     event_log: object
     intents: object
     epoch_scope: str
-    lease_ms: int
     wal_epoch_backend: object | None = None
 
 
@@ -225,7 +216,7 @@ class WriterLeaseService:
             try:
                 grant = self.state.lease_store.acquire(
                     owner=self.state.writer_id, instance=self.state.lease_instance,
-                    now_ms=int(self.deps.clock.now_ms()), ttl_ms=self.deps.lease_ms)
+                    now_ms=int(self.deps.clock.now_ms()), ttl_ms=self.state.lease_ms)
             except LeaseUnavailable:
                 self.state.lease_outcome = UNAVAILABLE
                 self.state.lease_reason = "lease_store_unavailable"
@@ -249,7 +240,7 @@ class WriterLeaseService:
                         self.state.writer_lease_ok = False
                         return False
                     doc = dict(cur)                  # 同写者重入：续期，不 bump epoch
-                    doc["expires_at"] = now + int(self.deps.lease_ms)
+                    doc["expires_at"] = now + int(self.state.lease_ms)
                     atomic_write(path, dumps(doc).encode("utf-8"))
                     self.state.writer_lease_ok = True
                     return True
@@ -269,7 +260,7 @@ class WriterLeaseService:
                     return False
             doc = {"owner": self.state.writer_id,
                    "epoch": epoch,
-                   "expires_at": self.deps.clock.now_ms() + int(self.deps.lease_ms)}
+                   "expires_at": self.deps.clock.now_ms() + int(self.state.lease_ms)}
             parent = os.path.dirname(path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
@@ -287,7 +278,7 @@ class WriterLeaseService:
                 grant = self.state.lease_store.renew(
                     owner=self.state.writer_id, instance=self.state.lease_instance,
                     epoch=self.state.writer_epoch, now_ms=int(self.deps.clock.now_ms()),
-                    ttl_ms=self.deps.lease_ms)
+                    ttl_ms=self.state.lease_ms)
             except LeaseUnavailable:
                 self.state.lease_outcome = UNAVAILABLE
                 self.state.lease_reason = "lease_store_unavailable"
@@ -304,7 +295,7 @@ class WriterLeaseService:
             now = self.deps.clock.now_ms()
             if cur is not None and cur.get("owner") == self.state.writer_id:
                 doc = dict(cur)
-                doc["expires_at"] = now + int(self.deps.lease_ms)
+                doc["expires_at"] = now + int(self.state.lease_ms)
                 atomic_write(path, dumps(doc).encode("utf-8"))
                 self.state.writer_lease_ok = True
                 return True
@@ -380,7 +371,7 @@ class WriterLeaseService:
                 grant = self.state.lease_store.advance(
                     owner=self.state.writer_id, instance=self.state.lease_instance,
                     epoch=self.state.writer_epoch, now_ms=int(self.deps.clock.now_ms()),
-                    ttl_ms=self.deps.lease_ms)
+                    ttl_ms=self.state.lease_ms)
                 if not grant.ok:
                     raise FencingRejected(
                         f"lease advance 被拒：{grant.outcome}:{grant.reason}")

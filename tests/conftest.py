@@ -72,7 +72,7 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
     if toolgw is not None:
         h.toolgw = toolgw
     if compensate_crash_at is not None:
-        _orig_run_one = h._run_one_compensation
+        _orig_run_one = h.commit._run_one_compensation
         _counter = itertools.count(1)
 
         def _crashy(acb, e, w=None, _orig=_orig_run_one, _n=compensate_crash_at):
@@ -80,7 +80,8 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
                 raise CrashInjected(0, 0)
             return _orig(acb, e, w)
 
-        h._run_one_compensation = _crashy
+        # S2：补偿已迁到 CommitService，打桩必须打在服务的可替换接缝上
+        h.commit.run_one_hook = _crashy
     h.policy.default_token = h.policy.issue(
         "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
     return h

@@ -26,7 +26,10 @@ class _NullLock:
 
 
 class _SpawnAbort(Exception):
-    """C1：spawn ② 事务的「明确拒绝」信号（非崩溃），由回滚分支转成 failure。"""
+    """C1：spawn ② 事务的「明确拒绝」信号（非崩溃），由回滚分支转成 failure。
+
+    TODO(S3)：这是控制流异常，不是状态；S3 抽取 ChildManager 时移到 kernel/children.py。
+    """
 
 
 @dataclass
@@ -63,3 +66,5 @@ class KernelState:
     # ---- 可变配置 / 可替换组件（调用时读取，不得冻结进 deps）----
     lock_timeout_s: float = 5.0
     comp_journal: Any = None
+    receipts_enabled: bool = True
+    lease_ms: int = 60_000

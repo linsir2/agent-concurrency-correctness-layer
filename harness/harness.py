@@ -6,13 +6,11 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import itertools
 import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 
 from .auth import Signer
 from .budget import BudgetManager, InvariantError, Reservation, _is_budget_kind
@@ -33,12 +31,11 @@ from .kernel.commit import CommitDeps, CommitService
 from .kernel.identity import IdentityDeps, SigningService
 from .kernel.leases import EpochStore, LeaseDeps, WriterLeaseService
 from .kernel.receipts import (
-    _EXT_KEY_CONFLICT,
     ReceiptChain,
     ReceiptDeps,
     ReceiptScanFailed,
 )
-from .kernel.state import KernelState, _NullLock, _SpawnAbort
+from .kernel.state import KernelState, _SpawnAbort
 from .llm import LLMClient
 from .orchestration import (
     _UNSET,
@@ -59,31 +56,17 @@ from .policy import (
     Scope,
     attenuate_token,
 )
-from .rebase import DELETE
 from .resolver import ScriptedResolver
-from .runtime import AgentRuntime, CrashInjected
-from .spec.receipt import (
-    GENESIS_HASH,
-    Receipt,
-    ReceiptMalformed,
-    build_receipt,
-    receipt_hash,
-    verify_chain_detailed,
-)
+from .runtime import AgentRuntime
 from .storage._lock import (
     RECEIPTS_ORDER,
     FencingRejected,
     _FileLock,
     receipts_lock_path,
 )
-from .storage.atomic import atomic_write
-from .storage.blob import InMemoryBlobStore, canonical_bytes
-from .storage.codec import CodecError, dumps, loads
+from .storage.blob import InMemoryBlobStore
 from .storage.lease import (
-    UNAVAILABLE,
-    LeaseGrant,
     LeaseStore,
-    LeaseUnavailable,
 )
 from .subscription import SubscriptionRegistry
 from .timer import DurableTimer
@@ -92,7 +75,6 @@ from .types import (
     TASK_TERMINAL,
     EventKind,
     Mode,
-    ReceiptConflict,
     Result,
     ResultEnvelope,
     Status,
@@ -231,7 +213,7 @@ class Harness:
         self._pool = (ThreadPoolExecutor(max_workers=self.pool_workers,
                                          thread_name_prefix="harness-worker")
                       if scheduler_mode == "pool" else None)
-        self.lease_ms = lease_ms
+        self.state.lease_ms = int(lease_ms)
         self.guard_every = guard_every
         self.aging_max = aging_max
         self.max_steps = max_steps
@@ -330,7 +312,6 @@ class Harness:
             LeaseDeps(budget=self.budget, checkpoints=self.checkpoints,
                       clock=self.clock, event_log=self.event_log,
                       intents=self.intents, epoch_scope=self.epoch_scope,
-                      lease_ms=self.lease_ms,
                       wal_epoch_backend=self._wal_epoch_backend),
             self.state)
         # S10b §3.4：WAL append 的 fencing（同一 flock 内复验 run 级 epoch）
@@ -373,11 +354,10 @@ class Harness:
             self.state)
         self.policy._signer_factory = self.identity.get_signer
         # S1：收据链服务（构造顺序：event_log → workspace → policy → receipts）
-        self.receipts_enabled = receipts_enabled
+        self.state.receipts_enabled = bool(receipts_enabled)
         self.receipts = ReceiptChain(
             ReceiptDeps(event_log=self.event_log, workspace=self.workspace,
                         epoch_scope=self.epoch_scope,
-                        receipts_enabled=self.receipts_enabled,
                         retention=self.retention),
             self.state)
         self.identity.bind_receipts(self.receipts)
@@ -386,10 +366,9 @@ class Harness:
             CommitDeps(workspace=self.workspace, intents=self.intents,
                        blobs=self.blobs, event_log=self.event_log,
                        receipts=self.receipts, leases=self.leases,
-                       claim_guard=self._claim_fenced,
-                       definition_check=self.check_definition,
-                       lease_ms=self.lease_ms,
-                       receipts_enabled=self.receipts_enabled),
+                       # late lookup：保留「构造后替换实例方法仍生效」的旧语义
+                       claim_guard=lambda acb: self._claim_fenced(acb),
+                       definition_check=lambda ref: self.check_definition(ref)),
             self.state)
         self._sync_run_cursors()          # S12 K-33：从既有事件初始化 per-run 游标
         self.context = (context if context is not None
@@ -452,7 +431,6 @@ class Harness:
         self._children_index: dict[str, set[str]] = {}
         self._children_index_built = False
         # S9 §2.3：收据链（每 scope 一把 RLock；head/id 由 EventLog 重建）
-        self.receipts_enabled = receipts_enabled
         # 锁序写死：resource → scope → eventlog（docs s9 §2.3.5）。
         # **durable 模式为单写者**：`_scope_lock` 是**进程内** `threading.RLock`，
         # 跨进程**不互斥**；`WalEventLog.append_batch` 的 `_lock` 同理。跨进程
@@ -717,6 +695,22 @@ class Harness:
         self.state.receipt_scan_failed = value
 
     @property
+    def receipts_enabled(self) -> bool:
+        return self.state.receipts_enabled
+
+    @receipts_enabled.setter
+    def receipts_enabled(self, value: bool) -> None:
+        self.state.receipts_enabled = bool(value)
+
+    @property
+    def lease_ms(self) -> int:
+        return self.state.lease_ms
+
+    @lease_ms.setter
+    def lease_ms(self, value: int) -> None:
+        self.state.lease_ms = int(value)
+
+    @property
     def comp_journal(self):
         return self.state.comp_journal
 
@@ -736,6 +730,10 @@ class Harness:
     def compensation_journal(self):
         """S2：补偿日志已随 CommitService 迁移（旧的可观测视图）。"""
         return self.commit.compensation_journal
+
+    @compensation_journal.setter
+    def compensation_journal(self, value) -> None:
+        self.commit.compensation_journal = value
 
     # ---- S1 兼容属性（S5 删除）：写者租约状态已迁至 KernelState ----
     @property

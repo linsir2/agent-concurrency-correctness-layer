@@ -23,7 +23,7 @@ from .receipts import _EXT_KEY_CONFLICT, ReceiptScanFailed
 from .state import _NullLock
 from ..rebase import DELETE
 from ..runtime import CrashInjected
-from ..spec.receipt import GENESIS_HASH, build_receipt, receipt_hash
+from ..spec.receipt import build_receipt, receipt_hash
 from ..storage._lock import FencingRejected
 from ..storage.blob import canonical_bytes
 from ..storage.codec import CodecError
@@ -42,8 +42,6 @@ class CommitDeps:
     # 不做 kernel 反向依赖。
     claim_guard: Callable[[ACB], bool]
     definition_check: Callable[[Any], str]
-    lease_ms: int
-    receipts_enabled: bool
 
 
 @dataclass
@@ -71,6 +69,8 @@ class CommitService:
         self.deps = deps
         self.state = state
         self.compensation_journal: list[dict] = []   # 文档 §5.4（兼容视图）
+        # 可替换的补偿单条执行器（崩溃注入 / 测试打桩的稳定接缝）
+        self.run_one_hook = self._run_one_compensation
 
     # ------------------------------------------------------------------ 编排
     def commit_batch(self, acb: ACB, writes: list[Write],
@@ -95,6 +95,11 @@ class CommitService:
 
     # ------------------------------------------------------- ① 前哨 + 输入校验
     def _phase_preflight(self, ctx: _CommitCtx) -> Result | None:
+        """① 前哨 + 输入校验。
+
+        **必须在 try/finally 之外调用**：本阶段不得获取锁/租约/写 blob，
+        因此它的早退不需要 cleanup。若将来在此处加副作用，必须移进 try。
+        """
         acb = ctx.acb
         if not ctx.writes:
             return Result(Status.OK, {"noop": True, "seq": None})
@@ -147,7 +152,7 @@ class CommitService:
         for w in ctx.writes:                                       # ② 预留租约（L0）
             base = self.deps.workspace._base_of(ctx.acb, w.resource)
             lease = self.deps.intents.reserve(
-                w.resource, ctx.acb.id, base, self.deps.lease_ms,
+                w.resource, ctx.acb.id, base, self.state.lease_ms,
                 run_id=ctx.acb.run_id)
             if lease is None:
                 return Result(Status.DENIED, {"resource": w.resource})
@@ -256,24 +261,24 @@ class CommitService:
                          if not dedup]
 
             # P2：tainted scope 拒绝继续扩展（不得接在坏 head 上）
-            if ctx.scope in self.state.tainted_scopes:
+            if self.deps.receipts.is_tainted(ctx.scope):
                 raise ReceiptConflict(
                     f"scope 已隔离（tainted），拒绝扩展：{ctx.scope}")
 
-            head = self.state.receipt_heads.get(ctx.scope, GENESIS_HASH)
+            head = self.deps.receipts.head_of(ctx.scope)
             secret = self.deps.receipts.receipt_secret()
             drafts: list[dict] = []
             for w, draft, version_before, version_after, commit_key in to_append:
                 drafts.append(draft)
-                if not self.deps.receipts_enabled:
+                if not self.state.receipts_enabled:
                     continue
                 # P0-3：append 前断言 receipt_id 不冲突
-                if (commit_key in self.state.receipt_ids
+                if (self.deps.receipts.has_receipt(commit_key)
                         and self.deps.receipts.receipt_is_stale(commit_key)):
                     commit_key = self.deps.receipts.derive_receipt_id(commit_key)
-                if commit_key in self.state.receipt_ids:
+                if self.deps.receipts.has_receipt(commit_key):
                     # P2-C：冲突必须把 scope 加入 tainted（否则永久 ReceiptConflict）
-                    self.state.tainted_scopes.add(ctx.scope)
+                    self.deps.receipts.taint(ctx.scope)
                     raise ReceiptConflict(
                         f"receipt_id 已签发：{commit_key}（scope={ctx.scope}）")
                 receipt = build_receipt(
@@ -304,14 +309,9 @@ class CommitService:
             # S12 K-33：notify=False → 主动推进 per-run 游标
             for ev in ctx.events:
                 self.deps.receipts.track_run_cursor(ev)
-            # ③ head 后置提交：append 成功后才改内存态
-            with self.state.receipt_refresh_lock:
-                if self.deps.receipts_enabled:
-                    self.state.receipt_heads[ctx.scope] = head
-                    self.state.receipt_ids.update(ctx.issued)
-                for e in ctx.events:
-                    self.state.receipt_scan_watermark = max(
-                        self.state.receipt_scan_watermark, e.seq)
+            # ③ head 后置提交：append 成功后才改内存态（唯一写入者 = ReceiptChain）
+            self.deps.receipts.record_commit(
+                ctx.scope, head, ctx.issued, ctx.events)
         return None
 
     # ------------------------------------------------------------ ⑦ 投影 + 成功
@@ -414,7 +414,7 @@ class CommitService:
         self.deps.intents.revoke_all(acb.id)
         by_id = {e.comp_id: w for e, w in zip(entries, applied)}
         for e in reversed(entries):
-            self._run_one_compensation(acb, e, by_id.get(e.comp_id))
+            self.run_one_hook(acb, e, by_id.get(e.comp_id))
 
     def _run_one_compensation(self, acb: ACB, e, w: Write | None = None) -> None:
         """单条补偿（§4.2）：先按 journal 状态分支，再按 hash / 版本号判定。"""

@@ -18,6 +18,7 @@ import pytest
 from conftest import make_harness
 
 from harness.kernel.commit import CommitService
+from harness.runtime import CrashInjected
 from harness.types import ACB, ReceiptConflict, Status, Write
 
 ORDER = ["_phase_preflight", "_phase_acquire", "_phase_records",
@@ -115,3 +116,71 @@ def test_cleanup_on_receipt_conflict(monkeypatch):
     assert h.intents.active_intents("r") == [], "租约泄漏（finally 未执行）"
     assert h.workspace.get("r") == "v1", "失败提交不得写入"
     assert notified == [], "events 为 None 时不得 notify"
+
+
+def test_order_checker_has_teeth(monkeypatch):
+    """负对照（真正走 commit）：人为把 project 提前调用 → 顺序断言必须触发。
+
+    上一版负对照只比较两个 Python list，无法证明「阶段乱序会被发现」。
+    这里真的让 commit_batch 走乱序路径，再断言记录到的序列非常规。
+    """
+    h = make_harness()
+    acb = _acb()
+    acb.staged["r"] = "v"
+    acb.base_version["r"] = 0
+
+    seen: list[str] = []
+    for name in ORDER:
+        orig = getattr(CommitService, name)
+
+        def wrapper(self, ctx, _n=name, _f=orig):
+            seen.append(_n)
+            return _f(self, ctx)
+
+        monkeypatch.setattr(CommitService, name, wrapper)
+
+    # 取「已被 recorder 包裹」的 preflight 作为原实现，保证 preflight 仍被记录
+    wrapped_preflight = CommitService._phase_preflight
+
+    def bad_preflight(self, ctx):
+        try:
+            CommitService._phase_project(self, ctx)  # 乱序：project 提前
+        except Exception:  # noqa: BLE001  # 提前投影必然失败，只关心它被执行过
+            pass
+        return wrapped_preflight(self, ctx)
+
+    monkeypatch.setattr(CommitService, "_phase_preflight", bad_preflight)
+    try:
+        h.commit_batch(acb, [Write("r")])
+    except Exception:  # noqa: BLE001  # 乱序必然在某处失败，这里只关心序列
+        pass
+
+    assert not _canonical_order(seen), f"乱序未被发现：{seen}"
+    assert seen[:2] == ["_phase_project", "_phase_preflight"], seen
+
+
+def test_compensation_crash_hook_is_reachable():
+    """补偿单条执行器必须可替换（conftest 的崩溃注入依赖这个接缝）。
+
+    这个用例存在的理由：S2 之后 conftest 仍打在 `h._run_one_compensation` 上，
+    服务内部自调用绕过它 → 崩溃注入静默失效，而相关用例在缺 hypothesis 时被 skip
+    （假绿）。这里用最小场景把接缝钉死。
+    """
+    h = make_harness()
+    acb = _acb()
+    acb.staged["r"] = "v"
+    acb.base_version["r"] = 0
+    assert h.commit_batch(acb, [Write("r")]) == Status.OK
+    applied = [Write("r", content="v", version_before=0,
+                     applied_hash=h.workspace.content_hash("r"))]
+
+    fired: list[str] = []
+
+    def hook(acb_, entry, write=None):
+        fired.append(entry.comp_id)
+        raise CrashInjected(0, 0)
+
+    h.commit.run_one_hook = hook
+    with pytest.raises(CrashInjected):
+        h.compensate(acb, applied)
+    assert fired, "补偿钩子未被调用：崩溃注入接缝失效"

@@ -35,7 +35,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .harness import _EXT_KEY_CONFLICT
+from .kernel.receipts import _EXT_KEY_CONFLICT
 from .merge_queue import QUEUE_FULL, MergeQueue
 from .rebase import DELETE
 from .semantic import detect as _detect_semantics
