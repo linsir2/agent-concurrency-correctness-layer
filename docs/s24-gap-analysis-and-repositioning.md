@@ -55,7 +55,7 @@ python3 -m pytest -q tests/test_s24_determinism.py    # 同 seed 逐字节重放
 | Z3 私有 worktree | design §0.1 | ✅ `harness/worktree.py` |
 | 收据签名链 | design §18.3 | ✅ `harness/spec/receipt.py` |
 | **VerifierRunner / 语义验证** | design §4.2、milestones §「VerifierRunner（独立上下文校验）」标 P2/MS5「当前无」 | ✅ S24-1：`session.verify` + `verify_cmd` 自动门禁；语义冲突由 `harness/semantic.py` 静态拦截 |
-| 四件套对外（TLA+ / corpus / CLI） | 定位 §6.3、design §18.4 | ✅ `harness/spec/conformance/`（35 条语言无关向量 + manifest）、`python3 -m harness.diagnose`、`spec/tla/`（I1/I2/I4/I7 + TLC 反例） |
+| 四件套对外（TLA+ / corpus / CLI） | 定位 §6.3、design §18.4 | ✅ `harness/spec/conformance/`（47 条语言无关向量 + manifest）、`python3 -m harness.diagnose`、`spec/tla/`（I1/I2/I3/I4/I7 + I1 活性 + TLC 反例） |
 | 跨主机租约复制 | 定位 §6.5、S21 明确「不做 → K-103」 | ✅ S24-8：`LeaseState` 纯状态机 + `MemoryLeaseStore`（同进程）/ `RaftLeaseStore`（共识复制，与 `_ReplicatedLeaseLog` 同一 RSM）；旧 epoch 的续租与提交被拒；缺 pysyncobj 时 fail-closed |
 | 多租户 / 计量 / Admin | 定位 §6.5 | ✅ S20/S15/S17 |
 | 宿主适配（LangGraph/CrewAI/OpenAI/AG2/MCP/HTTP） | 定位 §6.2 阶段一交付物、§6.4 MVP | ✅ S22/S23 |
@@ -79,7 +79,7 @@ MS0–MS10 均已收口（S0–S18），阶段三（S19–S21）、被集成层�
 | 2 | 语义冲突检测 | 文本合并不冲突但符号不兼容（改名/签名变更）是我们**唯一能超过 git** 的地方 | 对候选改动做符号级 diff：删除/改名的符号是否仍被引用 |
 | 3 | merge queue 集成 | 并行度与串行安全兼得；CAS 提交点天然是 enqueue 点 | 提交成功后 rebase 到队首 + 回写验证结果 |
 | 4 | 规范对外化（corpus / `rsc-diagnose` / CI merge-gate） | 别人能自测，才谈得上「层」 | 导出 `harness/spec` 语料 + 一个只读 CLI |
-| 5 | TLA+ 模型 | 并发正确性缺形式化背书，说服力弱 | I1/I2/I4/I7 四个模型 + TLC |
+| 5 | TLA+ 模型 | 并发正确性缺形式化背书，说服力弱 | I1/I2/I3/I4/I7 五个模型 + I1 活性 + TLC |
 | 6 | 跨主机租约复制 | 阶段三卖点（多机）目前只有事件/预算跨主机 | `RaftIntentRegistry` + 旧 fence 被拒用例 |
 | 7 | 真实基准（LLM/token） | 差异化缺少数据 | 小样本真模型回放，报 token 倍数与返工率 |
 | 8 | 确定性原语 | 重放不可复现，影响审计可信度 | 注入 `clock`/`uuid` 的 seeded 版本 |
@@ -144,9 +144,9 @@ RscSession（版本、预算、收据、Z3 私有工作区）
 | S24-2 | 适配器接入：`RscSession(verify_cmd=...)` 后 `apply` 自动先跑验证（无需改适配器代码） | ✅ 已生效；sidecar/MCP 响应新增 `verified` |
 | S24-3 | 符号级语义冲突检测：删除/改名符号仍被引用 → `Deny(semantic_conflict)`（不执行代码、零依赖、仅 Python） | ✅ 已实现（`harness/semantic.py` + `semantic=off|warn|block`），22 个用例 |
 | S24-4 | 进程内 merge queue：单写者 FIFO，「出队 → 最新账本重验 → 提交」串成一步 | ✅ 已实现（`harness/merge_queue.py` + `apply_queued`），9 个用例 |
-| S24-5 | 合规语料：`harness/spec/conformance/`（manifest + 35 条语言无关向量 + runner 协议），`python3 -m harness.spec.corpus --check` 防漂移 | ✅ 已实现，17 个用例 |
+| S24-5 | 合规语料：`harness/spec/conformance/`（manifest + 47 条语言无关向量 + runner 协议），`python3 -m harness.spec.corpus --check` 防漂移 | ✅ 已实现，17 个用例 |
 | S24-6 | 只读诊断 `rsc-diagnose`：WAL 完整性/seq、租约 epoch、收据链、版本流、幂等键、token、store；退出码 0/1/2 | ✅ 已实现，16 个用例 |
-| S24-7 | TLA+ 最小模型 I1/I2/I4/I7 + TLC 反例（jar/Java 可选，主门禁不依赖 Java） | ✅ 已实现，4 正确 + 4 broken 实跑 |
+| S24-7 | TLA+ 最小模型 I1/I2/I4/I7 + TLC 反例（jar/Java 可选，主门禁不依赖 Java）；S24-P1 补 I3 + I1 活性 | ✅ 已实现，5 正确 + 5 broken + 2 活性实跑 |
 | S24-8 | 跨主机租约复制：`LeaseState` 纯状态机 + `MemoryLeaseStore` + `RaftLeaseStore`；接管 epoch+1，旧 epoch 续租/提交被拒；缺依赖 fail-closed | ✅ 已实现，18 个用例（含真实 3 节点 Raft） |
 | S24-9 | 真实 token 基准：`LLMReply` 保留上游 usage → `bench/llm_replay.py` 录制 + 离线回放；报 token 倍数与返工率（n=1，不声称显著） | ✅ 已实现（实测 1.39× / 0.33），17 个用例 |
 | S24-10 | 确定性原语：`Deterministic(seed)` 域隔离 id + 单调时钟，注入 event_id/run_id/预算/WAL generation；同 seed 逐字节重放 | ✅ 已实现，11 个用例 |
@@ -213,7 +213,7 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 |---|---|
 | 验证的是**文件视图** | 只叠加「路径已存在于候选副本」的账本资源；纯 JSON/非文件资源不参与合并视图 |
 | 不替代 CI | 只跑你给的一条命令；耗时 = 一次全量检查，接受不了就配更快的子集 |
-| 静态检测只覆盖「名字消失」 | 签名/行为变化、类成员、动态引用查不到（S24-3 明确不做，交给 `verify`） |
+| 静态检测只覆盖「名字消失」 | S24-P1 已补签名不兼容/类成员删除；动态引用、继承/duck typing 仍查不到（交给 `verify`） |
 | 副本复制成本 | 大仓库每次 `apply` 复制一棵树；可用 `verify_cmd=None` + 显式 `verify()` 控制频率 |
 
 **不做**：语义 diff 的全量程序分析、替代 CI、替代 git 合并。
@@ -221,8 +221,8 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
 ### 5.6 S24-5 合规语料（`harness/spec/conformance/`）
 
 - **形态**：`manifest.json`（版本 + 每文件 sha256 + 总数）+ `vectors/*.json`（协议 8 /
-  资源 15 / 收据构建 4 / 链校验 8）+ `invariants.json`（I1–I14 目录）。
-  共 **35 条向量**，每条含 `id / kind / description / invariants / input / expect`。
+  资源 15 / 收据构建 4 / 链校验 8 / fencing 6 / plan 6）+ `invariants.json`（I1–I14 目录）。
+  共 **47 条向量**，每条含 `id / kind / description / invariants / input / expect`。
 - **语言无关**：向量只依赖 JSON 解析；`README.md` 给出 runner 协议（`kind` 分派表、
   canonical payload、HMAC 算法、三态语义）。第三方实现不需要读 Python 代码。
 - **冻结期望**：收据向量的 `payload_sha256` 与 `signature` 是字面量，**不由实现现场生成**；
@@ -230,7 +230,7 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
   任何 canonical 化/签名漂移都会以 `drift` 报出。`--write` 是显式的开发动作。
 - **版本规则**：加字段/加向量 = minor；删改语义 = major；下游按 `corpus_version` 钉住。
 - **诚实边界**：I6/I8–I12/I14 需真实调度或崩溃注入，只在 `invariants.json` 登记测试名，
-  **不伪造纯函数向量**；当前可执行不变量为 I1/I2/I13。
+  **不伪造纯函数向量**；当前可执行不变量为 I1/I2/I3/I9/I13。
 
 ### 5.7 S24-6 只读诊断（`python3 -m harness.diagnose`）
 
@@ -299,8 +299,15 @@ session = RscSession(h, worktrees=WorktreeManager(repo, wt_dir),
   `bench/fixtures/llm_replay.json`（`provenance=live`），回放完全离线且逐值可重算。
 - **口径纪律**：naive 的 token 少是因为它**丢写**；必须与 `success/lost_update` 同表呈现，
   不得单独拿「token 倍数」说优劣。n=1、每条件 2–3 turn，**不做显著性声明**。
-- **注意**：该模型把「思考」计入 `completion_tokens`（`reasoning_tokens` 约 674/920），
-  `max_tokens=64` 并未真正限制总 completion；报告单列 `reasoning_tokens`。
+- **S24-P1 n=5（2026-10-29，thinking 关闭）**：`capture_live(n=5)` 透传
+  `enable_thinking=false`，逐样本落 `finish_reason`；5 个有效样本、无 `length` 截断、
+  `reasoning_tokens=0`。产物：`bench/fixtures/llm_replay.n5.json`（v2）与
+  `bench/llm_replay.n5.md`。本机实测 **token 倍数中位数 1.5446×、极差 0**
+  （temperature=0 下 5 次调用逐 token 相同，这是**描述性**结果，不作显著性结论）。
+  **与上面的 n=1/1.3909× 不可直接比**：v1 默认 thinking 开启，v2 明确关闭。
+- **注意**：该模型在 thinking 开启时把「思考」计入 `completion_tokens`
+  （v1 的 `reasoning_tokens` 约 674/920），`max_tokens=64` 并未真正限制总 completion；
+  报告单列 `reasoning_tokens`。v2 关闭后该字段为 0。
 - **不做**：大规模评测、多模型横评、把回放数字写成 live、缺 usage 时按字符估算。
 
 ### 5.11 S24-10 确定性原语（`harness/entropy.py`）

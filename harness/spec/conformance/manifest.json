@@ -1,6 +1,16 @@
 {
-  "corpus_version": "1.0.0",
+  "corpus_version": "1.1.0",
   "files": [
+    {
+      "path": "vectors/fencing.json",
+      "sha256": "6205b1da05f025d7bd6ccad8fa040a010be8a35850bbf372b95d2cb670659e47",
+      "vectors": 6
+    },
+    {
+      "path": "vectors/plan.json",
+      "sha256": "a69db7770f24f9e5c6df753f9c2ee992d950c0724f9e385a408a648fa8f929ed",
+      "vectors": 6
+    },
     {
       "path": "vectors/protocol.json",
       "sha256": "8482ed295f599752601e589455f277176fb1d83cc5c2ea22eeda280482867e91",
@@ -28,10 +38,12 @@
     "executable_invariants": [
       "I1",
       "I13",
-      "I2"
+      "I2",
+      "I3",
+      "I9"
     ],
-    "files": 4,
+    "files": 6,
     "invariants": 14,
-    "vectors": 35
+    "vectors": 47
   }
 }

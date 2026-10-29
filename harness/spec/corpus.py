@@ -28,13 +28,14 @@ from .receipt import Receipt, build_receipt, verify_chain_detailed
 from .resources import RESOURCE_KINDS, ResourceKind, ResourceSpec, resource_kind
 
 SCHEMA_VERSION = 1
-CORPUS_VERSION = "1.0.0"
+CORPUS_VERSION = "1.1.0"
 SPEC_VERSION = "1.0.0"
 
 # 语料目录（相对 `harness/spec/`）
 CORPUS_ROOT = pathlib.Path(__file__).resolve().parent / "conformance"
 _VECTOR_FILES = ("vectors/protocol.json", "vectors/resources.json",
                  "vectors/receipt-build.json", "vectors/receipt-verify.json",
+                 "vectors/fencing.json", "vectors/plan.json",
                  "invariants.json")
 
 # 冻结用例里使用的签名密钥（公开值，不是生产 secret）
@@ -97,6 +98,93 @@ def _resource_vectors() -> list[dict]:
             "expect": {"kind": expect},
         })
     return out
+
+
+def _fencing_vectors() -> list[dict]:
+    """I3：真实 `LeaseState` 的确定性 trace（epoch 单调 + 旧 epoch 被拒）。"""
+    def vec(vid, desc, ops, epochs, outcomes, authorized):
+        return {"id": vid, "kind": "fencing.trace", "description": desc,
+                "invariants": ["I3"], "input": {"ops": ops},
+                "expect": {"epochs": epochs, "outcomes": outcomes,
+                           "authorized": authorized}}
+
+    return [
+        vec("fencing.takeover",
+            "advance 后旧 epoch 的 acquire 被 fence；旧 epoch 不再授权",
+            [{"op": "acquire", "owner": "A", "instance": "i1",
+              "now_ms": 0, "ttl_ms": 10},
+             {"op": "advance", "owner": "A", "instance": "i1", "epoch": 1,
+              "now_ms": 10, "ttl_ms": 10},
+             {"op": "acquire", "owner": "B", "instance": "i2",
+              "now_ms": 10, "ttl_ms": 10, "expected_epoch": 1},
+             {"op": "authorizes", "owner": "A", "instance": "i1",
+              "epoch": 1, "now_ms": 10}],
+            [1, 2, 2], ["acquired", "advanced", "fenced"], [False]),
+        vec("fencing.expire",
+            "租约过期后接管 epoch+1；旧持有者不再授权",
+            [{"op": "acquire", "owner": "A", "instance": "i1",
+              "now_ms": 0, "ttl_ms": 10},
+             {"op": "acquire", "owner": "B", "instance": "i2",
+              "now_ms": 20, "ttl_ms": 10},
+             {"op": "authorizes", "owner": "A", "instance": "i1",
+              "epoch": 1, "now_ms": 20}],
+            [1, 2], ["acquired", "acquired"], [False]),
+        vec("fencing.renew",
+            "同持有者续租 epoch 不变，仍授权",
+            [{"op": "acquire", "owner": "A", "instance": "i1",
+              "now_ms": 0, "ttl_ms": 10},
+             {"op": "renew", "owner": "A", "instance": "i1", "epoch": 1,
+              "now_ms": 5, "ttl_ms": 10},
+             {"op": "authorizes", "owner": "A", "instance": "i1",
+              "epoch": 1, "now_ms": 10}],
+            [1, 1], ["acquired", "renewed"], [True]),
+        vec("fencing.release",
+            "主动释放后 epoch 保留；新持有者 epoch+1，旧 epoch 失效",
+            [{"op": "acquire", "owner": "A", "instance": "i1",
+              "now_ms": 0, "ttl_ms": 10},
+             {"op": "release", "owner": "A", "instance": "i1", "epoch": 1},
+             {"op": "acquire", "owner": "B", "instance": "i2",
+              "now_ms": 1, "ttl_ms": 10},
+             {"op": "authorizes", "owner": "A", "instance": "i1",
+              "epoch": 1, "now_ms": 1}],
+            [1, 1, 2], ["acquired", "released", "acquired"], [False]),
+        vec("fencing.stale_acquire",
+            "expected_epoch 落后 → fenced，epoch 不变；当前持有者仍授权",
+            [{"op": "acquire", "owner": "A", "instance": "i1",
+              "now_ms": 0, "ttl_ms": 10},
+             {"op": "acquire", "owner": "B", "instance": "i2",
+              "now_ms": 0, "ttl_ms": 10, "expected_epoch": 999},
+             {"op": "authorizes", "owner": "A", "instance": "i1",
+              "epoch": 1, "now_ms": 0}],
+            [1, 1], ["acquired", "fenced"], [True]),
+        vec("fencing.monotonic",
+            "连续 advance 三次：epoch 严格 +1",
+            [{"op": "acquire", "owner": "A", "instance": "i1",
+              "now_ms": 0, "ttl_ms": 10},
+             {"op": "advance", "owner": "A", "instance": "i1", "epoch": 1,
+              "now_ms": 1, "ttl_ms": 10},
+             {"op": "advance", "owner": "A", "instance": "i1", "epoch": 2,
+              "now_ms": 2, "ttl_ms": 10},
+             {"op": "advance", "owner": "A", "instance": "i1", "epoch": 3,
+              "now_ms": 3, "ttl_ms": 10}],
+            [1, 2, 3, 4], ["acquired", "advanced", "advanced", "advanced"], []),
+    ]
+
+
+def _plan_vectors() -> list[dict]:
+    """I9：逻辑依赖图的环检测（生产用 `_has_cycle`）。"""
+    cases = (
+        ("plan.dag", [["a", "b"], ["a", "c"], ["b", "d"], ["c", "d"]], True),
+        ("plan.two_cycle", [["a", "b"], ["b", "a"]], False),
+        ("plan.self_loop", [["a", "a"]], False),
+        ("plan.unknown_endpoint", [["a", "zz"]], True),
+        ("plan.duplicate_edge", [["a", "b"], ["a", "b"]], True),
+        ("plan.diamond", [["a", "b"], ["a", "c"], ["b", "d"], ["c", "d"]], True),
+    )
+    return [{"id": vid, "kind": "plan.acyclic", "description": f"环检测：{vid}",
+             "invariants": ["I9"], "input": {"edges": edges},
+             "expect": {"acyclic": acyclic}}
+            for vid, edges, acyclic in cases]
 
 
 def _build_kwargs() -> list[dict]:
@@ -207,6 +295,8 @@ def build_corpus() -> dict[str, bytes]:
             {"vectors": _receipt_build_vectors()}),
         "vectors/receipt-verify.json": _canon(
             {"vectors": _receipt_verify_vectors()}),
+        "vectors/fencing.json": _canon({"vectors": _fencing_vectors()}),
+        "vectors/plan.json": _canon({"vectors": _plan_vectors()}),
         "invariants.json": _canon({"invariants": [
             {"id": i.id, "name": i.name, "description": i.description,
              "test": i.test} for i in INVARIANTS]}),
@@ -273,6 +363,36 @@ def _run_vector(vec: dict) -> None:
         got = verify_chain_detailed(receipts, data.get("secret", ""))
         if got is not expect["result"]:
             raise AssertionError(f"result={got!r}")
+        return
+    if kind == "fencing.trace":
+        # 延迟导入：避免 `corpus` 在导入期把 orchestration/storage 全链拉起
+        from ..storage.lease import LeaseState
+        state = LeaseState()
+        epochs: list[int] = []
+        outcomes: list[str] = []
+        authorized: list[bool] = []
+        for op in data.get("ops") or []:
+            name = op.get("op")
+            kwargs = {k: v for k, v in op.items() if k != "op"}
+            if name == "authorizes":
+                authorized.append(state.authorizes(**kwargs))
+            elif name in ("acquire", "renew", "release", "advance"):
+                grant = getattr(state, name)(**kwargs)
+                epochs.append(int(grant.epoch))
+                outcomes.append(str(grant.outcome))
+            else:
+                raise AssertionError(f"未知 fencing op：{name}")
+        if (epochs != list(expect["epochs"])
+                or outcomes != list(expect["outcomes"])
+                or authorized != list(expect["authorized"])):
+            raise AssertionError(
+                f"epochs={epochs} outcomes={outcomes} authorized={authorized}")
+        return
+    if kind == "plan.acyclic":
+        from ..orchestration import _has_cycle
+        got = _has_cycle(data.get("edges") or [])
+        if (not got) is not expect["acyclic"]:
+            raise AssertionError(f"acyclic={not got}")
         return
     raise AssertionError(f"未知 kind：{kind}")
 

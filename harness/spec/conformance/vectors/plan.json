@@ -1,0 +1,150 @@
+{
+  "vectors": [
+    {
+      "description": "环检测：plan.dag",
+      "expect": {
+        "acyclic": true
+      },
+      "id": "plan.dag",
+      "input": {
+        "edges": [
+          [
+            "a",
+            "b"
+          ],
+          [
+            "a",
+            "c"
+          ],
+          [
+            "b",
+            "d"
+          ],
+          [
+            "c",
+            "d"
+          ]
+        ]
+      },
+      "invariants": [
+        "I9"
+      ],
+      "kind": "plan.acyclic"
+    },
+    {
+      "description": "环检测：plan.two_cycle",
+      "expect": {
+        "acyclic": false
+      },
+      "id": "plan.two_cycle",
+      "input": {
+        "edges": [
+          [
+            "a",
+            "b"
+          ],
+          [
+            "b",
+            "a"
+          ]
+        ]
+      },
+      "invariants": [
+        "I9"
+      ],
+      "kind": "plan.acyclic"
+    },
+    {
+      "description": "环检测：plan.self_loop",
+      "expect": {
+        "acyclic": false
+      },
+      "id": "plan.self_loop",
+      "input": {
+        "edges": [
+          [
+            "a",
+            "a"
+          ]
+        ]
+      },
+      "invariants": [
+        "I9"
+      ],
+      "kind": "plan.acyclic"
+    },
+    {
+      "description": "环检测：plan.unknown_endpoint",
+      "expect": {
+        "acyclic": true
+      },
+      "id": "plan.unknown_endpoint",
+      "input": {
+        "edges": [
+          [
+            "a",
+            "zz"
+          ]
+        ]
+      },
+      "invariants": [
+        "I9"
+      ],
+      "kind": "plan.acyclic"
+    },
+    {
+      "description": "环检测：plan.duplicate_edge",
+      "expect": {
+        "acyclic": true
+      },
+      "id": "plan.duplicate_edge",
+      "input": {
+        "edges": [
+          [
+            "a",
+            "b"
+          ],
+          [
+            "a",
+            "b"
+          ]
+        ]
+      },
+      "invariants": [
+        "I9"
+      ],
+      "kind": "plan.acyclic"
+    },
+    {
+      "description": "环检测：plan.diamond",
+      "expect": {
+        "acyclic": true
+      },
+      "id": "plan.diamond",
+      "input": {
+        "edges": [
+          [
+            "a",
+            "b"
+          ],
+          [
+            "a",
+            "c"
+          ],
+          [
+            "b",
+            "d"
+          ],
+          [
+            "c",
+            "d"
+          ]
+        ]
+      },
+      "invariants": [
+        "I9"
+      ],
+      "kind": "plan.acyclic"
+    }
+  ]
+}

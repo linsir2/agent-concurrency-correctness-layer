@@ -96,7 +96,7 @@ def test_vector_count_drift_is_detected(tmp_path):
     root = _copy_tree(tmp_path)
     path = root / "README.md"
     text = path.read_text(encoding="utf-8")
-    path.write_text(text.replace("35 条", "34 条", 1), encoding="utf-8")
+    path.write_text(text.replace("47 条", "46 条", 1), encoding="utf-8")
     findings = _module().check_docs(root)
     assert any("语料条数" in f["message"] for f in findings)
 

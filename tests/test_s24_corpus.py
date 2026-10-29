@@ -106,6 +106,35 @@ def test_frozen_signature_is_real_hmac():
             == vec["expect"]["payload_sha256"]
 
 
+# ---------------------------------------------------------------- I3 / I9
+def test_fencing_vectors_execute_and_are_frozen():
+    corpus = _dict()
+    doc = json.loads(corpus["vectors/fencing.json"].decode("utf-8"))
+    ids = [v["id"] for v in doc["vectors"]]
+    assert len(ids) == 6 and "fencing.takeover" in ids
+    assert C.run_corpus(corpus)["ok"]
+    mutated = _mutate_expect(corpus, "vectors/fencing.json", 0,
+                             "outcomes", ["acquired", "advanced", "fenced", "x"])
+    assert not C.run_corpus(mutated)["ok"]
+
+
+def test_plan_vectors_execute_and_are_frozen():
+    corpus = _dict()
+    doc = json.loads(corpus["vectors/plan.json"].decode("utf-8"))
+    ids = [v["id"] for v in doc["vectors"]]
+    assert len(ids) == 6 and "plan.self_loop" in ids
+    assert C.run_corpus(corpus)["ok"]
+    mutated = _mutate_expect(corpus, "vectors/plan.json", 2, "acyclic", True)
+    assert not C.run_corpus(mutated)["ok"]
+
+
+def test_corpus_version_and_executable_invariants():
+    manifest = json.loads(_dict()["manifest.json"].decode("utf-8"))
+    assert manifest["corpus_version"] == "1.1.0"
+    assert {"I3", "I9"} <= set(manifest["totals"]["executable_invariants"])
+    assert manifest["totals"]["vectors"] == 47
+
+
 # ---------------------------------------------------------------- 漂移
 def test_changed_expect_is_detected():
     corpus = _mutate_expect(_dict(), "vectors/protocol.json", 0,
