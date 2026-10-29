@@ -4,7 +4,7 @@
 
 依赖：
 - 组件  `deps.event_log` / `deps.workspace`
-- 配置  `deps.epoch_scope` / `deps.retention` / `state.receipts_enabled`
+- 配置  `deps.epoch_scope` / `state.retention` / `state.receipts_enabled`
 - 状态  `state.*`（收据 head/id/tainted、scope 锁、外部键锁、游标、粘滞闩锁）
 """
 
@@ -30,7 +30,6 @@ class ReceiptDeps:
     event_log: object
     workspace: object
     epoch_scope: str
-    retention: int
 
 
 _EXT_KEY_CONFLICT = object()
@@ -269,11 +268,11 @@ class ReceiptChain:
         run A 的保留窗口一起推进，A 的历史事件被截断后**找不回**）；
         `epoch_scope="global"` → **保持现状**（全局 tail，旧语义）。
         """
-        if self.deps.retention <= 0:
+        if self.state.retention <= 0:
             return 0
         if self.deps.epoch_scope != "run":
-            return max(0, self.deps.event_log.tail() - self.deps.retention + 1)
-        return max(0, self._run_tail(run_id) - self.deps.retention + 1)
+            return max(0, self.deps.event_log.tail() - self.state.retention + 1)
+        return max(0, self._run_tail(run_id) - self.state.retention + 1)
     # ---- 链状态读写（唯一写入者：CommitService 只能经这些方法改链）----
     def head_of(self, scope: tuple[str, str]) -> str:
         return self.state.receipt_heads.get(scope, GENESIS_HASH)

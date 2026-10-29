@@ -73,9 +73,7 @@ _MUTABLE_CONFIG: frozenset[str] = frozenset({
 # **不许**改生产代码，所以这里显式登记，并且：
 #   - 断言 allowlist **恰好**是这一条（不能悄悄长）；
 #   - 断言它**仍然**是真违规（S5 修掉后本测试会红，逼着把名单删掉）。
-_KNOWN_CONFIG_SNAPSHOTS: set[tuple[str, str, str]] = {
-    ("receipts.py", "ReceiptDeps", "retention"),
-}
+_KNOWN_CONFIG_SNAPSHOTS: set[tuple[str, str, str]] = set()
 
 # ---------------------------------------------------------------------------
 # 4) 公共面：S3 之前 `Harness` 的公开方法/属性（refactor 前基线）
@@ -333,11 +331,10 @@ def test_mutable_config_not_frozen_in_deps():
         "可热改配置被冻进 *Deps（frozen=True 后 `h.<cfg> = x` 静默失效）：\n"
         + "\n".join(f"{f}::{cls}.{name}" for f, cls, name in bad))
 
-    # 既有欠账：恰好一条，且必须仍然存在（S5 修好后逼着删名单）
-    assert _KNOWN_CONFIG_SNAPSHOTS == {("receipts.py", "ReceiptDeps", "retention")}, (
-        f"冻结配置 allowlist 只能有 ReceiptDeps.retention，实际：{_KNOWN_CONFIG_SNAPSHOTS}")
-    assert set(seen) >= _KNOWN_CONFIG_SNAPSHOTS, (
-        f"{_KNOWN_CONFIG_SNAPSHOTS} 已不再是违规 —— 请同步删除 allowlist 条目")
+    # S3.5：ReceiptDeps.retention 已改为读 KernelState，欠账清零。
+    # 名单必须保持为空 —— 任何新增都会让本断言与上面的 bad 列表同时失败。
+    assert _KNOWN_CONFIG_SNAPSHOTS == set(), (
+        f"冻结配置 allowlist 必须为空，实际：{_KNOWN_CONFIG_SNAPSHOTS}")
 
     # ---- 负对照：合成 dataclass 带 `lease_ms` 必须被检出 ----
     probe = ast.parse(

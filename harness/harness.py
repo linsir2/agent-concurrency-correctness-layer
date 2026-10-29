@@ -355,7 +355,7 @@ class Harness:
         self.receipts = ReceiptChain(
             ReceiptDeps(event_log=self.event_log, workspace=self.workspace,
                         epoch_scope=self.epoch_scope,
-                        retention=self.retention),
+                        ),
             self.state)
         self.identity.bind_receipts(self.receipts)
         # S2：提交服务（依赖 workspace/intents/blobs/event_log/receipts/leases）
