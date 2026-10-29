@@ -29,6 +29,8 @@ from .egress import EgressGuard
 from .event_log import EventLog
 from .ingress import Ingress
 from .intent_registry import IntentRegistry
+from .kernel.identity import IdentityDeps, SigningService
+from .kernel.state import KernelState
 from .llm import LLMClient
 from .orchestration import (
     _UNSET,
@@ -254,6 +256,8 @@ class Harness:
             if scheduler_mode != "sync":
                 raise ValueError("确定性模式只支持 scheduler_mode='sync'（并发交错不可重放）")
         self.entropy = entropy
+        # S1：跨服务共享状态容器（字段与旧 `self._xxx` 一一对应）
+        self.state = KernelState()
         # S24-11：定义版本化（默认 None → 无 definition 键时零影响）
         self.definitions = definitions
         if timers is not None and durable_timers:
@@ -429,15 +433,24 @@ class Harness:
         self._tick_skipped: list[tuple[str, str]] = []
         self.auth_gc_every = max(1, int(auth_gc_every))
         self.gc_every = max(1, int(gc_every))
-        self._event_count = 0
-        self._auth_secret = auth_secret
-        self._auth: Signer | None = Signer(auth_secret) if auth_secret else None
+        self.state.event_count = 0
+        self.state.auth_secret = auth_secret
+        self.state.auth = Signer(auth_secret) if auth_secret else None
         self.subscriptions = (subscriptions if subscriptions is not None
                               else SubscriptionRegistry(self.event_log))
         self.policy = (policy if policy is not None
                        else PolicyEngine(default_allow=policy_default_allow,
                                          default_token=default_token))
-        self.policy._signer_factory = self._get_signer
+        # S1：身份服务（签名 / 有效 token / 幂等键 / 事件分发）
+        self.identity = SigningService(
+            IdentityDeps(clock=self.clock, policy=self.policy, budget=self.budget,
+                         subscriptions=self.subscriptions,
+                         auth_gc_every=self.auth_gc_every,
+                         gc_every=self.gc_every),
+            self.state)
+        self.policy._signer_factory = self.identity.get_signer
+        # 过渡期：per-run 游标暂由 Harness 承担（S1 的 receipts 抽取完成后重新绑定）
+        self.identity.bind_receipts(self)
         self._sync_run_cursors()          # S12 K-33：从既有事件初始化 per-run 游标
         self.context = (context if context is not None
                         else ContextAssembler(self.event_log, self.workspace, retention,
@@ -1131,51 +1144,53 @@ class Harness:
                                   "backfilled": backfilled})
 
     # ---- 事件 → 订阅失效（文档 §5.6） ----------------------------
+    # S1：实现已迁至 `kernel/identity.py::SigningService`（此处仅委托）
     def _on_event(self, ev) -> None:
-        # S12 K-33：per-run 高水位游标独立推进（run 之间不串）
-        self._track_run_cursor(ev)
-        # 周期性清理已过期的 jti（按注入时钟，避免 `_seen` 无界增长）
-        self._event_count += 1
-        if self._event_count % self.gc_every == 0:
-            # §4.4：接上 budget.gc（原死代码），now 用注入时钟的 epoch 秒
-            self.budget.gc(self.clock.now_ms() / 1000.0)
-        if (self._auth is not None
-                and self._event_count % self.auth_gc_every == 0):
-            self._auth.gc_seen(self.clock.now_ms() / 1000.0)
-        if ev.kind == EventKind.RESOURCE_COMMITTED:
-            for agent_id in self.subscriptions.subscribers(ev.subject):
-                self.subscriptions.notify(ev.subject, ev)
+        self.identity.on_event(ev)
 
     # ---- 签名 / token ---------------------------------------------
     def _get_signer(self) -> Signer:
-        """惰性构造 `Signer`：优先注入 secret，否则读 `HARNESS_AUTH_SECRET`。"""
-        if self._auth is None:
-            self._auth = Signer.from_env()
-        return self._auth
+        return self.identity.get_signer()
 
     @property
     def auth(self) -> Signer:
-        return self._get_signer()
+        return self.identity.auth
 
     def _effective_token(self, acb: ACB):
-        """取该 ACB 的有效 token：`acb.capability` → `policy._tokens` → `default_token`。
-
-        无 token → `None`（`_gateway_check` 据此 deny-by-default）。
-        """
-        token = getattr(acb, "capability", None)
-        if token is not None:
-            return token
-        token = self.policy.token(acb.id)
-        if token is not None:
-            return token
-        return self.policy.default_token
-
+        return self.identity.effective_token(acb)
 
     # ---- 幂等键（文档 §5.8 / I7） --------------------------------
     def idem_key(self, acb: ACB, action, action_index: int) -> str:
-        """`hash(run_id, logical_subgoal_id, hash(tool, hash(args)))` —— 不含 task_id。"""
-        payload = f"{acb.run_id}|{acb.logical_subgoal_id}|{action.tool}|{action.args}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        return self.identity.idem_key(acb, action, action_index)
+
+    def track_run_cursor(self, ev) -> None:
+        """`SigningService` 的游标回调（过渡期直连 Harness；S1 完成后改指 ReceiptChain）。"""
+        self._track_run_cursor(ev)
+
+    # ---- 兼容属性（S5 删除）--------------------------------------
+    @property
+    def _auth(self):
+        return self.state.auth
+
+    @_auth.setter
+    def _auth(self, value) -> None:
+        self.state.auth = value
+
+    @property
+    def _auth_secret(self):
+        return self.state.auth_secret
+
+    @_auth_secret.setter
+    def _auth_secret(self, value) -> None:
+        self.state.auth_secret = value
+
+    @property
+    def _event_count(self) -> int:
+        return self.state.event_count
+
+    @_event_count.setter
+    def _event_count(self, value: int) -> None:
+        self.state.event_count = value
 
     # ---- RSC 提交（文档 §5.5） ------------------------------------
     def commit_batch(self, acb: ACB, writes: list[Write],
