@@ -29,6 +29,19 @@ def make_tools(session: RscSession, *, agent_id: str = "mcp-agent") -> dict:
     """返回可测的 MCP 工具函数（不依赖 FastMCP，便于单元测试）。"""
     aid = str(agent_id)
 
+    def _ownership_ok(token: str) -> bool:
+        """token 归属校验（S7）。
+
+        - `owner is None`（token 不存在）→ **True**，保持原有错误路径
+          （`unknown_token`），不把它伪装成归属错误；
+        - `owner != aid` → False，由调用方返回 `token_owner_mismatch`
+          （与 HTTP sidecar 的 403 同语义，只是传输层不同）。
+        """
+        owner = session.owner_of(str(token))
+        return owner is None or owner == aid
+
+    _MISMATCH = {"error": "token_owner_mismatch"}
+
     def rsc_apply(resource: str, content=None,
                   idempotency_key: str = "") -> dict:
         """一次性提交一个资源写入（无 token 会话）。content=None 表示删除。"""
@@ -56,6 +69,8 @@ def make_tools(session: RscSession, *, agent_id: str = "mcp-agent") -> dict:
                   idempotency_key: str = "") -> dict:
         """在已有会话（rsc_begin）内提交一次写。"""
         session.tick()
+        if not _ownership_ok(token):
+            return dict(_MISMATCH)
         writes = [(resource, DELETE if content is None else content)]
         r = session.apply(str(token), writes, idempotency_key=idempotency_key,
                           agent_id=aid)
@@ -77,12 +92,16 @@ def make_tools(session: RscSession, *, agent_id: str = "mcp-agent") -> dict:
     def rsc_finish(token: str, outcome: str = "DONE") -> dict:
         """结束会话（结算 + 释放 + 销毁 Z3）。"""
         session.tick()
+        if not _ownership_ok(token):
+            return dict(_MISMATCH)
         res = session.finish(str(token), outcome=outcome)
         return {"status": res.status.value, "detail": res.detail}
 
     def rsc_gate(token: str) -> dict:
         """外部副作用（发邮件/开 PR）前的读集校验。"""
         session.tick()
+        if not _ownership_ok(token):
+            return dict(_MISMATCH)
         g = session.gate(str(token))
         return ({"verdict": "deny", "reason": g.reason, "code": g.code}
                 if isinstance(g, Deny) else {"verdict": "allow"})
@@ -90,6 +109,8 @@ def make_tools(session: RscSession, *, agent_id: str = "mcp-agent") -> dict:
     def rsc_snapshot(token: str) -> dict:
         """当前 base_versions（供宿主做上下文）。"""
         session.tick()
+        if not _ownership_ok(token):
+            return dict(_MISMATCH)
         s = session.snapshot(str(token))
         return {"error": s.reason} if isinstance(s, Deny) else dict(s)
 

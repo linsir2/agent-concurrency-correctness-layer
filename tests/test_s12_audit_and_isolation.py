@@ -27,6 +27,7 @@ import threading
 import pytest
 from _egress_env import FEATURE_UNSHARE, probe_environment, register, unshare_available
 
+from harness.kernel.receipts import ReceiptChain
 from harness import (
     ACB,
     EpochStore,
@@ -142,14 +143,14 @@ def test_s12_1_receipt_scan_failure_is_fail_closed(tmp_path, monkeypatch, path):
     acb = _acb()
     assert _commit(h, acb) == Status.OK
     scope = (acb.run_id, acb.logical_subgoal_id)
-    head_before = h._receipt_heads[scope]
+    head_before = h.state.receipt_heads[scope]
     tail_before = log.tail()
     assert h.verify_receipts(acb.run_id, acb.logical_subgoal_id) is True
 
     if path == "_receipt_records":
         def boom(self, watermark: int = 0):
             raise RuntimeError("fake: receipt scan failed")
-        monkeypatch.setattr(Harness, "_receipt_records", boom)
+        monkeypatch.setattr(ReceiptChain, "_receipt_records", boom)
     elif path == "receipts_from":
         def boom(self, watermark: int = 0):
             raise RuntimeError("fake: wal receipts_from failed")
@@ -170,12 +171,12 @@ def test_s12_1_receipt_scan_failure_is_fail_closed(tmp_path, monkeypatch, path):
     st = _commit(h, acb2, resource="r2", content={"v": 2})
     assert st.status is Status.UPSTREAM_FAILED
     assert st.detail == {"reason": "receipt_scan_failed"}
-    assert h._receipt_scan_failed is True, "回扫失败必须置粘滞闩锁"
+    assert h.state.receipt_scan_failed is True, "回扫失败必须置粘滞闩锁"
     assert log.tail() == tail_before, "被拒的写不得落盘（tail 不变）"
-    assert h._receipt_heads[scope] == head_before, "被拒的写不得改 head"
-    assert h._tainted_scopes == set(), "未 append → 链未污染，不得 taint"
+    assert h.state.receipt_heads[scope] == head_before, "被拒的写不得改 head"
+    assert h.state.tainted_scopes == set(), "未 append → 链未污染，不得 taint"
     assert h.verify_receipts(acb.run_id, acb.logical_subgoal_id) is True
-    assert h._receipt_scan_watermark != 0 or tail_before == 0, \
+    assert h.state.receipt_scan_watermark != 0 or tail_before == 0, \
         "绝不把水位清水位到 0（会 taint 所有 scope）"
 
     # 粘滞：闩锁未解除前，后续每次提交都被拒
@@ -187,8 +188,8 @@ def test_s12_1_receipt_scan_failure_is_fail_closed(tmp_path, monkeypatch, path):
 
     # 一次**成功的全量重建** → 解除闩锁，写入口恢复服务
     monkeypatch.undo()
-    h._rebuild_receipts()
-    assert h._receipt_scan_failed is False
+    h.receipts.rebuild()
+    assert h.state.receipt_scan_failed is False
     acb4 = _acb(task_id="T4")
     assert _commit(h, acb4, resource="r4", content={"v": 4}) == Status.OK
     assert log.tail() > tail_before
@@ -243,7 +244,7 @@ def test_s12_1_negative_control_silent_fallback_forks_chain(tmp_path, monkeypatc
 
     # 静默实现：回扫「成功」但返回空（等价于旧 `except Exception: return`
     # 与 v1.0 的静默回退）→ h1 用陈旧 head 续链
-    monkeypatch.setattr(Harness, "_receipt_records", lambda self, watermark=0: [])
+    monkeypatch.setattr(ReceiptChain, "_receipt_records", lambda self, watermark=0: [])
     assert _commit(h1, ACB(id="A3", run_id=run_id, task_id="T3",
                            logical_subgoal_id=sub),
                    resource="r", content={"v": 3}) == Status.OK
@@ -280,8 +281,8 @@ def test_s12_2_budget_events_carry_run_id():
     # 向后兼容：无参 → 全部
     assert len(h.budget.budget_events()) >= len(evs)
     # K-40：树完整的种子集/校验同步支持 run 过滤
-    assert "B-S12-2" in h._declared_budget_nodes("R-S12-2")
-    assert h._declared_budget_nodes("R-OTHER") == set()
+    assert "B-S12-2" in h.recovery.declared_budget_nodes("R-S12-2")
+    assert h.recovery.declared_budget_nodes("R-OTHER") == set()
     h.budget._tree_integrity("R-S12-2")
 
 
@@ -470,8 +471,8 @@ def test_s12_4_per_run_retention_parameterized(scope, advanced):
     else:
         assert h.floor_for(run_a) == 0, "run B 的活动不得推进 run A 的保留窗口"
         assert h.floor_for(run_b) > 0, "run B 自己的窗口必须推进"
-        assert h._run_cursors[run_a] == 3
-        assert h._run_cursors[run_b] == 103
+        assert h.state.run_cursors[run_a] == 3
+        assert h.state.run_cursors[run_b] == 103
 
     acb_a = ACB(id="A-S12-4", run_id=run_a, task_id="T", logical_subgoal_id="S")
     acb_a.subscriptions.add("r")
@@ -486,8 +487,12 @@ def test_s12_4_per_run_retention_parameterized(scope, advanced):
 def test_s12_4_floor_for_uses_per_run_tail_not_global():
     """`floor_for` 在 `epoch_scope="run"` 时用 per-run tail（不是全局 tail）。"""
     h = Harness(retention=3, epoch_scope="run")
-    assert h.context._floor_for.__func__ is Harness.floor_for
-    assert h.context._floor_for.__self__ is h
+    # S3.0：注入改为 late-lookup（lambda），不再是 bound method —— 断言改为
+    # 行为断言：实例上替换 `floor_for` 后必须被 context 侧看见。
+    assert callable(h.context._floor_for)
+    h.floor_for = lambda run_id: 4242
+    assert h.context._floor_for("R-ANY") == 4242, "floor_for 必须是调用时查找"
+    del h.floor_for          # 还原为类方法（仅实例属性）
     h.event_log.append(EventKind.RESOURCE_COMMITTED, "r", {"v": 1}, run_id="R-X")
     assert h.floor_for("R-X") == 0
     for i in range(10):

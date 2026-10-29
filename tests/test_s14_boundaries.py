@@ -152,7 +152,7 @@ def test_s14_4_without_checkpoint_saves_tick_is_memory_only():
     """零破坏：没有任何落盘时 `_tick_candidates()` 与内存完全一致。"""
     h = make_harness()
     assert h.checkpoints.refs_all() == [], "前提：无落盘"
-    assert h._tick_candidates() == list(h.acbs.values())
+    assert h.dispatch._tick_candidates() == list(h.acbs.values())
 
 
 # ================================================================ S14-5
@@ -180,7 +180,7 @@ def test_s14_5_tick_finalize_does_not_violate_lock_order(tmp_path):
     assert not [lease for lease in h.intents._leases.values() if lease.valid]
     assert acb.id not in h.slots.active_keys()
     h.budget.check_invariants()
-    assert h._tick_skipped == [], f"不应有跳过项：{h._tick_skipped}"
+    assert h.state.tick_skipped == [], f"不应有跳过项：{h.state.tick_skipped}"
 
 
 def test_s14_5_hydrate_failure_is_recorded_not_silent(tmp_path, monkeypatch):
@@ -210,9 +210,9 @@ def test_s14_5_hydrate_failure_is_recorded_not_silent(tmp_path, monkeypatch):
     h2 = _shared_harness(h)
     h2.tick(now_ms=deadline)
 
-    assert ("", "refs_all_failed") not in h2._tick_skipped
-    assert any(reason == "tick_load_failed" for _, reason in h2._tick_skipped), (
-        f"水合失败未被记录：{h2._tick_skipped}")
+    assert ("", "refs_all_failed") not in h2.state.tick_skipped
+    assert any(reason == "tick_load_failed" for _, reason in h2.state.tick_skipped), (
+        f"水合失败未被记录：{h2.state.tick_skipped}")
 
 
 @pytest.mark.parametrize("resume", ["APPROVED", "TIMEOUT"])
@@ -322,8 +322,8 @@ def test_s14_7_inline_depth_exceeded_is_terminal_and_propagates():
     h.plans["R"] = plan
     acb = admit(h, "R", plan, "T1")
 
-    h._tls.depth = _MAX_INLINE_DEPTH              # 已到上限
-    res = h._run_one_inline(acb, [decision(1, finish())])
+    h.state.tls.depth = _MAX_INLINE_DEPTH              # 已到上限
+    res = h.dispatch._run_one_inline(acb, [decision(1, finish())])
 
     assert res.status is Status.GUARD_VIOLATION, (
         f"旧实现返回 INVALID_INPUT（可重试语义），实际 {res.status}")
@@ -333,7 +333,7 @@ def test_s14_7_inline_depth_exceeded_is_terminal_and_propagates():
     # 终态 → 不占槽位/预算，Run 可 finalize
     assert acb.id not in h.slots.active_keys()
     assert h.budget.root.subtree_reserved == 0
-    assert (acb.id, "inline_depth_exceeded") in h._drain_skipped
+    assert (acb.id, "inline_depth_exceeded") in h.dispatch.skipped
     h.budget.check_invariants()
 
 
@@ -373,13 +373,13 @@ def test_s14_9_prune_keeps_alias_referenced_by_active_acb():
     assert new_plan["_id_aliases"] == {"T1": "S1"}
 
     # 无活跃 ACB 引用 T1 → 被剪
-    h._prune_id_aliases("R", new_plan)
+    h.tasks.prune_id_aliases("R", new_plan)
     assert new_plan["_id_aliases"] == {}
 
     # 有活跃 ACB 持有旧 task_id `T1` → **不得剪**
     plan2, _ = h.planner.patch(plan, {"failing_subgoals": ["S1"]})
     stale = ACB(id="LIVE1", run_id="R", task_id="T1", logical_subgoal_id="S1")
     h.acbs["LIVE1"] = stale
-    h._prune_id_aliases("R", plan2)
+    h.tasks.prune_id_aliases("R", plan2)
     assert plan2["_id_aliases"] == {"T1": "S1"}, (
         f"在途 ACB 的别名被剪（旧判据漏洞）：{plan2['_id_aliases']}")

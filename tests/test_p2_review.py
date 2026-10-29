@@ -130,7 +130,7 @@ def test_p2_4_rebuild_detects_duplicate_receipt_id(tmp_path):
                        producer=acb.id, run_id=acb.run_id)
 
     h2 = Harness(event_log=h.event_log, auth_secret="s3cr3t")
-    assert scope in h2._tainted_scopes, "重复 receipt_id 必须标 tainted"
+    assert scope in h2.state.tainted_scopes, "重复 receipt_id 必须标 tainted"
     assert h2.verify_receipts(*scope) is False
     # 拒绝继续扩展坏链
     acb2 = _acb(h2, "r2")
@@ -153,8 +153,8 @@ def test_p2_4_rebuild_detects_out_of_order_chain(tmp_path):
     for r in (r1, r2):
         h.event_log.append(EventKind.RECEIPT_ISSUED, r.receipt_id, r.to_dict(),
                            producer="A", run_id=r.run_id)
-    h._rebuild_receipts()
-    assert ("R", "S") in h._tainted_scopes
+    h.receipts.rebuild()
+    assert ("R", "S") in h.state.tainted_scopes
     assert h.verify_receipts("R", "S") is False
 
 
@@ -225,8 +225,8 @@ def test_p2_6_malformed_receipt_does_not_break_startup(tmp_path):
     # 新实例（模拟重启）→ 不得抛
     h2 = Harness(event_log=h.event_log, auth_secret="s3cr3t")
     assert h2.receipts_of("R-BAD") == [], "畸形事件不得进入 receipts_of"
-    assert h2._malformed_receipts, "畸形事件必须被记录（不静默）"
-    assert ("R-BAD", "") in h2._tainted_scopes
+    assert h2.state.malformed_receipts, "畸形事件必须被记录（不静默）"
+    assert ("R-BAD", "") in h2.state.tainted_scopes
     assert h2.verify_receipts("R-BAD", "") is False
 
 
@@ -277,20 +277,20 @@ def test_p2_c_receipt_conflict_isolates_scope_and_reconciles():
     scope = (acb.run_id, acb.logical_subgoal_id)
 
     # 强制 dedup 失效 → 冲突（提交事件仍在，去重被绕过）
-    orig = h._dedup_event
-    h._dedup_event = lambda *a, **k: None
+    orig = h.receipts.dedup_event
+    h.receipts.dedup_event = lambda *a, **k: None
     try:
         with pytest.raises(ReceiptConflict):
             h.commit_batch(acb, [Write("b")])
     finally:
-        h._dedup_event = orig
-    assert scope in h._tainted_scopes, "冲突必须把 scope 加入 _tainted_scopes"
+        h.receipts.dedup_event = orig
+    assert scope in h.state.tainted_scopes, "冲突必须把 scope 加入 _tainted_scopes"
     assert h.verify_receipts(*scope) is False, "隔离后 verify 必须为 False"
 
     # 对账 → 解除隔离
     st = h.reconcile_scope(*scope)
     assert st == Status.OK and st.detail["backfilled"] == 0
-    assert scope not in h._tainted_scopes
+    assert scope not in h.state.tainted_scopes
     # 重试同逻辑写 → dedup 命中（不再永久冲突）
     acb.base_version["b"] = h.workspace.version("b")
     st2 = h.commit_batch(acb, [Write("b")])
@@ -307,7 +307,7 @@ def test_p2_c_reconcile_backfills_missing_commit_event():
     acb.staged["r"] = {"v": 2}
     assert h.commit_batch(acb, [Write("r")]) == Status.OK     # v2，E1 + R1
     scope = (acb.run_id, acb.logical_subgoal_id)
-    commit_key = h._commit_key(acb, "r", h.blobs.put(canonical_bytes({"v": 2})),
+    commit_key = h.receipts.commit_key(acb, "r", h.blobs.put(canonical_bytes({"v": 2})),
                                Mode.COMMIT)
 
     # 模拟提交事件丢失（收据仍在）：从内存事件日志移除 RESOURCE_COMMITTED，
@@ -317,20 +317,20 @@ def test_p2_c_reconcile_backfills_missing_commit_event():
     h.event_log._by_subject = {}
     for e in h.event_log._events:
         h.event_log._by_subject.setdefault(e.subject, []).append(e)
-    h._rebuild_receipts()
-    assert commit_key in h._receipt_ids
+    h.receipts.rebuild()
+    assert commit_key in h.state.receipt_ids
     assert h.workspace.version("r") == 2
 
     # 重试 → 冲突（dedup 找不到提交事件）
     acb.base_version["r"] = h.workspace.version("r")
     with pytest.raises(ReceiptConflict):
         h.commit_batch(acb, [Write("r")])
-    assert scope in h._tainted_scopes
+    assert scope in h.state.tainted_scopes
 
     # 对账：补写缺失的 RESOURCE_COMMITTED → 解除隔离
     st = h.reconcile_scope(*scope)
     assert st == Status.OK and st.detail["backfilled"] == 1
-    assert scope not in h._tainted_scopes
+    assert scope not in h.state.tainted_scopes
     # 重试 → dedup 命中补写的事件
     acb.base_version["r"] = h.workspace.version("r")
     st2 = h.commit_batch(acb, [Write("r")])
@@ -359,13 +359,13 @@ def test_p2_c_reconcile_needs_manual_when_resource_overwritten():
     h.event_log._by_subject = {}
     for e in h.event_log._events:
         h.event_log._by_subject.setdefault(e.subject, []).append(e)
-    h._rebuild_receipts()
+    h.receipts.rebuild()
     assert h.workspace.version("r") == 3
 
     st = h.reconcile_scope(*scope)
     assert st == Status.NEEDS_RECONCILIATION
     assert st.detail["reason"] == "resource_overwritten"
-    assert scope in h._tainted_scopes
+    assert scope in h.state.tainted_scopes
 
 
 # ================================================================ P3-E tmp 兜底清理

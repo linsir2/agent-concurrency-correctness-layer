@@ -108,3 +108,21 @@ def test_cli_exit_codes(tmp_path, capsys):
     (root / "README.md").write_text("no counts here\n", encoding="utf-8")
     assert checker.main(["--root", str(root)]) == 1
     capsys.readouterr()
+
+
+def test_volatile_test_counts_are_rejected(tmp_path):
+    """S6：README 不得写易变的测试计数（passed/failed/xfailed/skipped）。
+
+    RIPR：Reachability=检查器扫 README 逐行；Infection=注入 `924 passed`；
+    Propagation=check_docs 返回 finding 且 CLI 退出码 1；Revealability=finding 带文件名。
+    """
+    root = _copy_tree(tmp_path)
+    readme = root / "README.md"
+    readme.write_text(readme.read_text(encoding="utf-8")
+                      + "\n# 924 passed / 23 skipped / 4 xfailed\n",
+                      encoding="utf-8")
+    checker = _module()
+    findings = checker.check_docs(root)
+    assert any(f["file"] == "README.md" and "易变" in f["message"]
+               for f in findings), findings
+    assert checker.main(["--root", str(root)]) == 1

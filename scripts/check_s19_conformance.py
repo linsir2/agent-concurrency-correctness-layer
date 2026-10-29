@@ -23,6 +23,7 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
 
 from harness import Harness, protocols
 from harness.budget import BudgetManager, Reservation
+from harness.kernel.tenancy import TenancyService
 from harness.storage import raft as raft_mod
 
 # ---------------------------------------------------- K-88
@@ -42,7 +43,7 @@ _settle = inspect.getsource(BudgetManager.settle)
 chk("K-88 settle 设 settled_at", "resv.settled_at = stamp" in _settle)
 chk("K-88 Harness.prune_budget 存在",
     callable(getattr(Harness, "prune_budget", None)))
-_hp = inspect.getsource(Harness.prune_budget)
+_hp = inspect.getsource(TenancyService.prune_budget)
 chk("K-88 从活 ACB 精确算 live_rids",
     "acb.reservation_ids" in _hp and "TASK_TERMINAL" in _hp)
 

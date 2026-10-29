@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import pytest
 
-mcp = pytest.importorskip("mcp", reason="需要 MCP SDK")
+mcp = pytest.importorskip(
+    "mcp.server.fastmcp",
+    reason="需要 MCP SDK 1.x（FastMCP）；mcp 2.x 已改名为 MCPServer",
+)
 
 from conftest import make_harness
 
@@ -122,3 +125,4 @@ def test_c9_unknown_token_denied(tmp_path):
     h = make_harness(run_limits=1000)
     tools = make_tools(_session(h, tmp_path))
     assert tools["rsc_gate"]("nope")["verdict"] == "deny"
+

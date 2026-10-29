@@ -290,7 +290,7 @@ def measure_recovery_replay_cost(n_events: int) -> dict:
 
     phases = {"rebuild": 0.0, "replay": 0.0, "invariant": 0.0}
     orig = (h.effects.rebuild_from, h.comp_journal.rebuild_from,
-            h._replay_events, h.budget.check_invariants)
+            h.recovery.replay_events, h.budget.check_invariants)
 
     def timed(fn, key):
         def wrap(*a, **k):
@@ -302,14 +302,14 @@ def measure_recovery_replay_cost(n_events: int) -> dict:
 
     h.effects.rebuild_from = timed(orig[0], "rebuild")
     h.comp_journal.rebuild_from = timed(orig[1], "rebuild")
-    h._replay_events = timed(orig[2], "replay")
+    h.recovery.replay_events = timed(orig[2], "replay")
     h.budget.check_invariants = timed(orig[3], "invariant")
     try:
         t0 = time.perf_counter()
         h.recover(ref)
         total = time.perf_counter() - t0
     finally:
-        h.effects.rebuild_from, h.comp_journal.rebuild_from, h._replay_events, \
+        h.effects.rebuild_from, h.comp_journal.rebuild_from, h.recovery.replay_events, \
             h.budget.check_invariants = orig
     phases["total"] = total
     return phases

@@ -34,6 +34,21 @@ def _src(rel: str) -> str:
     return (_ROOT / rel).read_text(encoding="utf-8")
 
 
+def _impl(name: str | None = None) -> str:
+    """内核实现全文：harness/harness.py + harness/kernel/*.py。
+
+    S1–S5 把这些实现拆到多个文件，源码文本断言若只 grep 单文件会假红。
+    `name` 给出时只取**该服务**的文件（`harness/kernel/<name>.py`）——
+    S3 之后实现按服务分文件，断言应钉在「拥有该实现的服务」上。
+    """
+    if name is not None:
+        return (_ROOT / "harness/kernel" / f"{name}.py").read_text(encoding="utf-8")
+    parts = [(_ROOT / "harness/harness.py").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8")
+              for p in sorted((_ROOT / "harness/kernel").glob("*.py"))]
+    return "\n".join(parts)
+
+
 from conftest import make_harness
 
 from harness import RscSession
@@ -53,7 +68,7 @@ chk("构造参数 verify_cmd", "verify_cmd=None" in _facade)
 chk("构造参数 verify_required", "verify_required: bool = False" in _facade)
 chk("verify 需要工作区（fail-closed）", "verify_requires_worktree" in _facade)
 chk("verify 不经 shell（argv）", "shlex.split" in _facade and "shell=True" not in _facade)
-chk("verify 有超时", "subprocess.TimeoutExpired" in _facade)
+chk("verify 有超时", "subprocess.TimeoutExpired" in _src("harness/tool_runner.py"))
 chk("verify 在隔离副本跑", "copytree" in _facade and "rsc-verify-" in _facade)
 chk("合并视图叠加账本", "workspace.manifest" in _facade)
 chk("合并视图叠加 pending", "pending" in _facade and "_overlay" in _facade)
@@ -237,10 +252,11 @@ _g4 = _st.renew(owner="a", instance="i1", epoch=1, now_ms=12, ttl_ms=10)
 chk("同一资源单持有者", _g1.epoch == 1 and _g2.outcome == "held")
 chk("接管 epoch+1", _g3.epoch == 2)
 chk("旧 epoch 续租被拒", _g4.outcome == "fenced")
-_facade_h = _src("harness/harness.py")
-chk("Harness 接受 lease_store", "lease_store: LeaseStore | None = None" in _facade_h)
-chk("存储模式不写本地租约文件", "self._lease_store is not None" in _facade_h)
-chk("写入口原因可观测", "writer_lease_unavailable" in _facade_h)
+_kern_h = _impl("kernel")          # 组合根：Harness 构造签名
+_lease_h = _impl("leases")         # 租约实现所在服务
+chk("Harness 接受 lease_store", "lease_store: LeaseStore | None = None" in _kern_h)
+chk("存储模式不写本地租约文件", "state.lease_store is not None" in _lease_h)
+chk("写入口原因可观测", "writer_lease_unavailable" in _lease_h)
 _raft_src = _src("harness/storage/raft.py")
 chk("租约与事件同一 RSM", "class _ReplicatedLeaseLog" in _raft_src)
 chk("提交点复核 stamp", "def append_record(self, rec: dict, stamp" in _raft_src)
@@ -322,7 +338,7 @@ chk("预算 id/时间可注入",
 chk("WAL generation 可注入",
     'entropy.uuid("wal_generation")' in _src("harness/storage/wal.py"))
 chk("确定性拒绝 auth_secret",
-    "确定性模式不支持 auth_secret" in _src("harness/harness.py"))
+    "确定性模式不支持 auth_secret" in _impl("kernel"))
 chk("确定性拒绝 merge_queue",
     "确定性模式不支持 merge_queue" in _src("harness/facade.py"))
 _det_tests = _src("tests/test_s24_determinism.py")
@@ -357,13 +373,14 @@ chk("definitions 模块存在", (_ROOT / "harness/definitions.py").exists())
 chk("TIMER 事件已登记", "TIMER_SET" in _src("harness/types.py")
     and "TIMER_FIRED" in _src("harness/types.py")
     and "TIMER_CANCELLED" in _src("harness/types.py"))
-chk("tick 驱动 timer", "self.timers.fire_due(now)" in _src("harness/harness.py"))
+chk("tick 驱动 timer",
+    "self.deps.timers.fire_due(now)" in _impl("dispatch"))
 chk("内存日志拒绝 durable_timers",
-    "需要 WAL/Raft 事件日志" in _src("harness/harness.py"))
+    "需要 WAL/Raft 事件日志" in _impl("kernel"))
 chk("定义在准入前校验",
     "占预算/槽位之前" in _src("harness/orchestration.py"))
 chk("定义在提交前校验",
-    "定义版本钉住" in _src("harness/harness.py"))
+    "定义版本钉住" in _impl("commit"))
 chk("同名异内容冲突", "class DefinitionConflict" in _src("harness/definitions.py"))
 _det_t = _src("tests/test_s24_timer.py")
 _det_d = _src("tests/test_s24_definitions.py")
@@ -464,10 +481,10 @@ with tempfile.TemporaryDirectory() as tmp:
     _store = MemoryLeaseStore()
     _h1 = make_harness(lease_store=_store)
     _h2 = make_harness(lease_store=_store)
-    chk("第二个 Harness 被租约拒绝", _h2._writer_lease_ok is False)
+    chk("第二个 Harness 被租约拒绝", _h2.state.writer_lease_ok is False)
     _store.set_fail(True)
     chk("租约后端故障 fail-closed",
-        _h1._renew_writer_lease() is False and _h1._lease_outcome == "unavailable")
+        _h1.leases._renew_writer_lease() is False and _h1.state.lease_outcome == "unavailable")
 
     # S24-11 运行期：timer 只触发一次；定义未知在准入前拒绝
     from harness.clock import ManualClock as _MC

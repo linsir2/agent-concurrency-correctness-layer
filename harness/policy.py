@@ -71,13 +71,27 @@ def _lower_class(a: str, b: str | None) -> str:
     return a if la <= lb else b
 
 
+def _path_prefix_match(prefix: str, path: str) -> bool:
+    """路径前缀匹配（**按段边界**）。
+
+    `docs/secret.md` 不得覆盖 `docs/secret.md.bak`（旧的裸 startswith 会）。
+    目录前缀以 `/` 结尾时按目录匹配；否则要求 `path == prefix` 或以
+    `prefix + "/"` 开头。
+    """
+    if path == prefix:
+        return True
+    if prefix.endswith("/"):
+        return path.startswith(prefix)
+    return path.startswith(prefix + "/")
+
+
 def _path_contains_one(wide: str, narrow: str) -> bool:
     """路径前缀包含：`narrow` 是否被 `wide` 覆盖（`allows_path` 同谓词）。"""
     if wide == "*":
         return True
     if narrow == "*":
         return False
-    return narrow == wide or narrow.startswith(wide)
+    return _path_prefix_match(wide, narrow)
 
 
 def _paths_contains(parent_paths: set[str], child_paths: set[str]) -> bool:
@@ -341,7 +355,7 @@ class CapabilityToken:
     def allows_path(self, path: str) -> bool:
         if "*" in self.paths:
             return True
-        return any(path.startswith(p) for p in self.paths)
+        return any(_path_prefix_match(p, path) for p in self.paths)
 
     def allows_network(self, host: str) -> bool:
         """S11a §2.1：精确 host / 通配 `*.example.com` / CIDR / 端口。"""

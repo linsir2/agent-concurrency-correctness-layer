@@ -16,7 +16,6 @@ from typing import Any
 
 from .orchestration import classify_verdict
 from .rebase import MISSING, MergeResult, _kind, _merge_object, _strict_eq, merge3
-from .spec.receipt import GENESIS_HASH
 from .types import (
     ACB,
     TASK_TERMINAL,
@@ -63,13 +62,13 @@ class AgentRuntime:
         if acb.state in TASK_TERMINAL:
             # F4：tick 可能已判超时（FAILED）—— 终态不得被无条件改回 RUNNING
             # （否则任务真的进 guard/执行，且 failure 被覆盖成 BUDGET_EXHAUSTED）。
-            return self.h._terminal_status(acb)
+            return self.h.tasks.terminal_status(acb)
         acb.state = TaskState.RUNNING
         for decision in decisions:
             # X1：主线程 `tick` 可能在上一 turn 之后把本 ACB 判为终态（审批超时）。
             # 终态一旦成立就不再推进（不跑下一个 action、不 append TASK_COMPLETED）。
             if acb.state in TASK_TERMINAL:
-                return self.h._terminal_status(acb)
+                return self.h.tasks.terminal_status(acb)
             acb.turn_seq = decision.turn_seq
             acb.cursor = self.h.event_log.tail()          # §2.3：save 前对齐全局水位
             acb.heartbeat_at = self.h.clock.now_ms()      # D13b：心跳推进（不再只恢复）
@@ -86,7 +85,7 @@ class AgentRuntime:
             for i, action in enumerate(decision.actions):
                 # X1：每个 action 前复查终态（tick 可能在上一个动作执行期间判超时）。
                 if acb.state in TASK_TERMINAL:
-                    return self.h._terminal_status(acb)
+                    return self.h.tasks.terminal_status(acb)
                 if crash_at and crash_at == (acb.turn_seq, i):
                     # 模拟「工具已调用但副作用未确认」→ effect 停在 UNKNOWN（文档 §5.8⑤）
                     if action.kind == "tool":
@@ -115,7 +114,7 @@ class AgentRuntime:
                 if (acb.state in TASK_TERMINAL
                         and not (isinstance(st, (Status, Result))
                                  and acb.failure in (st.value,))):
-                    return self.h._terminal_status(acb)
+                    return self.h.tasks.terminal_status(acb)
                 if st in (Status.OK, Status.VALID):      # D13b：本 turn 有进展
                     progressed = True
                 if st in (Status.CANCELLED, Status.APPROVAL_TIMEOUT, Status.DENIED):
@@ -151,7 +150,7 @@ class AgentRuntime:
                 return st
             # X1：turn 末结算期间被外部判终态（审批超时/取消）→ 不覆盖、不置 DONE。
             if acb.state in TASK_TERMINAL:
-                return (self.h._terminal_status(acb)
+                return (self.h.tasks.terminal_status(acb)
                         if st in (Status.OK, Status.VALID) else st)
             if st != Status.OK:
                 acb.state = TaskState.FAILED
@@ -170,11 +169,11 @@ class AgentRuntime:
         # X1：置 DONE 之前**最后复查**终态 —— 若 tick 已判 FAILED(APPROVAL_TIMEOUT)，
         # 绝不 append TASK_COMPLETED、绝不把终态改回 DONE（审批超时不可被抹掉）。
         if acb.state in TASK_TERMINAL:
-            return self.h._terminal_status(acb)
+            return self.h.tasks.terminal_status(acb)
         acb.state = TaskState.DONE
         # S9 §2.3.7：TASK_COMPLETED 作 head 锚点（run_id/receipt_head/receipt_count）
         scope = (acb.run_id, acb.logical_subgoal_id)
-        receipt_head = self.h._receipt_heads.get(scope, GENESIS_HASH)
+        receipt_head = self.h.receipts.head_of(scope)
         receipt_count = len(self.h.receipts_of(acb.run_id, acb.logical_subgoal_id))
         plan = self.h.plans.get(acb.run_id)
         if plan is not None:                # 非权威镜像（plan 不持久化）
@@ -200,7 +199,7 @@ class AgentRuntime:
         ② `agent_id` 必须与 ACB 绑定（`"*"` 仅测试夹具通配）；
         ③ `network` / `data_class` 字段缺失 → 该维度不约束（本地动作不经 egress）。
         """
-        token = self.h._effective_token(acb)
+        token = self.h.identity.effective_token(acb)
         if token is None:
             return False                                  # ①
         resolved = self.h.policy.resolve_token(token)
@@ -282,12 +281,12 @@ class AgentRuntime:
     @register_action("tool")
     def _action_tool(self, acb: ACB, action: Action, i: int) -> Result:
         # B4：能力强制点在 gateway 强制执行，模型不可绕过（§4.1 / §5.9）
-        token = self.h._effective_token(acb)
+        token = self.h.identity.effective_token(acb)
         if not self.h.policy.check_capability(
                 acb.id, token, action.tool, action.resource or ""):
             return Result(Status.DENIED_CAPABILITY, {"tool": action.tool})
         # S13d §2.5 P0-10：claim fencing —— 旧 worker 不得推进任何副作用。
-        if self.h._claim_fenced(acb):
+        if self.h.dispatch.claim_fenced(acb):
             return Result(Status.REJECT_STALE, {
                 "reason": "claim_fenced", "acb_id": acb.id})
         idem_key = self.h.idem_key(acb, action, i)
@@ -345,7 +344,7 @@ class AgentRuntime:
         task = plan.get("tasks", {}).get(acb.task_id) if plan else None
         plan_version = (int(task.get("plan_version", 1))
                         if isinstance(task, dict) else 1)
-        deadline_ms = now_ms + int(getattr(self.h, "hitl_timeout_ms", 30_000))
+        deadline_ms = now_ms + int(self.h.state.hitl_timeout_ms)
         acb.hitl_pending = {
             "approval_id": approval_id,
             "deadline_ms": deadline_ms,
@@ -364,13 +363,13 @@ class AgentRuntime:
         if kind == "approved":
             acb.hitl_result = {"approved": True}
             advance(acb, "resume")
-            self.h._record_approval(acb, "approved", "APPROVED")
+            self.h.tasks.record_approval(acb, "approved", "APPROVED")
             self.h.checkpoints.save(acb)
             return Result(Status.NEEDS_APPROVAL, {"approval_id": approval_id})
         # 显式拒绝 / 非法判词：走唯一 FAILED 边，failure 码区分 denied / invalid
         advance(acb, "timeout")
         acb.failure = "APPROVAL_DENIED" if kind == "denied" else "APPROVAL_INVALID"
-        self.h._record_approval(
+        self.h.tasks.record_approval(
             acb, "denied" if kind == "denied" else "invalid", acb.failure)
         self.h.checkpoints.save(acb)
         return Result(Status.DENIED,

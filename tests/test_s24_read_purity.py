@@ -31,7 +31,7 @@ def _harness(root: pathlib.Path, clock: ManualClock, *, aging_ms: int = 10):
 def _admit(h: Harness):
     plan = h.planner.plan("run-1", [{
         "task_id": "t", "logical_subgoal_id": "g", "min_budget": 1}])
-    return h._admit_and_register(plan, "t")
+    return h.tasks.admit_and_register(plan, "t")
 
 
 def _epoch(root: pathlib.Path) -> int:
@@ -78,7 +78,7 @@ def test_pending_deadlines_is_read_only(tmp_path):
     wal2, h2 = _harness(root, clock)
     try:
         epoch_before = _epoch(root)
-        h2._pending_deadlines()
+        h2.dispatch._pending_deadlines()
         assert _epoch(root) == epoch_before
     finally:
         wal2.close()

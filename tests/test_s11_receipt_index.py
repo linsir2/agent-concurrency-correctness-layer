@@ -18,6 +18,7 @@ import pytest
 from harness import ACB, EventKind, Harness, Status, Write
 from harness.event_log import WalEventLog
 from harness.storage._lock import FencingRejected
+from harness.kernel.receipts import ReceiptChain
 from harness.storage.wal import Wal
 
 N = 8
@@ -107,14 +108,14 @@ def test_s11_2_negative_control_full_scan_is_quadratic(tmp_path, monkeypatch):
               logical_subgoal_id="S1")
 
     def full_scan(self, watermark: int = 0):
-        wal = getattr(self.event_log, "_wal", None)
+        wal = getattr(self.deps.event_log, "_wal", None)
         raw = wal.records()
         recs = [(r.get("seq", 0), r.get("payload")) for r in raw
                 if r.get("kind") == EventKind.RECEIPT_ISSUED.value]
         recs.sort(key=lambda rp: rp[0])
         return [rp for rp in recs if rp[0] > watermark]
 
-    monkeypatch.setattr(Harness, "_receipt_records", full_scan)
+    monkeypatch.setattr(ReceiptChain, "_receipt_records", full_scan)
     enumerated = _count_records(monkeypatch)
 
     _commit_n(h, acb)
@@ -192,7 +193,7 @@ def test_s11_3_fencing_bound_to_wal(tmp_path):
     st = h1.commit_batch(acb, [Write("r")])
     assert st.status is Status.REJECT_STALE
     assert st.detail.get("reason") == "fencing_epoch_rejected"
-    assert ("R-S11-3", "S1") not in h1._receipt_heads, "被拒的写不得 ack（改 head）"
+    assert ("R-S11-3", "S1") not in h1.state.receipt_heads, "被拒的写不得 ack（改 head）"
     assert os.path.getsize(wal_path) == before
 
 

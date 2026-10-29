@@ -101,8 +101,8 @@ def test_second_harness_is_held_and_cannot_write():
     clock = ManualClock()
     h1 = make_harness(lease_store=store, clock=clock)
     h2 = make_harness(lease_store=store, clock=clock)
-    assert h1._writer_lease_ok is True
-    assert h2._writer_lease_ok is False
+    assert h1.state.writer_lease_ok is True
+    assert h2.state.writer_lease_ok is False
 
     s1 = _session(h1)
     tok = s1.begin("a", "g", writes=["a.md"])
@@ -127,7 +127,7 @@ def test_takeover_fences_old_writer_commit():
 
     clock.advance(1001)
     h2 = make_harness(lease_store=store, clock=clock, lease_ms=1000)
-    assert h2._writer_lease_ok is True
+    assert h2.state.writer_lease_ok is True
     assert store.read_epoch() == 2
 
     before = h1.event_log.tail()
@@ -136,7 +136,7 @@ def test_takeover_fences_old_writer_commit():
     assert denied.reason == "writer_lease_held"
     assert h1.event_log.tail() == before
     # 旧 epoch 的续租被拒（不是静默成功）
-    old = store.renew(owner=h1._writer_id, instance=h1._lease_instance,
+    old = store.renew(owner=h1.state.writer_id, instance=h1.state.lease_instance,
                       epoch=1, now_ms=clock.now_ms(), ttl_ms=1000)
     assert old.outcome == FENCED
 
@@ -165,14 +165,14 @@ def test_bump_epoch_advances_store_and_self_stays_valid():
     h = make_harness(lease_store=store, clock=clock)
     s = _session(h)
     tok = s.begin("a", "g", writes=["a.md"])
-    assert h._writer_epoch == 1
+    assert h.state.writer_epoch == 1
     assert h.bump_epoch() == 2
     assert store.read_epoch() == 2
-    assert h._writer_epoch == 2
+    assert h.state.writer_epoch == 2
     # 监督者自己仍然可写
     assert _commit(s, tok, "v1", "k1")
     # 旧 epoch 的视图被拒
-    assert store.renew(owner=h._writer_id, instance=h._lease_instance,
+    assert store.renew(owner=h.state.writer_id, instance=h.state.lease_instance,
                        epoch=1, now_ms=clock.now_ms(), ttl_ms=60_000).outcome \
         == FENCED
 
@@ -181,7 +181,7 @@ def test_release_makes_lease_available_to_next_host():
     store = MemoryLeaseStore()
     clock = ManualClock()
     h1 = make_harness(lease_store=store, clock=clock)
-    h1._release_writer_lease()             # 显式会话结束
+    h1.leases.release_writer_lease()             # 显式会话结束
     h2 = make_harness(lease_store=store, clock=clock)
-    assert h2._writer_lease_ok is True
-    assert h2._writer_epoch == 2
+    assert h2.state.writer_lease_ok is True
+    assert h2.state.writer_epoch == 2

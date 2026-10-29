@@ -97,10 +97,10 @@ def test_s10_1_cross_process_no_overissue(tmp_path, monkeypatch):
     def _no_replay(cutoff):
         return True, []
 
-    monkeypatch.setattr(h3, "_replay_budget_events", _no_replay)
+    monkeypatch.setattr(h3.recovery, "replay_budget_events", _no_replay)
     # 补丁生效断言（参照 test_ms2 的 `assert BudgetManager.reserve is broken`）：
     # 若方法被重命名，patch 会静默失效 → 负对照恒绿、测试无牙。
-    assert h3._replay_budget_events is _no_replay, \
+    assert h3.recovery.replay_budget_events is _no_replay, \
         "补丁未生效：`_replay_budget_events` 可能已重命名"
     h3.recover(disk_ref)
     assert h3.budget.root.subtree_reserved == 300, \
@@ -170,7 +170,7 @@ def test_s10_3_replay_anchors_event_identity(tmp_path):
     after = [e for e in h2.budget.budget_events() if e.seq > cursor]
     assert after, "checkpoint 之后未新增预算事件（测试前提不成立）"
     for ev in after:
-        assert ev.event_id in h2._applied_event_ids, \
+        assert ev.event_id in h2.state.applied_event_ids, \
             f"事件 {ev.event_id}（seq={ev.seq}）未入去重集合 → 重放会双份"
     # 每个 rid 能在重建树找到；其 consumed 等于**最后一条** CONSUMED 事件，
     # 且逐条单调递增（set 语义下不会回退）
@@ -241,7 +241,7 @@ def test_s10_4_tree_integrity_epoch_expiry(tmp_path):
     hb2 = Harness(run_limits=1000, event_log=logb2, checkpoint_root=str(root_b))
     recb = hb2.recover(hb2.checkpoints.latest_ref_for_acb(b1.id))
     assert recb.needs_readmit is False, "完整树不应 needs_readmit"
-    assert hb2._declared_budget_nodes() == (set(hb2.budget._nodes) - {"run"}), \
+    assert hb2.recovery.declared_budget_nodes() == (set(hb2.budget._nodes) - {"run"}), \
         "完整树必须 declared == rebuilt"
     hb2.budget.check_invariants(cross_process=True)
 
@@ -312,8 +312,8 @@ def test_s10_9_budget_events_do_not_trigger_gc():
     assert [e for e in h.event_log.all() if e.kind in kinds], \
         "预算事件未落 EventLog（notify=False 之外还须 append）"
     # 预算事件全部 notify=False → `_event_count` 不受影响
-    assert h._event_count == 0, \
-        f"预算事件触发了订阅者：_event_count={h._event_count}（应 0）"
+    assert h.state.event_count == 0, \
+        f"预算事件触发了订阅者：_event_count={h.state.event_count}（应 0）"
 
     # 现有 gc 用例语义不变：第 3 个**普通**事件才触发 gc
     h.event_log.append(EventKind.TASK_COMPLETED, "x1", {})
@@ -330,24 +330,24 @@ def test_s10_writer_lease_takeover_and_epoch_rmw(tmp_path):
     root = tmp_path / "cp"
     h1 = Harness(run_limits=1000, checkpoint_root=str(root), lease_ms=1000,
                  clock=clock)
-    assert h1._try_acquire_writer_lease() is True
-    assert h1._renew_writer_lease() is True
+    assert h1.leases._try_acquire_writer_lease() is True
+    assert h1.leases._renew_writer_lease() is True
 
     # 第二个进程：旧租约仍有效 → 不能接管（避免双写者）
     # 用不同 writer_id 模拟**另一个写者进程**（同进程多 Harness 共享 writer 身份）
     h2 = Harness(run_limits=1000, checkpoint_root=str(root), lease_ms=1000,
                  clock=clock, writer_id="harness-other-process")
-    assert h2._try_acquire_writer_lease() is False
+    assert h2.leases._try_acquire_writer_lease() is False
 
     clock.advance(2000)                       # 租约过期
-    assert h2._try_acquire_writer_lease() is True     # 接管（含 bump_epoch + 落盘）
-    assert h2._renew_writer_lease() is True
+    assert h2.leases._try_acquire_writer_lease() is True     # 接管（含 bump_epoch + 落盘）
+    assert h2.leases._renew_writer_lease() is True
 
     # epoch RMW：同一 flock 内 read-modify-write（跨进程读到同一单调值）
     e0 = h2.checkpoints.read_epoch()
     assert h2.checkpoints.bump_epoch() == e0 + 1
     assert h2.checkpoints.read_epoch() == e0 + 1
-    assert h2._restore_epoch() == e0 + 1
+    assert h2.leases.restore_epoch() == e0 + 1
     assert h2.intents.get_epoch() == e0 + 1
     assert h2.budget._epoch == e0 + 1
     # epoch 单调：不允许回绕
@@ -404,7 +404,7 @@ def test_s10_restore_budget_old_dict_branch_unchanged():
         "reservation_ids": ["rid-x"],
     }
     acb = ACB(id="A-S10-RB", run_id="R", task_id="T1")
-    h._restore_budget(acb, data)
+    h.recovery.restore_budget(acb, data)
     assert h.budget._nodes["B-X"].limits == 10
     assert acb.reservation_ids == ["rid-x"]
 
@@ -422,7 +422,7 @@ def test_s10_writer_lease_blocks_commit_and_recover(tmp_path):
 
     h2 = Harness(run_limits=1000, checkpoint_root=str(root), lease_ms=1000,
                  clock=clock, writer_id="writer-2")
-    assert h2._writer_lease_ok is False, "构造期 acquire 失败必须被记录"
+    assert h2.state.writer_lease_ok is False, "构造期 acquire 失败必须被记录"
     st = h2.commit_batch(ACB(id="A-L2", run_id="R", task_id="T2"),
                          [Write("r", content={"v": 1})])
     assert st == Status.UPSTREAM_FAILED
@@ -433,7 +433,7 @@ def test_s10_writer_lease_blocks_commit_and_recover(tmp_path):
     assert rec.needs_readmit is True
 
     clock.advance(2000)                       # 旧租约过期 → 可接管
-    assert h2._ensure_writer_lease() is True
+    assert h2.leases.ensure_writer_lease() is True
     st2 = h2.commit_batch(ACB(id="A-L3", run_id="R", task_id="T3"),
                           [Write("r", content={"v": 2})])
     assert st2 == Status.OK, "接管后写入口必须恢复服务"
@@ -468,7 +468,7 @@ def test_s10_stale_budget_epoch_writes_rejected(tmp_path):
     assert h1.budget.settle(resv.reservation_id) == 0
 
     # 重新同步 epoch 后恢复可写（证明拒绝是 fencing，不是永久损坏）
-    h1._restore_epoch()
+    h1.leases.restore_epoch()
     assert h1.budget.reserve("B", 5) is not None
 
 
@@ -508,7 +508,7 @@ def test_s10_replay_failure_rolls_back_built_nodes(monkeypatch):
 
     monkeypatch.setattr(BudgetManager, "apply_budget_event",
                         lambda self, ev: False)
-    ok, built = h._replay_budget_events(0)
+    ok, built = h.recovery.replay_budget_events(0)
     assert ok is False and built == []
     assert set(h.budget._nodes) == {"run"}, f"回滚残留节点：{set(h.budget._nodes)}"
     assert h.budget.root.children == []

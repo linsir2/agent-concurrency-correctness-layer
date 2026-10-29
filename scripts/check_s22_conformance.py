@@ -21,6 +21,17 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
     (ok if cond else bad).append((name, detail))
 
 
+def _impl(name: str) -> str:
+    """`Harness.<name>` 的**实现**源码（S3.2：准入/终态簇已迁至 kernel/tasks.py）。
+
+    拆分后 Harness 只留旧名委托（一行转发），源码文本断言必须追随实现所在地，
+    否则「搬代码 → 检查静默失效」。
+    """
+    from harness.kernel.tasks import TaskService
+    owner = TaskService if hasattr(TaskService, name) else Harness
+    return inspect.getsource(getattr(owner, name))
+
+
 from harness import Harness, TaskState
 from harness.intent_registry import IntentRegistry as _IR
 from harness.orchestration import Dispatcher
@@ -42,7 +53,7 @@ chk("C2 状态机边 ADMITTED→DONE",
     TRANSITIONS.get((TaskState.ADMITTED, "finish_ok")) is TaskState.DONE)
 chk("C2 状态机边 ADMITTED→FAILED",
     TRANSITIONS.get((TaskState.ADMITTED, "fail")) is TaskState.FAILED)
-_fin = inspect.getsource(Harness.finish)
+_fin = _impl("finish")
 chk("C2 finish 复用 _finalize", "self._finalize(acb)" in _fin)
 chk("C2 finish 幂等（已终态直接返回）", "already" in _fin)
 
@@ -66,7 +77,7 @@ chk("C3 外部键命中后刷新 base_version",
 # ---------------------------------------------------- C4 token reaper
 chk("C4 _reap_expired_tokens 存在",
     callable(getattr(Harness, "_reap_expired_tokens", None)))
-_rp = inspect.getsource(Harness._reap_expired_tokens)
+_rp = _impl("_reap_expired_tokens")
 chk("C4 只处理 rsc_token", '"rsc_token"' in _rp)
 chk("C4 回收走 abort + purge_run",
     "dispatcher.abort" in _rp and "purge_run" in _rp)
@@ -75,7 +86,7 @@ chk("C4 跳过可重试态（INADMISSIBLE/QUARANTINED）",
 chk("C4 跳过在途 claim", "claim_of(acb.id)" in _rp)
 _tick = inspect.getsource(Harness.tick)
 chk("C4 tick 触发 token 回收", "_reap_expired_tokens(now)" in _tick)
-chk("C4 有清理钩子（销毁 Z3）", "_token_cleanup" in _rp)
+chk("C4 有清理钩子（销毁 Z3）", "token_cleanup" in _rp)
 
 # ---------------------------------------------------- C5 token 恢复
 _rs = inspect.signature(Harness._restore_acb).parameters

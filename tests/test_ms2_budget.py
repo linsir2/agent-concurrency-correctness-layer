@@ -414,7 +414,7 @@ def test_ms2_restore_budget_children_never_overwritten():
                             conflict.reservation_id],
     }
     acb = ACB(id="A-RB", run_id="R", task_id="T1")
-    h._restore_budget(acb, data)
+    h.recovery.restore_budget(acb, data)
 
     assert parent.subtree_reserved == 50                   # 30 + 20，不是快照 90
     assert conflict.reservation_id not in acb.reservation_ids
@@ -445,7 +445,7 @@ def test_ms2_restore_budget_replay_recomputes_parent_subtree():
         "run_limits": 100,
         "reservations": [],
     }
-    h2._restore_budget(acb, data)
+    h2.recovery.restore_budget(acb, data)
 
     node = h2.budget._nodes["P"]
     assert node.subtree_reserved == 35, \
@@ -465,7 +465,7 @@ def test_ms2_restore_budget_uses_limits_and_parent():
         "reservation_ids": ["rid-x"],
     }
     acb = ACB(id="A-RX", run_id="R", task_id="T1")
-    h._restore_budget(acb, data)
+    h.recovery.restore_budget(acb, data)
 
     node = h.budget._nodes["B-X"]
     assert node.limits == 10                               # 不是 max(6,6,2,1)

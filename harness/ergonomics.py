@@ -97,6 +97,7 @@ class RscContext:
     writes: tuple[str, ...] = ()
     reads: tuple[str, ...] = ()
     intent: str = ""
+    tool: str = ""                 # #2：工具名（能力 tokens 的 tool 维度）
     receipt: Receipt | None = None
     attempts: int = 1
     _pending: dict[str, Any] = field(default_factory=dict)
@@ -172,7 +173,7 @@ class RscContext:
             raise RscToolDenied("no_output", "没有待提交内容（先 ctx.write/delete）")
         res = self.session.apply(self.token, pending,
                                  idempotency_key=key or _content_key(pending),
-                                 agent_id=self.agent_id)
+                                 agent_id=self.agent_id, tool=self.tool)
         if isinstance(res, Receipt):
             self.receipt = res
             self._pending.clear()
@@ -270,7 +271,8 @@ def rsc_task(session: RscSession, agent_id: str, *, writes=(), reads=(),
 
 
 def _begin(session: RscSession, agent_id: str, writes: tuple[str, ...],
-           cost: int, intent: str, reads: tuple[str, ...] = ()) -> RscContext:
+           cost: int, intent: str, reads: tuple[str, ...] = (),
+           tool: str = "") -> RscContext:
     tok = session.begin(agent_id, intent, writes=list(writes),
                         reads=list(reads))
     if isinstance(tok, Wait):
@@ -280,7 +282,7 @@ def _begin(session: RscSession, agent_id: str, writes: tuple[str, ...],
     assert isinstance(tok, Token)
     return RscContext(session=session, agent_id=agent_id, token=tok.token,
                       worktree=tok.worktree, writes=writes, reads=reads,
-                      intent=intent)
+                      intent=intent, tool=tool)
 
 
 # ---------------------------------------------------------------- 装饰器
@@ -366,7 +368,7 @@ def _apply(ctx: RscContext, fn: Callable, args, kwargs, steps) -> Any:
                 str(detail.get("tail") or detail.get("reason") or detail))
     res = ctx.session.apply(ctx.token, pending,
                             idempotency_key=_idem_key(fn, args, kwargs),
-                            agent_id=ctx.agent_id)
+                            agent_id=ctx.agent_id, tool=ctx.tool)
     return res
 
 
@@ -399,7 +401,7 @@ def _run_ephemeral(binding: _Binding, fn, args, kwargs, paths, reads, steps,
     for attempt in range(retry + 1):
         ctx = _begin(binding.session, binding.agent_id, paths, cost,
                      f"{fn.__name__}:{binding.agent_id}:{uuid.uuid4().hex[:8]}",
-                     reads)
+                     reads, tool=fn.__name__)
         ctx.attempts = attempt + 1
         try:
             value = fn(ctx, *args, **kwargs)

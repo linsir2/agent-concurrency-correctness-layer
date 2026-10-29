@@ -66,13 +66,13 @@ def test_s13_11_pool_single_owner_despite_duplicate_ready_keys():
     acb = _admitted(h, "R11", plan, "T1")
 
     calls: list[str] = []
-    orig_run_one = h._run_one
+    orig_run_one = h.dispatch.run_one
 
     def spy(acb_, decisions=None, crash_at=None):
         calls.append(acb_.id)
         return orig_run_one(acb_, decisions, crash_at=crash_at)
 
-    h._run_one = spy
+    h.dispatch.run_one = spy
     # 绕过 `push` 去重：同一 acb.id 在队列中出现两次
     h.scheduler._ready.extend([acb.id, acb.id])
     assert h.scheduler._ready.count(acb.id) == 2
@@ -107,8 +107,8 @@ def test_s13_11_crash_injected_is_reraised_and_drain_is_not_rerun():
 
     run_calls: list[str] = []
     drain_calls: list[str] = []
-    orig_run_one = h._run_one
-    orig_drain = h._drain_scheduler
+    orig_run_one = h.dispatch.run_one
+    orig_drain = h.dispatch.drain_scheduler
 
     def spy_run_one(acb_, decisions=None, crash_at=None):
         run_calls.append(acb_.id)
@@ -118,8 +118,8 @@ def test_s13_11_crash_injected_is_reraised_and_drain_is_not_rerun():
         drain_calls.append("drain")
         return orig_drain()
 
-    h._run_one = spy_run_one
-    h._drain_scheduler = spy_drain
+    h.dispatch.run_one = spy_run_one
+    h.dispatch.drain_scheduler = spy_drain
     h.scheduler._ready.extend([acb.id, acb.id])
 
     with pytest.raises(CrashInjected):
@@ -164,7 +164,7 @@ def test_s13_11_negative_control_unclaimed_workers_race_two_tool_events():
     def worker():
         try:
             entry.wait(timeout=10)            # 保证两边都不在入口看到终态
-            h._run_one(acb, decisions)
+            h.dispatch.run_one(acb, decisions)
         except BaseException as exc:          # noqa: BLE001 - 收集后断言
             errors.append(exc)
 
@@ -211,7 +211,7 @@ def test_s13_12_aging_deadline_tick_marks_inadmissible_and_run_can_finalize():
     assert a1.reservation_ids == [] and a1.budget_node is None
     assert a1.id not in h.slots.active_keys()
     assert h.budget.root.subtree_reserved == 0
-    assert a1.id not in h._admission_index
+    assert a1.id not in h.state.admission_index
     h.budget.check_invariants()
 
     # P1-1 ①：单次超时可 readmit（INADMISSIBLE → PLANNED → 重新准入）
@@ -276,7 +276,7 @@ def test_s13_13_worker_nested_run_task_inlines_no_pool_deadlock(monkeypatch):
     nested_calls: list[bool] = []
 
     def nested(rt, acb_, action, i):
-        nested_calls.append(bool(getattr(rt.h._tls, "in_worker", False)))
+        nested_calls.append(bool(getattr(rt.h.state.tls, "in_worker", False)))
         return rt.h.run_task(child, [decision(1, finish())])
 
     monkeypatch.setitem(runtime_module._HANDLERS, "nested_child", nested)
@@ -414,7 +414,7 @@ def test_s13_x5_replan_write_ahead_fenced_rolls_back_memory_count():
     assert acb.replan_attempts == 1                    # 尝试数永不回滚
     assert [e for e in h.event_log.all()
             if e.kind is EventKind.PLAN_PATCHED] == patched_before
-    assert (acb.id, "save_fenced") in h._drain_skipped
+    assert (acb.id, "save_fenced") in h.dispatch.skipped
 
 
 def test_s13_x7_claim_fields_persisted_and_expired_lease_released_on_restore():
@@ -436,11 +436,11 @@ def test_s13_x7_claim_fields_persisted_and_expired_lease_released_on_restore():
     assert data["claim_lease_until_ms"] == c1.lease_until_ms
 
     clock.advance(501)                                 # 越过 claim 租约
-    restored = h._restore_acb(h.checkpoints.load(ref))
+    restored = h.recovery.restore_acb(h.checkpoints.load(ref))
     assert restored.claim_epoch == 0
     assert restored.claim_worker == ""
     assert restored.claim_lease_until_ms == 0
-    assert (restored.id, "claim_lease_expired_released") in h._drain_skipped
+    assert (restored.id, "claim_lease_expired_released") in h.dispatch.skipped
 
 
 # ============================================================ X1 跨波次（终审）

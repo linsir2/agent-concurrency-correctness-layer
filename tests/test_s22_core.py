@@ -20,7 +20,7 @@ def _begin(h, agent_id: str = "a1", intent_key: str = "i1",
         "logical_subgoal_id": intent_key,
         "min_budget": min_budget,
     }])
-    acb = h._admit_and_register(plan, agent_id)
+    acb = h.tasks.admit_and_register(plan, agent_id)
     if token:
         acb.spec["rsc_token"] = True
         acb.spec["token_deadline_ms"] = int(h.clock.now_ms()) + int(ttl_ms)
@@ -185,7 +185,7 @@ def test_c4_expired_token_reclaimed():
     assert acb.state is TaskState.CANCELLED
     assert h.budget.remaining("run") == 100, "预算必须退还"
     assert acb.id not in h.acbs, "回收后必须移出内存"
-    assert any(k == acb.id and r == "token_expired" for k, r in h._drain_skipped)
+    assert any(k == acb.id and r == "token_expired" for k, r in h.dispatch.skipped)
 
 
 def test_c4_finished_token_not_reaped():
@@ -256,7 +256,7 @@ def test_c5_restore_acb_without_global_epoch_bump():
 
     epoch0 = h.intents.get_epoch()
     data = h.checkpoints.load_strict(ref)
-    restored = h._restore_acb(data, bump_epoch=False)
+    restored = h.recovery.restore_acb(data, bump_epoch=False)
 
     assert restored.id == acb.id
     assert restored.state is TaskState.ADMITTED
@@ -276,7 +276,7 @@ def test_c5_lazy_restore_does_not_reset_budget_tree():
     ref = h.checkpoints.latest_ref_for_acb(acb.id)
     data = h.checkpoints.load_strict(ref)
 
-    restored = h._restore_acb(data, bump_epoch=False)
+    restored = h.recovery.restore_acb(data, bump_epoch=False)
 
     assert restored.budget_node is not None
     assert other_node in h.budget._nodes, "懒恢复不得重置整棵预算树"
@@ -292,6 +292,6 @@ def test_c5_bump_epoch_true_keeps_legacy_semantics():
     data = h.checkpoints.load_strict(ref)
     epoch0 = h.intents.get_epoch()
 
-    h._restore_acb(data)                       # 默认 True
+    h.recovery.restore_acb(data)                       # 默认 True
 
     assert h.intents.get_epoch() == epoch0 + 1

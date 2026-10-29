@@ -130,7 +130,7 @@ def test_harness_with_raft_lease_blocks_second_writer():
     try:
         clock = ManualClock()
         h1 = make_harness(lease_store=store, clock=clock, lease_ms=1000)
-        assert h1._writer_lease_ok is True
+        assert h1.state.writer_lease_ok is True
         s1 = RscSession(h1, tenant="t", min_budget=1)
         tok = s1.begin("a", "g", writes=["a.md"])
         assert s1.apply(tok.token, [("a.md", "v1")],
@@ -138,7 +138,7 @@ def test_harness_with_raft_lease_blocks_second_writer():
 
         clock.advance(1001)
         h2 = make_harness(lease_store=store, clock=clock, lease_ms=1000)
-        assert h2._writer_lease_ok is True
+        assert h2.state.writer_lease_ok is True
         assert store.read_epoch() == 2
 
         before = h1.event_log.tail()

@@ -230,7 +230,7 @@ def test_i13_receipts_from_production_path():
     assert head == receipt_hash(receipts[-1])
     # plan 镜像（非权威）与 EventLog 链尾一致
     assert plan["receipt_heads"][subgoal] == head
-    assert h._receipt_heads[("I13", subgoal)] == head
+    assert h.state.receipt_heads[("I13", subgoal)] == head
 
 
 # ---------------------------------------------------------------- I4/I7/I11

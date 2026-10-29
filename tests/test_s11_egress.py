@@ -573,7 +573,7 @@ def test_s11_7_required_guard_requires_dns_enforceable():
 
 def test_s11_7_harness_egress_required_true_refuses_start(monkeypatch):
     """`Harness(egress_required=True)`：无强制点 → 拒绝启动（生产 fail-closed）。"""
-    import harness.harness as harness_mod
+    import harness.kernel.kernel as harness_mod
 
     def _boom(*args, **kwargs):
         raise EgressUnavailable("fake: 启动校验失败")

@@ -49,7 +49,7 @@ def _barrier(args: argparse.Namespace) -> None:
 def run_scope_lock(args: argparse.Namespace) -> int:
     from contextlib import nullcontext
 
-    import harness.harness as harness_module
+    import harness.kernel.commit as harness_module
 
     root = args.root
     wal = WalEventLog(os.path.join(root, "wal.log"), fsync=True)
@@ -58,7 +58,7 @@ def run_scope_lock(args: argparse.Namespace) -> int:
     h = Harness(event_log=wal, checkpoint_root=root, auth_secret=SECRET,
                 writer_id=WRITER_ID)
     if args.null_context:
-        h._scope_lock = lambda scope: nullcontext()      # 负对照：撤掉跨进程锁
+        h.receipts.scope_lock = lambda scope: nullcontext()      # 负对照：撤掉跨进程锁
 
     if args.barrier_at == "build_receipt":
         # barrier 位于「读完 head 之后、append 之前」：两进程都读到同一 head → 分叉

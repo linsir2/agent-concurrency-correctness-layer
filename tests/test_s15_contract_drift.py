@@ -46,7 +46,11 @@ def _declared(proto_name: str) -> set[str]:
 
 
 def _holder_and_comp(node: ast.AST) -> str | None:
-    """若 `node` 形如 `self.<comp>` 或 `self.h.<comp>`，返回 comp。"""
+    """若 `node` 形如 `self.<comp>` / `self.h.<comp>` / `self.deps.<comp>`，返回 comp。
+
+    S1 起组件访问迁入 kernel 服务（`self.deps.workspace`）。若不认这一形，
+    服务层的漂移将**不可见** → 扫描变空绿（由 `test_drift_check_is_not_vacuous` 兜底）。
+    """
     if not isinstance(node, ast.Attribute):
         return None
     # self.<comp>
@@ -57,6 +61,12 @@ def _holder_and_comp(node: ast.AST) -> str | None:
             and isinstance(node.value.value, ast.Name)
             and node.value.value.id == "self"
             and node.value.attr == "h"):
+        return node.attr
+    # self.deps.<comp>（kernel 服务的统一持有形；见 harness/kernel/*.py）
+    if (isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "self"
+            and node.value.attr == "deps"):
         return node.attr
     return None
 
@@ -120,6 +130,95 @@ def test_negative_control_removing_declaration_is_detected():
     missing = sorted(set(accessed["checkpoints"]) - reduced)
     assert sample in missing, (
         f"删掉 {sample} 后未被检出 —— 负对照失效（检查不可信）")
+
+
+def test_negative_control_deps_form_is_scanned():
+    """**负对照**：`self.deps.<comp>.<member>` 必须被识别。
+
+    若不识别，S1 之后组件访问全部迁到 `self.deps.*` → 扫描面归零，
+    契约漂移将静默不可见（这是"变空绿"的具体形态）。
+    """
+    tree = ast.parse("self.deps.workspace.version('x')")
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.Attribute) and n.attr == "version")
+    assert _holder_and_comp(node.value) == "workspace"
+
+    accessed = _collect_accessed()
+    kernel_files = [f for f in accessed["workspace"]
+                    if any("kernel/" in path for path, _ in accessed["workspace"][f])]
+    assert kernel_files, "kernel 服务里的 self.deps.<comp> 访问未被扫描到"
+
+
+def test_kernel_services_access_components_via_deps():
+    """**S3.4 边界扩展**：kernel 服务访问组件**必须**经 `self.deps.<comp>`。
+
+    为什么：拆分后组件（workspace/budget/checkpoints/…）由 Harness 注入
+    `*Deps`。若某个服务写成裸 `self.workspace`，只有两种可能：
+    ① 该属性根本不存在 → 运行时 `AttributeError`（但可能只在罕见分支触发）；
+    ② 类上恰好有个同名的另一份引用 → **两套真相**（改了 deps 里的那份不生效）。
+    两种都是拆分期的典型事故，且都不会被「跑一遍用例」发现。
+
+    裸 `self.<comp>` 一律判红：组件访问只允许 `self.deps.<comp>`（唯一注入面）。
+    """
+    kernel_dir = _HARNESS_DIR / "kernel"
+    files = sorted(p for p in kernel_dir.glob("*.py") if p.name != "kernel.py")
+    assert len(files) >= 8, f"kernel 模块数异常（{len(files)}）"
+
+    bare: list[str] = []
+    via_deps = 0
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        rel = str(path.relative_to(_ROOT))
+        via_deps += _count_deps_component_accesses(tree)
+        bare.extend(_bare_component_accesses(tree, rel))
+
+    assert not bare, (
+        "服务用裸 `self.<comp>` 访问组件（必须 `self.deps.<comp>`）：\n"
+        + "\n".join(bare))
+    assert via_deps > 0, "kernel 里一次 `self.deps.<comp>` 都没扫到 —— 扫描器失效"
+
+    # ---- 负对照：合成 AST 里的裸 `self.workspace` 必须被检出 ----
+    probe = ast.parse(
+        "class FakeService:\n"
+        "    def version(self):\n"
+        "        return self.workspace.version('x')\n")
+    assert _bare_component_accesses(probe, "<neg>"), "`self.workspace.version(...)` 未被检出"
+
+    # ---- 合法形不得误报：`self.deps.workspace` / `self.state` / 非组件名 ----
+    probe_ok = ast.parse(
+        "class FakeService:\n"
+        "    def version(self):\n"
+        "        self.deps.workspace.version('x')\n"
+        "        self.state.retention\n"
+        "        self.tasks.requeue_readmit('r')\n")
+    assert not _bare_component_accesses(probe_ok, "<neg>"), (
+        "把 `self.deps.<comp>` 或非组件属性误判成裸访问")
+
+
+def _bare_component_accesses(tree: ast.AST, rel: str) -> list[str]:
+    """`self.<comp>`（comp ∈ `_COMPONENTS`）——裸组件访问。"""
+    hits: list[str] = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+                and node.attr in _COMPONENTS):
+            hits.append(f"{rel}:{node.lineno} self.{node.attr}.…")
+    return hits
+
+
+def _count_deps_component_accesses(tree: ast.AST) -> int:
+    """`self.deps.<comp>` 的出现次数（用于证明扫描面非空）。"""
+    n = 0
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "self"
+                and node.value.attr == "deps"
+                and node.attr in _COMPONENTS):
+            n += 1
+    return n
 
 
 def test_protocols_are_runtime_checkable():

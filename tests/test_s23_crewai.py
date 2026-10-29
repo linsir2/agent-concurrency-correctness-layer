@@ -223,7 +223,7 @@ def test_coordinator_unavailable_is_deny(session, monkeypatch):
     def boom(*a, **kw):
         raise RaftUnavailable("no quorum")
 
-    monkeypatch.setattr(session.h, "_admit_and_register", boom)
+    monkeypatch.setattr(session.h.tasks, "admit_and_register", boom)
     tool = _wrap(session, WriteTool())
     out = tool.run(root="/x", value="v")
     assert out.startswith("RSC_DENY: coordinator_unavailable"), out

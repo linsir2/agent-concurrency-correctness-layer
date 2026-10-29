@@ -55,9 +55,9 @@ def test_admin_pause_resume():
 
     assert h.pause_run("R1") is True
     h.scheduler.push(acb.id)
-    h._drain_scheduler()
+    h.dispatch.drain_scheduler()
     assert acb.state is TaskState.ADMITTED                     # 未执行
-    assert (acb.id, "run_paused") in h._drain_skipped
+    assert (acb.id, "run_paused") in h.dispatch.skipped
     assert set(h.slots.active_keys()) == slot_before           # 资源保留
 
     assert h.resume_run("R1") is True
@@ -77,12 +77,12 @@ def test_dlq():
     # 第 1 次隔离 → 计数 1，未达阈值 → 仍是 QUARANTINED
     acb.state = TaskState.QUARANTINED
     acb.consecutive_failures = 0
-    h._finalize(acb)
+    h.tasks.finalize(acb)
     assert acb.consecutive_failures == 1
     assert acb.state is TaskState.QUARANTINED, "未达阈值不应进 DLQ（负对照）"
 
     # 第 2 次 → 达阈值 → DEAD_LETTER + POISON_TASK
-    h._finalize(acb)
+    h.tasks.finalize(acb)
     assert acb.consecutive_failures >= 2
     assert acb.state is TaskState.DEAD_LETTER
     assert acb.failure == "POISON_TASK"
@@ -97,7 +97,7 @@ def test_dlq_negative_control_zero_threshold_disables():
     acb = _admitted(h)
     acb.state = TaskState.QUARANTINED
     acb.consecutive_failures = 10
-    h._finalize(acb)
+    h.tasks.finalize(acb)
     assert acb.state is TaskState.QUARANTINED, "阈值 0 应禁用毒任务识别"
 
 
@@ -106,7 +106,7 @@ def test_dlq_redrive_after_poison():
     h = make_harness(run_limits=100, poison_after_failures=1)
     acb = _admitted(h)
     acb.state = TaskState.QUARANTINED
-    h._finalize(acb)
+    h.tasks.finalize(acb)
     assert acb.state is TaskState.DEAD_LETTER
 
     fresh = h.redrive_dead_letter(acb)

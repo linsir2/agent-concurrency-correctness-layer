@@ -91,9 +91,9 @@ python3 examples/quickstart/run.py   # S1 语义冲突 / S2 CAS 重试 / S3 崩�
 ## 运行测试
 
 ```bash
-python3 -m pytest tests/ -q                      # 924 passed / 23 skipped / 4 xfailed
-TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 936 passed / 11 skipped
-RSC_CHAOS=1 python3 -m pytest tests/test_s24_raft_chaos.py -q   # 7 passed（3 进程 + 真 TCP）
+python3 -m pytest tests/ -q                      # 主门禁（不依赖 Java）
+TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 含 TLA+ 实测
+RSC_CHAOS=1 python3 -m pytest tests/test_s24_raft_chaos.py -q   # 3 进程 + 真 TCP
 python3 -m harness.spec.corpus --check           # 合规语料无漂移（47 / 0）
 python3 -m harness.diagnose --state-dir <dir>    # 只读诊断，退出码 0/1/2
 python3 -m bench.llm_replay --json               # token 基准回放（n=1，离线）

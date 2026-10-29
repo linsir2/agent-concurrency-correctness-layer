@@ -282,7 +282,7 @@ def test_s10_8_fencing_rejects_stale_writer_and_preserves_acked_frame(tmp_path):
     st = h.commit_batch(acb, [Write("r")])
     assert st.status is Status.REJECT_STALE
     assert st.detail.get("reason") == "fencing_epoch_rejected"
-    assert ("R-FENCE", "S1") not in h._receipt_heads, "被拒的写不得 ack（改 head）"
+    assert ("R-FENCE", "S1") not in h.state.receipt_heads, "被拒的写不得 ack（改 head）"
     assert len(wal._wal.records()) == before
 
     # ② 「ack 后丢写」反例被拦截：已 ack 的 epoch=4 帧在恢复时**不得**被拒绝
@@ -372,23 +372,27 @@ def test_final_7_2_takeover_bumps_epoch_before_writing_lease(tmp_path, monkeypat
     clock = ManualClock()
     cp = str(tmp_path / "cp")
     h1 = Harness(checkpoint_root=cp, writer_id="w1", clock=clock, lease_ms=1000)
-    assert h1._read_lease()["owner"] == "w1"
+    assert h1.leases._read_lease()["owner"] == "w1"
 
     observed: list[str | None] = []
-    orig_bump = Harness.bump_epoch
+    # S1：bump_epoch 已迁至 WriterLeaseService（服务内部直接调自身方法，
+    # 打桩 Harness 委托不会生效 —— 必须打在服务类上）。
+    from harness.kernel.leases import WriterLeaseService
 
-    def spy(self, reason: str = ""):
-        if getattr(self, "_writer_id", None) == "w2":
+    orig_bump = WriterLeaseService.bump_epoch
+
+    def spy(self, reason: str = "", run_id=None, *, epoch_scope=None):
+        if self.state.writer_id == "w2":
             lease = self._read_lease()
             observed.append(None if lease is None else lease.get("owner"))
-        return orig_bump(self, reason)
+        return orig_bump(self, reason, run_id, epoch_scope=epoch_scope)
 
-    monkeypatch.setattr(Harness, "bump_epoch", spy)
+    monkeypatch.setattr(WriterLeaseService, "bump_epoch", spy)
     clock.advance(2000)                       # w1 租约过期 → w2 接管
     h2 = Harness(checkpoint_root=cp, writer_id="w2", clock=clock, lease_ms=1000)
 
     assert observed == ["w1"], \
         f"接管窗口未消除：bump 时租约 owner={observed!r}（期望旧写者 w1）"
-    assert h2._writer_lease_ok is True
-    lease = h2._read_lease()
+    assert h2.state.writer_lease_ok is True
+    lease = h2.leases._read_lease()
     assert lease["owner"] == "w2" and lease["epoch"] == 1
