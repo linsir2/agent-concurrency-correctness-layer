@@ -34,6 +34,17 @@ def _src(rel: str) -> str:
     return (_ROOT / rel).read_text(encoding="utf-8")
 
 
+def _impl() -> str:
+    """内核实现全文：harness/harness.py + harness/kernel/*.py。
+
+    S1–S5 把这些实现拆到多个文件，源码文本断言若只 grep 单文件会假红。
+    """
+    parts = [(_ROOT / "harness/harness.py").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8")
+              for p in sorted((_ROOT / "harness/kernel").glob("*.py"))]
+    return "\n".join(parts)
+
+
 from conftest import make_harness
 
 from harness import RscSession
@@ -237,9 +248,9 @@ _g4 = _st.renew(owner="a", instance="i1", epoch=1, now_ms=12, ttl_ms=10)
 chk("同一资源单持有者", _g1.epoch == 1 and _g2.outcome == "held")
 chk("接管 epoch+1", _g3.epoch == 2)
 chk("旧 epoch 续租被拒", _g4.outcome == "fenced")
-_facade_h = _src("harness/harness.py")
+_facade_h = _impl()
 chk("Harness 接受 lease_store", "lease_store: LeaseStore | None = None" in _facade_h)
-chk("存储模式不写本地租约文件", "self._lease_store is not None" in _facade_h)
+chk("存储模式不写本地租约文件", "state.lease_store is not None" in _facade_h)
 chk("写入口原因可观测", "writer_lease_unavailable" in _facade_h)
 _raft_src = _src("harness/storage/raft.py")
 chk("租约与事件同一 RSM", "class _ReplicatedLeaseLog" in _raft_src)
@@ -322,7 +333,7 @@ chk("预算 id/时间可注入",
 chk("WAL generation 可注入",
     'entropy.uuid("wal_generation")' in _src("harness/storage/wal.py"))
 chk("确定性拒绝 auth_secret",
-    "确定性模式不支持 auth_secret" in _src("harness/harness.py"))
+    "确定性模式不支持 auth_secret" in _impl())
 chk("确定性拒绝 merge_queue",
     "确定性模式不支持 merge_queue" in _src("harness/facade.py"))
 _det_tests = _src("tests/test_s24_determinism.py")
@@ -357,13 +368,13 @@ chk("definitions 模块存在", (_ROOT / "harness/definitions.py").exists())
 chk("TIMER 事件已登记", "TIMER_SET" in _src("harness/types.py")
     and "TIMER_FIRED" in _src("harness/types.py")
     and "TIMER_CANCELLED" in _src("harness/types.py"))
-chk("tick 驱动 timer", "self.timers.fire_due(now)" in _src("harness/harness.py"))
+chk("tick 驱动 timer", "self.timers.fire_due(now)" in _impl())
 chk("内存日志拒绝 durable_timers",
-    "需要 WAL/Raft 事件日志" in _src("harness/harness.py"))
+    "需要 WAL/Raft 事件日志" in _impl())
 chk("定义在准入前校验",
     "占预算/槽位之前" in _src("harness/orchestration.py"))
 chk("定义在提交前校验",
-    "定义版本钉住" in _src("harness/harness.py"))
+    "定义版本钉住" in _impl())
 chk("同名异内容冲突", "class DefinitionConflict" in _src("harness/definitions.py"))
 _det_t = _src("tests/test_s24_timer.py")
 _det_d = _src("tests/test_s24_definitions.py")

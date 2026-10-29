@@ -11,6 +11,14 @@ import pathlib
 import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _impl() -> str:
+    """内核实现全文：harness/harness.py + harness/kernel/*.py（拆分后不再固定单文件）。"""
+    parts = [(_ROOT / "harness/harness.py").read_text(encoding="utf-8")]
+    parts += [p.read_text(encoding="utf-8")
+              for p in sorted((_ROOT / "harness/kernel").glob("*.py"))]
+    return "\n".join(parts)
 sys.path.insert(0, str(_ROOT))
 
 ok: list[str] = []
@@ -56,7 +64,7 @@ _rcn2 = inspect.getsource(raft_mod.RaftBudgetManager.create_node)
 chk("K-97 Raft 后端 create_node 接收 tenant", "tenant" in _rcn2)
 _bpy = (_ROOT / "harness/budget.py").read_text(encoding="utf-8")
 chk("K-97 节点创建事件带 tenant", '"tenant": node.tenant' in _bpy)
-_hpy = (_ROOT / "harness/harness.py").read_text(encoding="utf-8")
+_hpy = _impl()
 chk("K-97 重放恢复 tenant", 'p.get("tenant"' in _hpy)
 chk("K-97 spawn_child 子节点带 tenant",
     "_tenant_of_node_id(parent_node.node_id)" in _hpy)
