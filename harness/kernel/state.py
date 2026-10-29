@@ -59,3 +59,7 @@ class KernelState:
     lease_reason: str = ""
     durable: bool = False
     writer_lease_ok: bool = True
+
+    # ---- 可变配置 / 可替换组件（调用时读取，不得冻结进 deps）----
+    lock_timeout_s: float = 5.0
+    comp_journal: Any = None

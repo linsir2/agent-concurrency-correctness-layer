@@ -19,6 +19,7 @@ from contextlib import nullcontext
 import pytest
 
 import harness.harness as harness_module
+import harness.kernel.commit as commit_module
 from harness import ACB, EventKind, Harness, Status, Write
 from harness.event_log import WalEventLog
 from harness.runtime import CrashInjected
@@ -137,13 +138,13 @@ def test_s9_4_retry_after_append_before_projection(monkeypatch):
 # ================================================================ S9-5 并发
 def _commit_pair(h: Harness, pairs, monkeypatch, barrier):
     """两线程并发 commit；`build_receipt` 内 `barrier.wait()` 作为「读完 head」同步点。"""
-    orig_build = harness_module.build_receipt
+    orig_build = commit_module.build_receipt
 
     def build_with_barrier(**kwargs):
         barrier.wait()                          # 位于 head 读取之后、append 之前
         return orig_build(**kwargs)
 
-    monkeypatch.setattr(harness_module, "build_receipt", build_with_barrier)
+    monkeypatch.setattr(commit_module, "build_receipt", build_with_barrier)
 
     results: dict = {}
     errors: list = []
@@ -185,7 +186,7 @@ def test_s9_5_positive_control_different_scopes_run_in_parallel(monkeypatch):
 def test_s9_5_negative_control_nullcontext_forks_chain(monkeypatch):
     """S9-5 负对照：scope 锁换成 `nullcontext()` → barrier 到达 → 链分叉 → verify False。"""
     h = Harness()
-    monkeypatch.setattr(h, "_scope_lock", lambda scope: nullcontext())
+    monkeypatch.setattr(h.receipts, "scope_lock", lambda scope: nullcontext())
 
     a = _acb(h, "R-S9-5N", "S-N", task_id="T-A")
     b = _acb(h, "R-S9-5N", "S-N", task_id="T-B")

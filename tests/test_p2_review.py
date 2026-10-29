@@ -277,13 +277,13 @@ def test_p2_c_receipt_conflict_isolates_scope_and_reconciles():
     scope = (acb.run_id, acb.logical_subgoal_id)
 
     # 强制 dedup 失效 → 冲突（提交事件仍在，去重被绕过）
-    orig = h._dedup_event
-    h._dedup_event = lambda *a, **k: None
+    orig = h.receipts.dedup_event
+    h.receipts.dedup_event = lambda *a, **k: None
     try:
         with pytest.raises(ReceiptConflict):
             h.commit_batch(acb, [Write("b")])
     finally:
-        h._dedup_event = orig
+        h.receipts.dedup_event = orig
     assert scope in h._tainted_scopes, "冲突必须把 scope 加入 _tainted_scopes"
     assert h.verify_receipts(*scope) is False, "隔离后 verify 必须为 False"
 

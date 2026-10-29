@@ -151,7 +151,7 @@ def test_review_p0_3_receipt_conflict_isolated(monkeypatch):
                                Mode.COMMIT)
     assert commit_key in h._receipt_ids, "前提：收据已签发"
     # 模拟「提交事件丢失、但收据仍在」→ 去重失效，append 前断言必须拦住
-    monkeypatch.setattr(h, "_dedup_event", lambda *a, **k: None)
+    monkeypatch.setattr(h.receipts, "dedup_event", lambda *a, **k: None)
 
     with pytest.raises(ReceiptConflict):
         h.commit_batch(acb, [Write("b")])
