@@ -315,7 +315,7 @@ class Harness:
                       wal_epoch_backend=self._wal_epoch_backend),
             self.state)
         # S10b §3.4：WAL append 的 fencing（同一 flock 内复验 run 级 epoch）
-        self._wire_wal_fencing()
+        self.leases._wire_wal_fencing()
         # ---- S10b §3.2 / S11b §3.2：跨进程锁全序（写死）--------------------
         #   resource → budget → receipts.lock → wal.lock → epoch → store.lock
         #   → eventlog._lock
@@ -367,10 +367,10 @@ class Harness:
                        blobs=self.blobs, event_log=self.event_log,
                        receipts=self.receipts, leases=self.leases,
                        # late lookup：保留「构造后替换实例方法仍生效」的旧语义
-                       claim_guard=lambda acb: self._claim_fenced(acb),
+                       claim_guard=lambda acb: self.dispatch.claim_fenced(acb),
                        definition_check=lambda ref: self.check_definition(ref)),
             self.state)
-        self._sync_run_cursors()          # S12 K-33：从既有事件初始化 per-run 游标
+        self.receipts._sync_run_cursors()          # S12 K-33：从既有事件初始化 per-run 游标
         self.context = (context if context is not None
                         else ContextAssembler(self.event_log, self.workspace, retention,
                                               floor_for=lambda *a, **k: self.floor_for(*a, **k),
@@ -383,7 +383,7 @@ class Harness:
         self.checkpoints.slots = self.slots        # checkpoint 快照活跃槽位
         # F6：checkpoint 落盘的是**有效 token**（`acb.capability` → `policy._tokens`
         # → `default_token`），否则跨进程 recover 会拿到 `None` → 工具全 DENIED。
-        self.checkpoints.token_provider = lambda *a, **k: self._effective_token(*a, **k)
+        self.checkpoints.token_provider = lambda *a, **k: self.identity.effective_token(*a, **k)
         self.planner = Planner(self)
         self.dispatcher = Dispatcher(self)
         self.scheduler = Scheduler(self, mode=scheduler_mode)
@@ -397,10 +397,10 @@ class Harness:
                       event_log=self.event_log, policy=self.policy,
                       slots=self.slots, run_coordinator=self.run_coordinator,
                       safe_save=lambda *a, **k: self._safe_save(*a, **k),
-                      effective_token=lambda *a, **k: self._effective_token(*a, **k),
-                      register_admission=lambda *a, **k: self._register_admission(*a, **k),
-                      transition_lock=lambda *a, **k: self._transition_lock(*a, **k),
-                      finalize=lambda *a, **k: self._finalize(*a, **k)),
+                      effective_token=lambda *a, **k: self.identity.effective_token(*a, **k),
+                      register_admission=lambda *a, **k: self.tasks.register_admission(*a, **k),
+                      transition_lock=lambda *a, **k: self.tasks.transition_lock(*a, **k),
+                      finalize=lambda *a, **k: self.tasks.finalize(*a, **k)),
             self.state)
         self.reconcile = ReconcileLoop(self)
         self.hitl = HITL()
@@ -419,7 +419,7 @@ class Harness:
                      run_coordinator=self.run_coordinator,
                      scheduler=self.scheduler, children=self.children,
                      safe_save=lambda *a, **k: self._safe_save(*a, **k),
-                     effective_token=lambda *a, **k: self._effective_token(*a, **k),
+                     effective_token=lambda *a, **k: self.identity.effective_token(*a, **k),
                      ensure_policy_token=lambda *a, **k:
                          self._ensure_policy_token(*a, **k),
                      run_task=lambda *a, **k: self.run_task(*a, **k),
@@ -448,11 +448,11 @@ class Harness:
         # → 守卫恒为 False（保持既有语义，36 个同步用例零破坏）。
         # S3.0：late lookup —— 注入 lambda 而非 bound method，保证「构造后替换
         # `h._claim_fenced` 实例方法仍生效」（tests 会打桩）。
-        self.budget.claim_guard = lambda *a, **k: self._claim_fenced(*a, **k)
-        self.effects.claim_guard = lambda *a, **k: self._claim_fenced(*a, **k)
-        self.checkpoints.claim_guard = lambda *a, **k: self._claim_fenced(*a, **k)
+        self.budget.claim_guard = lambda *a, **k: self.dispatch.claim_fenced(*a, **k)
+        self.effects.claim_guard = lambda *a, **k: self.dispatch.claim_fenced(*a, **k)
+        self.checkpoints.claim_guard = lambda *a, **k: self.dispatch.claim_fenced(*a, **k)
         # X7：claim 三字段随快照落盘（无锁只读，仅作恢复后的观测/租约判定）。
-        self.checkpoints.claim_provider = lambda *a, **k: self._claim_snapshot(*a, **k)
+        self.checkpoints.claim_provider = lambda *a, **k: self.dispatch._claim_snapshot(*a, **k)
 
         self.runtime = AgentRuntime(self)
         # S3.3：执行 / 调度 / tick / claim fencing 簇。依赖此刻已全部就绪
@@ -469,21 +469,21 @@ class Harness:
                 checkpoints=self.checkpoints, clock=self.clock,
                 hitl=self.hitl, reconcile=self.reconcile, timers=self.timers,
                 runtime=self.runtime, slots=self.slots, tasks=self.tasks,
-                run_one=lambda *a, **k: self._run_one(*a, **k),
+                run_one=lambda *a, **k: self.dispatch.run_one(*a, **k),
                 tick=lambda *a, **k: self.tick(*a, **k),
-                drain=lambda *a, **k: self._drain_scheduler(*a, **k),
-                hitl_gate=lambda *a, **k: self._hitl_gate(*a, **k),
-                terminal_status=lambda *a, **k: self._terminal_status(*a, **k),
-                finalize=lambda *a, **k: self._finalize(*a, **k),
+                drain=lambda *a, **k: self.dispatch.drain_scheduler(*a, **k),
+                hitl_gate=lambda *a, **k: self.tasks.hitl_gate(*a, **k),
+                terminal_status=lambda *a, **k: self.tasks.terminal_status(*a, **k),
+                finalize=lambda *a, **k: self.tasks.finalize(*a, **k),
                 safe_save=lambda *a, **k: self._safe_save(*a, **k),
-                transition_lock=lambda *a, **k: self._transition_lock(*a, **k),
-                clear_admission=lambda *a, **k: self._clear_admission(*a, **k),
+                transition_lock=lambda *a, **k: self.tasks.transition_lock(*a, **k),
+                clear_admission=lambda *a, **k: self.tasks.clear_admission(*a, **k),
                 dead_letter_after_replan=lambda *a, **k:
-                    self._dead_letter_after_replan(*a, **k),
-                approval_slot=lambda *a, **k: self._approval_slot(*a, **k),
-                record_approval=lambda *a, **k: self._record_approval(*a, **k),
+                    self.tasks._dead_letter_after_replan(*a, **k),
+                approval_slot=lambda *a, **k: self.tasks._approval_slot(*a, **k),
+                record_approval=lambda *a, **k: self.tasks.record_approval(*a, **k),
                 reap_expired_tokens=lambda *a, **k:
-                    self._reap_expired_tokens(*a, **k),
+                    self.tasks._reap_expired_tokens(*a, **k),
                 restore_acb=lambda *a, **k: self._restore_acb(*a, **k),
                 is_paused=lambda *a, **k: self.is_paused(*a, **k),
                 bump_epoch=lambda *a, **k: self.bump_epoch(*a, **k)),
@@ -520,7 +520,7 @@ class Harness:
         self.state.receipt_refresh_lock = threading.RLock()
         # S12 K-45：粘滞闩锁（回扫失败 → 后续提交一律被拒，直到全量重建）
         self.state.receipt_scan_failed = False
-        self._rebuild_receipts()
+        self.receipts._rebuild_receipts()
 
         # ---- S10a §2.5：单写者租约（durable 模式在构造期即 acquire）----
         # 生产路径必须真正持有租约：此前 `_try_acquire_writer_lease` 只被测试调用，
@@ -540,16 +540,16 @@ class Harness:
         self.state.writer_epoch = 0
         self.state.lease_outcome = ""
         self.state.lease_reason = ""
-        self._restore_epoch()
-        self.state.durable = (self._lease_path() is not None
+        self.leases.restore_epoch()
+        self.state.durable = (self.leases._lease_path() is not None
                               or self.state.lease_store is not None)
         self.state.writer_lease_ok = True
         if self.state.durable:
-            self._try_acquire_writer_lease()
-            self._wire_lease_fence()
+            self.leases._try_acquire_writer_lease()
+            self.leases.wire_lease_fence()
             on_close = getattr(self.event_log, "on_close", None)
             if callable(on_close):
-                on_close(self._release_writer_lease)
+                on_close(self.leases.release_writer_lease)
 
         # S4：恢复 / 预算回放 / 能力恢复簇。依赖此刻已全部存在（budget /
         # checkpoints / clock / comp_journal / effects / event_log / policy /
@@ -567,14 +567,14 @@ class Harness:
                 slots=self.slots, workspace=self.workspace,
                 receipts=self.receipts, children=self.children,
                 ensure_writer_lease=lambda *a, **k:
-                    self._ensure_writer_lease(*a, **k),
-                restore_epoch=lambda *a, **k: self._restore_epoch(*a, **k),
+                    self.leases.ensure_writer_lease(*a, **k),
+                restore_epoch=lambda *a, **k: self.leases.restore_epoch(*a, **k),
                 bump_epoch=lambda *a, **k: self.bump_epoch(*a, **k),
                 tick=lambda *a, **k: self.tick(*a, **k),
                 register_admission=lambda *a, **k:
-                    self._register_admission(*a, **k),
+                    self.tasks.register_admission(*a, **k),
                 run_one_compensation=lambda *a, **k:
-                    self._run_one_compensation(*a, **k),
+                    self.commit.run_one_compensation(*a, **k),
                 rebuild_pause_state=lambda: self._rebuild_pause_state(),
                 token_from_payload=lambda *a, **k:
                     self._token_from_payload(*a, **k),
@@ -582,66 +582,20 @@ class Harness:
                 ensure_policy_token=lambda *a, **k:
                     self._ensure_policy_token(*a, **k),
                 replay_budget_events=lambda *a, **k:
-                    self._replay_budget_events(*a, **k),
-                replay_events=lambda *a, **k: self._replay_events(*a, **k)),
+                    self.recovery.replay_budget_events(*a, **k),
+                replay_events=lambda *a, **k: self.recovery.replay_events(*a, **k)),
             self.state)
 
         self.event_log.subscribe(self._on_event)
 
     # ---- 收据链（S9 §2.3 / K-24） --------------------------------
     # ---- 收据链（S1：实现已迁至 kernel/receipts.py）----------
-    def _rebuild_receipts(self, *args, **kwargs):
-        return self.receipts._rebuild_receipts(*args, **kwargs)
-    @staticmethod
-    def _scan_receipts(*args, **kwargs):
-        return ReceiptChain._scan_receipts(*args, **kwargs)
-    def _receipt_records(self, *args, **kwargs):
-        return self.receipts._receipt_records(*args, **kwargs)
-    @staticmethod
-    def _rescan_wal_from_disk(*args, **kwargs):
-        return ReceiptChain._rescan_wal_from_disk(*args, **kwargs)
-    def _refresh_receipts_locked(self, *args, **kwargs):
-        return self.receipts.refresh_locked(*args, **kwargs)
-    @staticmethod
-    def _payload_scope(*args, **kwargs):
-        return ReceiptChain._payload_scope(*args, **kwargs)
-    def _scope_lock(self, *args, **kwargs):
-        return self.receipts.scope_lock(*args, **kwargs)
-    def _sync_run_cursors(self, *args, **kwargs):
-        return self.receipts._sync_run_cursors(*args, **kwargs)
-    def _track_run_cursor(self, *args, **kwargs):
-        return self.receipts.track_run_cursor(*args, **kwargs)
-    def _run_tail(self, *args, **kwargs):
-        return self.receipts._run_tail(*args, **kwargs)
     def floor_for(self, *args, **kwargs):
         return self.receipts.floor_for(*args, **kwargs)
-    def _receipt_secret(self, *args, **kwargs):
-        return self.receipts.receipt_secret(*args, **kwargs)
-    @staticmethod
-    def _commit_key(*args, **kwargs):
-        return ReceiptChain.commit_key(*args, **kwargs)
-    def _dedup_event(self, *args, **kwargs):
-        return self.receipts.dedup_event(*args, **kwargs)
-    def _ext_key_lock(self, *args, **kwargs):
-        return self.receipts.ext_key_lock(*args, **kwargs)
-    def _dedup_by_external_key(self, *args, **kwargs):
-        return self.receipts.dedup_by_external_key(*args, **kwargs)
-    def _replay_dedup_events(self, *args, **kwargs):
-        return self.receipts.replay_dedup_events(*args, **kwargs)
-    def _refresh_after_commit(self, *args, **kwargs):
-        return self.receipts.refresh_after_commit(*args, **kwargs)
-    def _receipt_event(self, *args, **kwargs):
-        return self.receipts.receipt_event(*args, **kwargs)
-    def _receipt_is_stale(self, *args, **kwargs):
-        return self.receipts.receipt_is_stale(*args, **kwargs)
-    def _derive_receipt_id(self, *args, **kwargs):
-        return self.receipts.derive_receipt_id(*args, **kwargs)
     def receipts_of(self, *args, **kwargs):
         return self.receipts.receipts_of(*args, **kwargs)
     def verify_receipts(self, *args, **kwargs):
         return self.receipts.verify_receipts(*args, **kwargs)
-    def _commit_event_for_receipt(self, *args, **kwargs):
-        return self.receipts._commit_event_for_receipt(*args, **kwargs)
     def reconcile_scope(self, *args, **kwargs):
         return self.receipts.reconcile_scope(*args, **kwargs)
 
@@ -657,32 +611,6 @@ class Harness:
 
 
     # ---- 写者租约 / epoch（S1：实现已迁至 kernel/leases.py）----
-    def _wire_wal_fencing(self, *args, **kwargs):
-        return self.leases._wire_wal_fencing(*args, **kwargs)
-    def _wire_lease_fence(self, *args, **kwargs):
-        return self.leases.wire_lease_fence(*args, **kwargs)
-    def _apply_lease_grant(self, *args, **kwargs):
-        return self.leases._apply_lease_grant(*args, **kwargs)
-    def _lease_failure_reason(self, *args, **kwargs):
-        return self.leases.failure_reason(*args, **kwargs)
-    def _lease_path(self, *args, **kwargs):
-        return self.leases._lease_path(*args, **kwargs)
-    def _read_lease(self, *args, **kwargs):
-        return self.leases._read_lease(*args, **kwargs)
-    def _store_flock(self, *args, **kwargs):
-        return self.leases._store_flock(*args, **kwargs)
-    def _try_acquire_writer_lease(self, *args, **kwargs):
-        return self.leases._try_acquire_writer_lease(*args, **kwargs)
-    def _renew_writer_lease(self, *args, **kwargs):
-        return self.leases._renew_writer_lease(*args, **kwargs)
-    def _ensure_writer_lease(self, *args, **kwargs):
-        return self.leases.ensure_writer_lease(*args, **kwargs)
-    def _release_writer_lease(self, *args, **kwargs):
-        return self.leases._release_writer_lease(*args, **kwargs)
-    def _epoch_backend(self, *args, **kwargs):
-        return self.leases._epoch_backend(*args, **kwargs)
-    def _restore_epoch(self, *args, **kwargs):
-        return self.leases._restore_epoch(*args, **kwargs)
     def bump_epoch(self, reason: str = "", run_id: str | None = None, *,
                    epoch_scope: str | None = None) -> int:
         return self.leases.bump_epoch(reason, run_id, epoch_scope=epoch_scope)
@@ -913,15 +841,11 @@ class Harness:
         self.identity.on_event(ev)
 
     # ---- 签名 / token ---------------------------------------------
-    def _get_signer(self) -> Signer:
-        return self.identity.get_signer()
 
     @property
     def auth(self) -> Signer:
         return self.identity.auth
 
-    def _effective_token(self, acb: ACB):
-        return self.identity.effective_token(acb)
 
     # ---- 幂等键（文档 §5.8 / I7） --------------------------------
     def idem_key(self, acb: ACB, action, action_index: int) -> str:
@@ -929,7 +853,7 @@ class Harness:
 
     def track_run_cursor(self, ev) -> None:
         """`SigningService` 的游标回调（过渡期直连 Harness；S1 完成后改指 ReceiptChain）。"""
-        self._track_run_cursor(ev)
+        self.receipts.track_run_cursor(ev)
 
     # ---- 兼容属性（S5 删除）--------------------------------------
     @property
@@ -1244,20 +1168,8 @@ class Harness:
                      idempotency_key: str | None = None) -> Result:
         return self.commit.commit_batch(
             acb, writes, mode, idempotency_key=idempotency_key)
-    def _commit_record(self, *args, **kwargs):
-        return self.commit._commit_record(*args, **kwargs)
-    def _last_committed_seq(self, *args, **kwargs):
-        return self.commit._last_committed_seq(*args, **kwargs)
-    def _last_receipt_seq(self, *args, **kwargs):
-        return self.commit._last_receipt_seq(*args, **kwargs)
     def compensate(self, *args, **kwargs):
         return self.commit.compensate(*args, **kwargs)
-    def _run_one_compensation(self, *args, **kwargs):
-        return self.commit.run_one_compensation(*args, **kwargs)
-    def _mark_write(self, *args, **kwargs):
-        return self.commit._mark_write(*args, **kwargs)
-    def _compensate_one(self, *args, **kwargs):
-        return self.commit._compensate_one(*args, **kwargs)
 
 
 
@@ -1310,8 +1222,6 @@ class Harness:
 
 
     # ---- 端到端运行 -----------------------------------------------
-    def _admit_and_register(self, *args, **kwargs):
-        return self.tasks.admit_and_register(*args, **kwargs)
 
     def dispatch_and_run(self, *args, **kwargs):
         return self.tasks.dispatch_and_run(*args, **kwargs)
@@ -1326,64 +1236,28 @@ class Harness:
         return self.dispatch.run_task(*args, **kwargs)
 
     # ---- S13d §2.5：pool 调度（单一 pop 所有者 + claim/fencing）--------
-    def _in_worker(self, *args, **kwargs):
-        return self.dispatch._in_worker(*args, **kwargs)
 
-    def _current_worker_id(self, *args, **kwargs):
-        return self.dispatch._current_worker_id(*args, **kwargs)
 
-    def _run_one_inline(self, *args, **kwargs):
-        return self.dispatch._run_one_inline(*args, **kwargs)
 
-    def _run_task_pooled(self, *args, **kwargs):
-        return self.dispatch._run_task_pooled(*args, **kwargs)
 
-    def _worker_main(self, *args, **kwargs):
-        return self.dispatch._worker_main(*args, **kwargs)
 
-    def _await_completion(self, *args, **kwargs):
-        return self.dispatch._await_completion(*args, **kwargs)
 
     # ---- S13c §2.4：spawn_child（S3.1：实现已迁至 kernel/children.py）----
     # 旧名委托保留到 S5；`self.children` 是唯一实现（不再有第二份逻辑）。
-    def _spawn_depth_of(self, *args, **kwargs):
-        return self.children._spawn_depth_of(*args, **kwargs)
 
-    def _spawn_reject(self, *args, **kwargs):
-        return self.children._spawn_reject(*args, **kwargs)
 
-    def _spawn_rollback(self, *args, **kwargs):
-        return self.children._spawn_rollback(*args, **kwargs)
 
-    def _save_strict(self, *args, **kwargs):
-        return self.children.save_strict(*args, **kwargs)
 
-    def _parent_child_alloc(self, *args, **kwargs):
-        return self.children._parent_child_alloc(*args, **kwargs)
 
-    def _child_ids_for_cancel(self, *args, **kwargs):
-        return self.children._child_ids_for_cancel(*args, **kwargs)
 
-    def _ref_for_child(self, *args, **kwargs):
-        return self.children.ref_for_child(*args, **kwargs)
 
-    def _settle_orphan_child(self, *args, **kwargs):
-        return self.children.settle_orphan_child(*args, **kwargs)
 
-    def _reconcile_children_refs(self, *args, **kwargs):
-        return self.children._reconcile_children_refs(*args, **kwargs)
 
-    def _reconcile_children_pending(self, *args, **kwargs):
-        return self.children._reconcile_children_pending(*args, **kwargs)
 
     def spawn_child(self, *args, **kwargs):
         return self.children.spawn_child(*args, **kwargs)
 
-    def _live_child_ids(self, *args, **kwargs):
-        return self.children._live_child_ids(*args, **kwargs)
 
-    def _load_persisted_child(self, *args, **kwargs):
-        return self.children._load_persisted_child(*args, **kwargs)
 
     def result_envelope(self, *args, **kwargs):
         return self.children.result_envelope(*args, **kwargs)
@@ -1391,27 +1265,15 @@ class Harness:
     def apply_result_envelope(self, *args, **kwargs):
         return self.children.apply_result_envelope(*args, **kwargs)
 
-    def _approval_slot(self, *args, **kwargs):
-        return self.tasks._approval_slot(*args, **kwargs)
 
-    def _record_approval(self, *args, **kwargs):
-        return self.tasks.record_approval(*args, **kwargs)
 
-    def _hitl_gate(self, *args, **kwargs):
-        return self.tasks.hitl_gate(*args, **kwargs)
 
-    def _terminal_status(self, *args, **kwargs):
-        return self.tasks.terminal_status(*args, **kwargs)
 
     def tick(self, *args, **kwargs):
         return self.dispatch.tick(*args, **kwargs)
 
     # ---- S14 K-69：tick 的持久候选集 + 外部驱动器 ---------------------
-    def _tick_candidates(self, *args, **kwargs):
-        return self.dispatch._tick_candidates(*args, **kwargs)
 
-    def _pending_deadlines(self, *args, **kwargs):
-        return self.dispatch._pending_deadlines(*args, **kwargs)
 
     def next_deadline_ms(self, *args, **kwargs):
         return self.dispatch.next_deadline_ms(*args, **kwargs)
@@ -1520,8 +1382,6 @@ class Harness:
         self.event_log.append(EventKind.RUN_PURGED, run_id, {}, run_id=run_id)
         return True
 
-    def _reap_expired_tokens(self, *args, **kwargs):
-        return self.tasks._reap_expired_tokens(*args, **kwargs)
 
     def claim_window_s(self, *args, **kwargs):
         return self.dispatch.claim_window_s(*args, **kwargs)
@@ -1655,63 +1515,29 @@ class Harness:
 
 
     # ---- S13d §2.5：aging（墙钟 deadline）+ claim fencing --------------
-    def _arm_aging(self, *args, **kwargs):
-        return self.dispatch.arm_aging(*args, **kwargs)
 
-    def _aging_timeout(self, *args, **kwargs):
-        return self.dispatch.aging_timeout(*args, **kwargs)
 
     def readmit_after_aging(self, *args, **kwargs):
         return self.dispatch.readmit_after_aging(*args, **kwargs)
 
-    def _exec_claim_epoch(self, *args, **kwargs):
-        return self.dispatch._exec_claim_epoch(*args, **kwargs)
 
-    def _bind_claim_epoch(self, *args, **kwargs):
-        return self.dispatch._bind_claim_epoch(*args, **kwargs)
 
-    def _unbind_claim_epoch(self, *args, **kwargs):
-        return self.dispatch._unbind_claim_epoch(*args, **kwargs)
 
     def claim_scope(self, *args, **kwargs):
         return self.dispatch.claim_scope(*args, **kwargs)
 
-    def _claim_fenced(self, *args, **kwargs):
-        return self.dispatch.claim_fenced(*args, **kwargs)
 
-    def _claim_snapshot(self, *args, **kwargs):
-        return self.dispatch._claim_snapshot(*args, **kwargs)
 
     # ---- X6：跨 run 子索引（S3.1：实现已迁至 kernel/children.py）----
-    def _index_child(self, *args, **kwargs):
-        return self.children._index_child(*args, **kwargs)
 
-    def _ensure_children_index(self, *args, **kwargs):
-        return self.children.ensure_children_index(*args, **kwargs)
 
-    def _run_one(self, *args, **kwargs):
-        return self.dispatch.run_one(*args, **kwargs)
 
-    def _drain_scheduler(self, *args, **kwargs):
-        return self.dispatch.drain_scheduler(*args, **kwargs)
 
-    def _drain_scheduler_claimed(self, *args, **kwargs):
-        return self.dispatch._drain_scheduler_claimed(*args, **kwargs)
 
-    def _drain_skip_reason(self, *args, **kwargs):
-        return self.dispatch._drain_skip_reason(*args, **kwargs)
 
-    def _is_current_plan_version(self, *args, **kwargs):
-        return self.dispatch._is_current_plan_version(*args, **kwargs)
 
-    def _resolve_current_acb(self, *args, **kwargs):
-        return self.tasks.resolve_current_acb(*args, **kwargs)
 
-    def _admit_ready_successor(self, *args, **kwargs):
-        return self.tasks._admit_ready_successor(*args, **kwargs)
 
-    def _adopt_capability(self, *args, **kwargs):
-        return self.tasks.adopt_capability(*args, **kwargs)
 
     def _register_token(self, acb: ACB, token) -> None:
         """C5：恢复/签发的 token 必须注册进 `policy._tokens`（否则 `_traceable` 全红）。
@@ -1764,7 +1590,7 @@ class Harness:
             token = self._token_from_payload(raw, parent_id) \
                 if raw is not None else self.policy.token(parent_id)
         if token is None:
-            ref = self._ref_for_child(parent_id)
+            ref = self.children.ref_for_child(parent_id)
             if ref:
                 try:
                     data = self.checkpoints.load_strict(ref)
@@ -1805,34 +1631,16 @@ class Harness:
             return True
 
     # ---- R6：准入唯一性登记 -----------------------------------------
-    def _admission_key_for(self, *args, **kwargs):
-        return self.tasks._admission_key_for(*args, **kwargs)
 
-    def _lookup_admission(self, *args, **kwargs):
-        return self.tasks.lookup_admission(*args, **kwargs)
 
-    def _register_admission(self, *args, **kwargs):
-        return self.tasks.register_admission(*args, **kwargs)
 
-    def _clear_admission(self, *args, **kwargs):
-        return self.tasks.clear_admission(*args, **kwargs)
 
     # ---- S3.1：已迁至 kernel/children.py（旧名委托，S5 删除）----
-    def _replace_child_ref(self, *args, **kwargs):
-        return self.children._replace_child_ref(*args, **kwargs)
 
     # ---- R7：每 ACB 一把 transition 锁 -------------------------------
-    def _transition_lock(self, *args, **kwargs):
-        return self.tasks.transition_lock(*args, **kwargs)
 
-    def _finalize(self, *args, **kwargs):
-        return self.tasks.finalize(*args, **kwargs)
 
-    def _maybe_poison_locked(self, *args, **kwargs):
-        return self.tasks._maybe_poison_locked(*args, **kwargs)
 
-    def _finalize_locked(self, *args, **kwargs):
-        return self.tasks._finalize_locked(*args, **kwargs)
 
     def escalate_quarantined(self, *args, **kwargs):
         return self.tasks.escalate_quarantined(*args, **kwargs)
@@ -1841,8 +1649,6 @@ class Harness:
     # 旧名（文档 §5.8 / §4.3）保留到 S5；`self.recovery` 是唯一实现
     # （不再有第二份逻辑）。签名保持不变（`_restore_acb` 的 `bump_epoch`
     # 由门面 token 懒恢复使用）。
-    def _pointer_header_fallback(self, ref: str) -> dict:
-        return self.recovery._pointer_header_fallback(ref)
 
     def recover(self, ref: str, *, resume_policy: str = "RESUME") -> ACB:
         return self.recovery.recover(ref, resume_policy=resume_policy)
@@ -1850,17 +1656,11 @@ class Harness:
     def replan(self, *args, **kwargs):
         return self.tasks.replan(*args, **kwargs)
 
-    def _prune_id_aliases(self, *args, **kwargs):
-        return self.tasks.prune_id_aliases(*args, **kwargs)
 
     def replan_from_quarantine(self, *args, **kwargs):
         return self.tasks.replan_from_quarantine(*args, **kwargs)
 
-    def _dead_letter_after_replan(self, *args, **kwargs):
-        return self.tasks._dead_letter_after_replan(*args, **kwargs)
 
-    def _readmit_after_replan(self, *args, **kwargs):
-        return self.tasks._readmit_after_replan(*args, **kwargs)
 
     def requeue_readmit(self, *args, **kwargs):
         return self.tasks.requeue_readmit(*args, **kwargs)
@@ -1870,34 +1670,14 @@ class Harness:
         return self.recovery.restore_acb(
             data, resume_policy, bump_epoch=bump_epoch, for_sweep=for_sweep)
 
-    def _restore_capability(self, acb: ACB, cap) -> None:
-        return self.recovery._restore_capability(acb, cap)
 
-    def _restore_budget(self, acb: ACB, data: dict) -> None:
-        return self.recovery.restore_budget(acb, data)
 
-    def _replay_budget_events(self, cutoff_epoch: int,
-                              run_id: str | None = None) -> tuple[bool, list[str]]:
-        return self.recovery.replay_budget_events(cutoff_epoch, run_id)
 
-    def _declared_budget_nodes(self, run_id: str | None = None) -> set[str]:
-        return self.recovery.declared_budget_nodes(run_id)
 
-    def _restore_budget_by_replay(self, acb: ACB, data: dict, node_id: str) -> bool:
-        return self.recovery._restore_budget_by_replay(acb, data, node_id)
 
-    def _restore_budget_ledger(self, acb: ACB, data: dict, node_id: str) -> None:
-        return self.recovery._restore_budget_ledger(acb, data, node_id)
 
-    def _restore_path(self, path: list[str], limits=None) -> list:
-        return self.recovery.restore_path(path, limits=limits)
 
-    def _replay_events(self, from_seq: int, dedup: bool = True) -> int:
-        return self.recovery._replay_events(from_seq, dedup)
 
-    @staticmethod
-    def _propagate_subtree_delta(node, delta: int) -> None:
-        return RecoveryService._propagate_subtree_delta(node, delta)
 
 
 def create_production_harness(*args, **kwargs) -> Harness:

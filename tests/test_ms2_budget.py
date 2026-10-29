@@ -445,7 +445,7 @@ def test_ms2_restore_budget_replay_recomputes_parent_subtree():
         "run_limits": 100,
         "reservations": [],
     }
-    h2._restore_budget(acb, data)
+    h2.recovery.restore_budget(acb, data)
 
     node = h2.budget._nodes["P"]
     assert node.subtree_reserved == 35, \

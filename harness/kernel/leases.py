@@ -306,7 +306,7 @@ class WriterLeaseService:
         if not self.state.durable:
             return True
         return self._renew_writer_lease()
-    def _release_writer_lease(self) -> None:
+    def release_writer_lease(self) -> None:
         """释放本写者的租约（EventLog 关闭 = 写者会话结束）。"""
         if self.state.lease_store is not None:
             try:
@@ -332,7 +332,7 @@ class WriterLeaseService:
         if backend is not None:
             return backend
         return self.deps.checkpoints
-    def _restore_epoch(self) -> int:
+    def restore_epoch(self) -> int:
         """从持久化存储读 run 级 epoch（RMW 语义，§3.4）。"""
         if self.state.lease_store is not None:
             epoch = int(self.state.lease_store.read_epoch())

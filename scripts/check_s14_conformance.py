@@ -81,7 +81,7 @@ chk("K-71a 有 _finalize 传播", "self.deps.finalize(acb)" in d)
 p = inspect.getsource(Planner.patch)
 chk("K-67B patch 物化 edges", '_canon(' in p and 'new_plan["edges"] = materialized' in p)
 # --- K-67(A) 剪枝
-chk("K-67A _prune_id_aliases 存在", hasattr(Harness, "_prune_id_aliases"))
+chk("K-67A _prune_id_aliases 存在", hasattr(TaskService, "prune_id_aliases"))
 rp = _impl("replan")
 i_readmit = rp.find("_readmit_after_replan(acb, new_plan)")
 i_prune = rp.find("prune_id_aliases(acb.run_id, new_plan)")

@@ -16,7 +16,6 @@ from typing import Any
 
 from .orchestration import classify_verdict
 from .rebase import MISSING, MergeResult, _kind, _merge_object, _strict_eq, merge3
-from .spec.receipt import GENESIS_HASH
 from .types import (
     ACB,
     TASK_TERMINAL,

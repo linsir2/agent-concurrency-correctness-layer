@@ -10,7 +10,7 @@
 - 预算重放（`replay_budget_events` / `_restore_budget_by_replay` /
   `declared_budget_nodes` / `_restore_budget_ledger` / `restore_path` /
   `_propagate_subtree_delta`）；
-- 事件重放（`_replay_events`）与 checkpoint 头部兜底
+- 事件重放（`replay_events`）与 checkpoint 头部兜底
   （`_pointer_header_fallback`）。
 
 约定（与 `kernel/tasks.py` / `kernel/dispatch.py` 一致）：
@@ -72,7 +72,7 @@ class RecoveryDeps:
     # 否则 `monkeypatch.setattr(h, "replay_budget_events", ...)` 静默失效）：
     #   - `tests/test_s10_budget_reconcile.py` 用 `replay_budget_events` 做
     #     「禁用重放 → 必超发」的负对照；
-    #   - `bench/run_bench.py` 给 `_replay_events` 套计时包装。
+    #   - `bench/run_bench.py` 给 `replay_events` 套计时包装。
     replay_budget_events: Callable[..., tuple[bool, list[str]]]
     replay_events: Callable[..., int]
 
@@ -510,7 +510,7 @@ class RecoveryService:
             acb.budget_node = None
             acb.needs_readmit = True
             return False
-        # 已应用事件身份入去重集合（避免 `_replay_events` 二次投影 → 双份）
+        # 已应用事件身份入去重集合（避免 `replay_events` 二次投影 → 双份）
         for ev in self.deps.budget.budget_events():
             if ev.event_id:
                 self.state.applied_event_ids.add(ev.event_id)
@@ -698,7 +698,7 @@ class RecoveryService:
                         pass
             raise
 
-    def _replay_events(self, from_seq: int, dedup: bool = True) -> int:
+    def replay_events(self, from_seq: int, dedup: bool = True) -> int:
         """§4.3：从 `from_seq` 重放事件，真正调用 workspace 投影。
 
         投影按 `(resource, version)` 做版本守卫（幂等）；`event_id` 去重集合

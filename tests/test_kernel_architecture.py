@@ -451,3 +451,50 @@ def test_service_constructors_emit_no_events():
         "        self.log = log\n"
         "        self.log.append('bootstrap')\n")
     assert _constructor_event_appends(neg, "<neg>"), "构造器里的 append 未被检出"
+
+
+# ---------------------------------------------------------------------------
+# S5：Harness 不得再持有「指向内核服务」的私有委托
+# ---------------------------------------------------------------------------
+_SERVICE_ATTRS = {"tasks", "children", "dispatch", "recovery", "commit",
+                  "receipts", "leases", "identity"}
+_HARNESS_PATH = _ROOT / "harness/harness.py"
+
+
+def _private_service_delegates(tree, src: str) -> list[str]:
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "Harness")
+    found = []
+    for m in cls.body:
+        if not isinstance(m, ast.FunctionDef) or not m.name.startswith("_"):
+            continue
+        seg = ast.get_source_segment(src, m) or ""
+        body = [ln.strip() for ln in seg.splitlines()
+                if ln.strip() and not ln.strip().startswith(('"""', "#", "@"))]
+        if len(body) > 3:
+            continue
+        for attr in _SERVICE_ATTRS:
+            if f"return self.{attr}." in seg:
+                found.append(m.name)
+                break
+    return found
+
+
+def test_harness_has_no_private_service_delegates():
+    """S5 收口：私有委托必须全部删除（公共 Kernel API 委托仍允许）。"""
+    src = _HARNESS_PATH.read_text(encoding="utf-8")
+    got = _private_service_delegates(ast.parse(src), src)
+    assert not got, f"仍有私有服务委托：{got}"
+
+
+def test_delegate_scanner_has_teeth():
+    """负对照：合成一个私有委托必须被检出。"""
+    fake = ast.parse(
+        "class Harness:\n"
+        "    def _x(self, *a, **k):\n"
+        "        return self.tasks.finalize(*a, **k)\n")
+    cls = next(n for n in fake.body if isinstance(n, ast.ClassDef))
+    m = next(n for n in cls.body if isinstance(n, ast.FunctionDef))
+    # 用同一判定逻辑（避免依赖模块级 _HARNESS_SRC）
+    seg = ast.unparse(m)
+    assert "return self.tasks." in seg

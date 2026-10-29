@@ -372,7 +372,7 @@ def test_final_7_2_takeover_bumps_epoch_before_writing_lease(tmp_path, monkeypat
     clock = ManualClock()
     cp = str(tmp_path / "cp")
     h1 = Harness(checkpoint_root=cp, writer_id="w1", clock=clock, lease_ms=1000)
-    assert h1._read_lease()["owner"] == "w1"
+    assert h1.leases._read_lease()["owner"] == "w1"
 
     observed: list[str | None] = []
     # S1：bump_epoch 已迁至 WriterLeaseService（服务内部直接调自身方法，
@@ -394,5 +394,5 @@ def test_final_7_2_takeover_bumps_epoch_before_writing_lease(tmp_path, monkeypat
     assert observed == ["w1"], \
         f"接管窗口未消除：bump 时租约 owner={observed!r}（期望旧写者 w1）"
     assert h2._writer_lease_ok is True
-    lease = h2._read_lease()
+    lease = h2.leases._read_lease()
     assert lease["owner"] == "w2" and lease["epoch"] == 1

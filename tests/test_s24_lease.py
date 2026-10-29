@@ -181,7 +181,7 @@ def test_release_makes_lease_available_to_next_host():
     store = MemoryLeaseStore()
     clock = ManualClock()
     h1 = make_harness(lease_store=store, clock=clock)
-    h1._release_writer_lease()             # 显式会话结束
+    h1.leases.release_writer_lease()             # 显式会话结束
     h2 = make_harness(lease_store=store, clock=clock)
     assert h2._writer_lease_ok is True
     assert h2._writer_epoch == 2

@@ -617,7 +617,7 @@ def test_s8_4_fault_window_enumeration():
         assert crashed == (k < 2)                        # k=0/1 崩溃，k=2 正常完成
 
         # 解除崩溃注入（make_harness 把 _run_one_compensation 包成 crashy 实例属性）
-        h.commit.run_one_compensation = Harness._run_one_compensation.__get__(h, Harness)
+        h.commit.run_one_hook = h.commit.run_one_compensation
 
         # 崩溃后：每个资源要么完全补偿（删除），要么保持原样 —— 无中间态
         for res, val in (("r1", {"v": 1}), ("r2", {"v": 2})):

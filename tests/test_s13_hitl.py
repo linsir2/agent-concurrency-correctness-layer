@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 from conftest import admit, decision, finish, hitl, make_harness, seed, tool
 
+from harness.kernel.tasks import TaskService
 from harness import ACB, EventKind, Harness, ManualClock, Status, TaskState
 from harness.orchestration import _UNSET
 from harness.runtime import CrashInjected
@@ -175,7 +176,7 @@ def test_s13_1_negative_control_removing_gate_breaks_waiting(monkeypatch):
     acb = _admit_waiting(h)
 
     # 故障注入：移除入口判态 → 已挂起的审批被忽略，runtime 直接执行
-    monkeypatch.setattr(Harness, "_hitl_gate", lambda self, acb_: None)
+    monkeypatch.setattr(TaskService, "hitl_gate", lambda self, acb_: None)
     h.run_task(acb, [decision(2, tool("read", {"p": "/x"}))])
 
     # 主用例的两条断言（仍 WAITING / 无 TOOL_COMPLETED）必须失败
@@ -347,7 +348,7 @@ def test_s13_13_run_task_calls_tick_before_gate_and_settles(monkeypatch):
         return orig_gate(acb_)
 
     monkeypatch.setattr(h, "tick", spy_tick)
-    monkeypatch.setattr(h, "_hitl_gate", spy_gate)
+    monkeypatch.setattr(h.tasks, "hitl_gate", spy_gate)
 
     clock.advance(5000)                        # 已过期
     st = h.run_task(acb, [decision(2, tool("read", {"p": "/x"}))])

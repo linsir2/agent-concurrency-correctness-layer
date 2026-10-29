@@ -97,10 +97,10 @@ def test_s10_1_cross_process_no_overissue(tmp_path, monkeypatch):
     def _no_replay(cutoff):
         return True, []
 
-    monkeypatch.setattr(h3, "_replay_budget_events", _no_replay)
+    monkeypatch.setattr(h3.recovery, "replay_budget_events", _no_replay)
     # 补丁生效断言（参照 test_ms2 的 `assert BudgetManager.reserve is broken`）：
     # 若方法被重命名，patch 会静默失效 → 负对照恒绿、测试无牙。
-    assert h3._replay_budget_events is _no_replay, \
+    assert h3.recovery.replay_budget_events is _no_replay, \
         "补丁未生效：`_replay_budget_events` 可能已重命名"
     h3.recover(disk_ref)
     assert h3.budget.root.subtree_reserved == 300, \
@@ -241,7 +241,7 @@ def test_s10_4_tree_integrity_epoch_expiry(tmp_path):
     hb2 = Harness(run_limits=1000, event_log=logb2, checkpoint_root=str(root_b))
     recb = hb2.recover(hb2.checkpoints.latest_ref_for_acb(b1.id))
     assert recb.needs_readmit is False, "完整树不应 needs_readmit"
-    assert hb2._declared_budget_nodes() == (set(hb2.budget._nodes) - {"run"}), \
+    assert hb2.recovery.declared_budget_nodes() == (set(hb2.budget._nodes) - {"run"}), \
         "完整树必须 declared == rebuilt"
     hb2.budget.check_invariants(cross_process=True)
 
@@ -330,24 +330,24 @@ def test_s10_writer_lease_takeover_and_epoch_rmw(tmp_path):
     root = tmp_path / "cp"
     h1 = Harness(run_limits=1000, checkpoint_root=str(root), lease_ms=1000,
                  clock=clock)
-    assert h1._try_acquire_writer_lease() is True
-    assert h1._renew_writer_lease() is True
+    assert h1.leases._try_acquire_writer_lease() is True
+    assert h1.leases._renew_writer_lease() is True
 
     # 第二个进程：旧租约仍有效 → 不能接管（避免双写者）
     # 用不同 writer_id 模拟**另一个写者进程**（同进程多 Harness 共享 writer 身份）
     h2 = Harness(run_limits=1000, checkpoint_root=str(root), lease_ms=1000,
                  clock=clock, writer_id="harness-other-process")
-    assert h2._try_acquire_writer_lease() is False
+    assert h2.leases._try_acquire_writer_lease() is False
 
     clock.advance(2000)                       # 租约过期
-    assert h2._try_acquire_writer_lease() is True     # 接管（含 bump_epoch + 落盘）
-    assert h2._renew_writer_lease() is True
+    assert h2.leases._try_acquire_writer_lease() is True     # 接管（含 bump_epoch + 落盘）
+    assert h2.leases._renew_writer_lease() is True
 
     # epoch RMW：同一 flock 内 read-modify-write（跨进程读到同一单调值）
     e0 = h2.checkpoints.read_epoch()
     assert h2.checkpoints.bump_epoch() == e0 + 1
     assert h2.checkpoints.read_epoch() == e0 + 1
-    assert h2._restore_epoch() == e0 + 1
+    assert h2.leases.restore_epoch() == e0 + 1
     assert h2.intents.get_epoch() == e0 + 1
     assert h2.budget._epoch == e0 + 1
     # epoch 单调：不允许回绕
@@ -433,7 +433,7 @@ def test_s10_writer_lease_blocks_commit_and_recover(tmp_path):
     assert rec.needs_readmit is True
 
     clock.advance(2000)                       # 旧租约过期 → 可接管
-    assert h2._ensure_writer_lease() is True
+    assert h2.leases.ensure_writer_lease() is True
     st2 = h2.commit_batch(ACB(id="A-L3", run_id="R", task_id="T3"),
                           [Write("r", content={"v": 2})])
     assert st2 == Status.OK, "接管后写入口必须恢复服务"
@@ -468,7 +468,7 @@ def test_s10_stale_budget_epoch_writes_rejected(tmp_path):
     assert h1.budget.settle(resv.reservation_id) == 0
 
     # 重新同步 epoch 后恢复可写（证明拒绝是 fencing，不是永久损坏）
-    h1._restore_epoch()
+    h1.leases.restore_epoch()
     assert h1.budget.reserve("B", 5) is not None
 
 

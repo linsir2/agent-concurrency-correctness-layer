@@ -39,4 +39,4 @@ def test_same_cluster_is_accepted():
     h.leases.wire_lease_fence()                     # 不抛
     # 没装 lease 状态的日志 → 直接跳过（不假装有 fence）
     h2 = make_harness(lease_store=MemoryLeaseStore())
-    h2._wire_lease_fence()
+    h2.leases.wire_lease_fence()

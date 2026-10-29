@@ -78,7 +78,7 @@ def test_pending_deadlines_is_read_only(tmp_path):
     wal2, h2 = _harness(root, clock)
     try:
         epoch_before = _epoch(root)
-        h2._pending_deadlines()
+        h2.dispatch._pending_deadlines()
         assert _epoch(root) == epoch_before
     finally:
         wal2.close()
