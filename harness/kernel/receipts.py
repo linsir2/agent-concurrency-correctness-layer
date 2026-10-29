@@ -107,7 +107,7 @@ class ReceiptChain:
                        malformed: list) -> int:
         """按 seq 顺序应用收据记录，维护 running head + 连续性校验。
 
-        `_rebuild_receipts`（首次构建）与 `_refresh_receipts_locked`（锁内增量
+        `_rebuild_receipts`（首次构建）与 `refresh_locked`（锁内增量
         刷新）**共用**此逻辑：`prev_receipt_hash` 必须等于 running head 且
         `receipt_id` 不重复；失败 → 该 scope tainted 并拒绝继续扩展；畸形
         payload → 记入 `malformed`（**不得抛**）。返回处理到的最大 seq
@@ -176,7 +176,7 @@ class ReceiptChain:
         """flock 内 O(1) fstat 比对：仅当别的进程写过才回扫（复用 WAL 既有优化）。
 
         K-45：回扫失败**不得静默**（与 `_receipt_records` / `Wal.receipts_from`
-        同口径）—— 异常向上抛，由 `_refresh_receipts_locked` 置粘滞闩锁并
+        同口径）—— 异常向上抛，由 `refresh_locked` 置粘滞闩锁并
         抛 `ReceiptScanFailed` → 提交 fail-closed。
         """
         fd = getattr(wal, "_fd", None)
@@ -187,7 +187,7 @@ class ReceiptChain:
         rescan = getattr(wal, "_rescan_from_disk", None)
         if callable(rescan):
             rescan()
-    def _refresh_receipts_locked(self) -> None:
+    def refresh_locked(self) -> None:
         """scope 临界区内：从 EventLog **增量**刷新 head/ids（跨进程安全）。
 
         根因（K-24 后续）：`_receipt_heads`/`_receipt_ids` 只在 `__init__`/
@@ -236,7 +236,7 @@ class ReceiptChain:
         if not isinstance(run_id, str) or not run_id:
             return None
         return (run_id, payload.get("logical_subgoal_id") or "")
-    def _scope_lock(self, scope: tuple[str, str]):
+    def scope_lock(self, scope: tuple[str, str]):
         """取（必要时创建）scope 锁；只护锁表，极短，不覆盖临界区。
 
         **durable 模式**：返回跨进程 `receipts.lock`（flock，全序第 1 位），
@@ -277,13 +277,13 @@ class ReceiptChain:
         if self.deps.epoch_scope != "run":
             return max(0, self.deps.event_log.tail() - self.deps.retention + 1)
         return max(0, self._run_tail(run_id) - self.deps.retention + 1)
-    def _receipt_secret(self) -> str:
+    def receipt_secret(self) -> str:
         """收据签名密钥来源：构造参数优先，否则读 env（开关独立于 secret 是否存在）。"""
         if self.state.auth_secret:
             return self.state.auth_secret
         return os.environ.get("HARNESS_AUTH_SECRET", "")
     @staticmethod
-    def _commit_key(acb: ACB, resource: str, content_hash: str, mode: Mode) -> str:
+    def commit_key(acb: ACB, resource: str, content_hash: str, mode: Mode) -> str:
         """同一逻辑提交恒等键（P0-2）：**不含 base_version**。
 
         `base_version` 是「读到哪一版」的**状态**而非写的内容；刷新 ACB
@@ -293,7 +293,7 @@ class ReceiptChain:
         raw = (f"{acb.run_id}|{acb.logical_subgoal_id}|{resource}|"
                f"{content_hash}|{mode.value}")
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-    def _dedup_event(self, acb: ACB, resource: str, blob_hash: str,
+    def dedup_event(self, acb: ACB, resource: str, blob_hash: str,
                      deleted: bool, mode: Mode):
         """查找既有 `RESOURCE_COMMITTED`：同 (run, subgoal, resource, content, mode)。
 
@@ -330,7 +330,7 @@ class ReceiptChain:
                 return None                   # 命中的是陈旧版本 → 视为新写（P1-B）
             return ev
         return None
-    def _ext_key_lock(self, key: str):
+    def ext_key_lock(self, key: str):
         """S22：外部幂等键的进程内串行锁（只护锁表，不覆盖临界区）。"""
         with self.state.lock:
             lock = self.state.ext_key_locks.get(key)
@@ -338,7 +338,7 @@ class ReceiptChain:
                 lock = threading.RLock()
                 self.state.ext_key_locks[key] = lock
             return lock
-    def _dedup_by_external_key(self, key: str, expected: set):
+    def dedup_by_external_key(self, key: str, expected: set):
         """S22：按**外部业务键**查既有提交（事件即真相，不另建存储）。
 
         `expected = {(resource, blob_hash, deleted)}`。
@@ -375,7 +375,7 @@ class ReceiptChain:
                     receipt_ids.append(rid)
         seq = max(int(getattr(e, "seq", 0) or 0) for e in hits)
         return tuple(hits), tuple(receipt_ids), seq
-    def _replay_dedup_events(self, dedup_events) -> None:
+    def replay_dedup_events(self, dedup_events) -> None:
         """P0-1①：把已提交但未投影的 `RESOURCE_COMMITTED` 补投影到 manifest。
 
         用版本守卫投影（`_project_event`），既补上缺失投影，又不会把 manifest
@@ -384,25 +384,25 @@ class ReceiptChain:
         for ev in dedup_events:
             if ev is not None:
                 self.deps.workspace.apply_event(ev)
-    def _refresh_after_commit(self, acb: ACB, records) -> None:
+    def refresh_after_commit(self, acb: ACB, records) -> None:
         """⑦′：自写后重读，刷新 ACB 的 read_set / base_version。"""
         for w, _draft, _vb, _va, _ck in records:
             new_version = self.deps.workspace.version(w.resource)
             acb.read_set[w.resource] = new_version
             acb.base_version[w.resource] = new_version
-    def _receipt_event(self, receipt_id: str):
+    def receipt_event(self, receipt_id: str):
         for ev in reversed(self.deps.event_log.all()):
             if ev.kind == EventKind.RECEIPT_ISSUED and ev.subject == receipt_id:
                 return ev
         return None
-    def _receipt_is_stale(self, receipt_id: str) -> bool:
+    def receipt_is_stale(self, receipt_id: str) -> bool:
         """该 `receipt_id` 对应的收据是否为「陈旧内容」收据（P1-B 后续）。
 
         若资源当前版本已推进到比该收据 `version_after` 更新的位置，说明该内容
         已被后续写覆盖 → 本次是**合法新写**（dedup 正确地未命中陈旧版本），
         应换 receipt_id 而不是永久冲突。
         """
-        ev = self._receipt_event(receipt_id)
+        ev = self.receipt_event(receipt_id)
         if ev is None:
             return False
         try:
@@ -410,7 +410,7 @@ class ReceiptChain:
         except ReceiptMalformed:
             return False
         return self.deps.workspace.version(receipt.resource) != receipt.version_after
-    def _derive_receipt_id(self, commit_key: str) -> str:
+    def derive_receipt_id(self, commit_key: str) -> str:
         """为合法重写派生一个不冲突的 `receipt_id`（换 receipt_id，P2-C）。"""
         n = 1
         candidate = f"{commit_key}#{n}"
@@ -450,7 +450,7 @@ class ReceiptChain:
         P2：tainted scope（畸形/重复/断链）→ `False`（拒绝继续扩展坏链）。
         """
         receipts = self.receipts_of(run_id, logical_subgoal_id)
-        secret = self._receipt_secret()
+        secret = self.receipt_secret()
         if logical_subgoal_id is not None:
             if (run_id, logical_subgoal_id) in self.state.tainted_scopes:
                 return False
@@ -497,7 +497,7 @@ class ReceiptChain:
         """P2-C 显式对账入口：解除 `ReceiptConflict` 造成的 scope 隔离。
 
         `ReceiptConflict` 的根因是「收据已签发（`receipt_id` 在 `_receipt_ids`），
-        但对应的 `RESOURCE_COMMITTED` 事件缺失」→ `_dedup_event` 失效 → 同逻辑写
+        但对应的 `RESOURCE_COMMITTED` 事件缺失」→ `dedup_event` 失效 → 同逻辑写
         **永久**冲突。本入口执行**补写丢失的 RESOURCE_COMMITTED**：
 
         ① 对该 scope 的每条收据，若缺少对应的提交事件，且 workspace 的当前版本

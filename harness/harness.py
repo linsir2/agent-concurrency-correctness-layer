@@ -507,12 +507,12 @@ class Harness:
     def _rescan_wal_from_disk(*args, **kwargs):
         return ReceiptChain._rescan_wal_from_disk(*args, **kwargs)
     def _refresh_receipts_locked(self, *args, **kwargs):
-        return self.receipts._refresh_receipts_locked(*args, **kwargs)
+        return self.receipts.refresh_locked(*args, **kwargs)
     @staticmethod
     def _payload_scope(*args, **kwargs):
         return ReceiptChain._payload_scope(*args, **kwargs)
     def _scope_lock(self, *args, **kwargs):
-        return self.receipts._scope_lock(*args, **kwargs)
+        return self.receipts.scope_lock(*args, **kwargs)
     def _sync_run_cursors(self, *args, **kwargs):
         return self.receipts._sync_run_cursors(*args, **kwargs)
     def _track_run_cursor(self, *args, **kwargs):
@@ -522,26 +522,26 @@ class Harness:
     def floor_for(self, *args, **kwargs):
         return self.receipts.floor_for(*args, **kwargs)
     def _receipt_secret(self, *args, **kwargs):
-        return self.receipts._receipt_secret(*args, **kwargs)
+        return self.receipts.receipt_secret(*args, **kwargs)
     @staticmethod
     def _commit_key(*args, **kwargs):
-        return ReceiptChain._commit_key(*args, **kwargs)
+        return ReceiptChain.commit_key(*args, **kwargs)
     def _dedup_event(self, *args, **kwargs):
-        return self.receipts._dedup_event(*args, **kwargs)
+        return self.receipts.dedup_event(*args, **kwargs)
     def _ext_key_lock(self, *args, **kwargs):
-        return self.receipts._ext_key_lock(*args, **kwargs)
+        return self.receipts.ext_key_lock(*args, **kwargs)
     def _dedup_by_external_key(self, *args, **kwargs):
-        return self.receipts._dedup_by_external_key(*args, **kwargs)
+        return self.receipts.dedup_by_external_key(*args, **kwargs)
     def _replay_dedup_events(self, *args, **kwargs):
-        return self.receipts._replay_dedup_events(*args, **kwargs)
+        return self.receipts.replay_dedup_events(*args, **kwargs)
     def _refresh_after_commit(self, *args, **kwargs):
-        return self.receipts._refresh_after_commit(*args, **kwargs)
+        return self.receipts.refresh_after_commit(*args, **kwargs)
     def _receipt_event(self, *args, **kwargs):
-        return self.receipts._receipt_event(*args, **kwargs)
+        return self.receipts.receipt_event(*args, **kwargs)
     def _receipt_is_stale(self, *args, **kwargs):
-        return self.receipts._receipt_is_stale(*args, **kwargs)
+        return self.receipts.receipt_is_stale(*args, **kwargs)
     def _derive_receipt_id(self, *args, **kwargs):
-        return self.receipts._derive_receipt_id(*args, **kwargs)
+        return self.receipts.derive_receipt_id(*args, **kwargs)
     def receipts_of(self, *args, **kwargs):
         return self.receipts.receipts_of(*args, **kwargs)
     def verify_receipts(self, *args, **kwargs):
