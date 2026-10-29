@@ -1159,11 +1159,12 @@ class Deterministic:
 | P2-2 | `FileCheckpointStore(entropy, clock)`、`Harness` 接线 | `tests/test_s24_determinism.py` 23 passed |
 | P2-3 | WAL `_canon_default`、`tests/_s24_hash_child.py`、`test_s24_cross_process_replay.py` | 4 passed（4 个 seed 摘要全等） |
 | P2-4 | `Deterministic._assert_owner()` | 跨线程/时钟/构造线程用例绿 |
+| 补壳 | `harness/ergonomics.py`（`@rsc_tool` / `rsc_task` / `rsc_session`）、`docs/quickstart.md`、`examples/quickstart/run.py` | 17 条接入壳用例 + 四场景样例（S1–S4）真跑 |
 
 门禁快照：
 
-- 主门禁：**907 passed / 23 skipped / 4 xfailed**（80s）；
-- 带 TLA jar：**919 passed / 11 skipped / 4 xfailed**（92s）；
+- 主门禁：**924 passed / 23 skipped / 4 xfailed**（88s）；
+- 带 TLA jar：**936 passed / 11 skipped / 4 xfailed**（95s）；
 - 完整混沌：`RSC_CHAOS=1 pytest tests/test_s24_raft_chaos.py` = **7 passed**；
 - `ruff check .` 0；`scripts/check_s24_conformance.py` **217/217**；
   `scripts/check_docs_consistency.py` **0 findings**。

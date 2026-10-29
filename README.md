@@ -11,6 +11,7 @@
 
 | 文档 | 内容 |
 |---|---|
+| **[快速开始](docs/quickstart.md)** | **怎么用**：`@rsc_tool` / `rsc_task` 一行接入、结果映射（Receipt/Conflict/Deny/Wait）、四个端到端场景、跨语言 sidecar、以及**什么时候别用** |
 | [第一阶段实现方案 v1.1](docs/phase1-implementation-plan.md) | 阶段一 MVP 的落地设计：提交点（WAL+blob）、补偿幂等键、EffectJournal 去重语义、全局锁序、S0–S8 实施步骤、19 个可判定测试、基准防作弊 |
 | [S2 详细方案 v1.3](docs/s2-workspace-and-locks.md) | manifest + blob 读模型、每资源锁与全序批量获取、租约时钟与过期语义、提交点顺序、4 组可判定测试（T4/T5/T5b/T7） |
 | [S3 详细方案 v1.3](docs/s3-rebase-and-compensation.md) | 结构化冲突的 JSON 3-way merge（`SET` 增并删减 / GROW_ONLY / REPLACE / PIVOT）、有界 rebase 回路、Delete 哨兵与 tombstone、resolver 三层安全防护 |
@@ -56,18 +57,50 @@
 
 详见 [harness/README.md](harness/README.md)。
 
+## 快速开始
+
+```python
+from harness import Harness, RscSession
+from harness.ergonomics import rsc_session, rsc_tool
+from harness.worktree import WorktreeManager
+
+h = Harness(run_limits=1000, checkpoint_root="./state")
+session = RscSession(h, tenant="team-a", min_budget=1,
+                     worktrees=WorktreeManager("./repo", "./state/wt"),
+                     state_dir="./state",
+                     verify_cmd=["python3", "-c", "import app"],  # 可选
+                     semantic="block")                            # 可选
+
+@rsc_tool(writes=["app/feature.py"], reads=["app/core.py"], retry=1)
+def add_feature(ctx, text: str) -> str:
+    ctx.write("app/feature.py", text)     # 写私有 worktree + 登记提交
+    return "ok"
+
+with rsc_session(session, "agent-a"):
+    add_feature("...")                    # begin/apply/finish 全自动
+```
+
+四个可跑场景（无需 API key）：
+
+```bash
+python3 examples/quickstart/run.py   # S1 语义冲突 / S2 CAS 重试 / S3 崩溃续跑 / S4 配额
+```
+
+完整说明见 [docs/quickstart.md](docs/quickstart.md)。
+
 ## 运行测试
 
 ```bash
-python3 -m pytest tests/ -q                      # 851 passed / 14 skipped / 4 xfailed
-TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 859 passed / 6 skipped
-python3 -m harness.spec.corpus --check           # 合规语料无漂移（35 / 0）
+python3 -m pytest tests/ -q                      # 924 passed / 23 skipped / 4 xfailed
+TLA2TOOLS_JAR=/tmp/tla2tools.jar python3 -m pytest tests/ -q   # 936 passed / 11 skipped
+RSC_CHAOS=1 python3 -m pytest tests/test_s24_raft_chaos.py -q   # 7 passed（3 进程 + 真 TCP）
+python3 -m harness.spec.corpus --check           # 合规语料无漂移（47 / 0）
 python3 -m harness.diagnose --state-dir <dir>    # 只读诊断，退出码 0/1/2
 python3 -m bench.llm_replay --json               # token 基准回放（n=1，离线）
-python3 scripts/check_tla.py --jar /tmp/tla2tools.jar   # 4 正确 + 4 反例
+python3 scripts/check_tla.py --jar /tmp/tla2tools.jar   # 5 正确 + 5 反例 + 2 活性
 ```
 
-> 主门禁**不依赖 Java**：未提供 `TLA2TOOLS_JAR` 时 8 条 TLA 用例显式 skip（不假绿），
+> 主门禁**不依赖 Java**：未提供 `TLA2TOOLS_JAR` 时 12 条 TLA 用例显式 skip（不假绿），
 > `scripts/check_tla.py --require` 才会因缺工具链硬失败。
 
 测试覆盖：U1–U4 真实用例、A1–A13 对抗用例（含背压降级）、MS0 出口（seq 单调 + schema 定稿 + 状态机表驱动）、MS7 出口（能力强制）、MS8 出口（I1–I13 一致性校验）。

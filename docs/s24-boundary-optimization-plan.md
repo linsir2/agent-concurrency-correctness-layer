@@ -146,5 +146,9 @@
 | P2-4 `Deterministic` 线程守卫 | ✅ | 构造线程记录；跨线程 `ValueError` 且不推进计数/时钟 |
 
 > 环境说明：pysyncobj 在本环境重新安装后 raft 用例恢复真跑；TLA jar 需按 README 下载。
-> 主门禁当前快照：**907 passed / 23 skipped / 4 xfailed**；带 TLA jar：**919 / 11 / 4**；
+> 主门禁当前快照：**924 passed / 23 skipped / 4 xfailed**；带 TLA jar：**936 / 11 / 4**；
 > 完整混沌矩阵（`RSC_CHAOS=1`）单独 7 passed。
+>
+> 补充（接入壳）：`harness/ergonomics.py`（`@rsc_tool` / `rsc_task` / `rsc_session`）
+> + `examples/quickstart/run.py` 四场景 + `tests/test_s24_ergonomics.py` 17 条
+> + quickstart 防腐 1 条。
