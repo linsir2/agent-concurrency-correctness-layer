@@ -66,6 +66,11 @@ class ChildManager:
         self.state = state
 
     # ---- S13c §2.4：spawn_child -------------------------------------
+    @property
+    def index(self):
+        """`parent_id -> {child_acb_id}` 反向索引（旧 `Harness._children_index`）。"""
+        return self.state.children_index
+
     def _spawn_depth_of(self, acb: ACB) -> int:
         """父 ACB 的嵌套深度（根 = 0）。
 
@@ -168,7 +173,7 @@ class ChildManager:
             ids.add(str(cid))
         return ids
 
-    def _ref_for_child(self, child_id: str, info: dict | None = None):
+    def ref_for_child(self, child_id: str, info: dict | None = None):
         """C1：按 `child_id` 找回子快照（ref=None 的崩溃窗口）。
 
         先查 per-ACB 指针，再退到 `(run_id, task_id, logical_subgoal)` 指针。
@@ -192,7 +197,7 @@ class ChildManager:
                 return None
         return None
 
-    def _settle_orphan_child(self, parent_acb: ACB, child_id: str,
+    def settle_orphan_child(self, parent_acb: ACB, child_id: str,
                              info: dict | None = None) -> bool:
         """C1：spawn 崩溃窗口的孤儿结算（父预算节点上的 ACTIVE 预留）。
 
@@ -266,11 +271,11 @@ class ChildManager:
             if ref:
                 new_entries.append((cid, ref))
                 continue
-            found = self._ref_for_child(cid)
+            found = self.ref_for_child(cid)
             if found:
                 new_entries.append((cid, found))
             else:
-                self._settle_orphan_child(acb, cid)
+                self.settle_orphan_child(acb, cid)
             changed = True
         if changed:
             acb.children_ids = new_entries
@@ -288,7 +293,7 @@ class ChildManager:
         promoted_slices = 0
         for child_id, info in list(pending.items()):
             info = info if isinstance(info, dict) else {}
-            ref = self._ref_for_child(str(child_id), info)
+            ref = self.ref_for_child(str(child_id), info)
             promoted = False
             if ref:
                 try:
@@ -314,7 +319,7 @@ class ChildManager:
                         new_ids.append((str(child_id), ref))
                     acb.children_ids = new_ids
             if not promoted:
-                self._settle_orphan_child(acb, str(child_id), info)
+                self.settle_orphan_child(acb, str(child_id), info)
             else:
                 slice_amt = info.get("slice")
                 if isinstance(slice_amt, int) and not isinstance(slice_amt, bool):
@@ -518,7 +523,7 @@ class ChildManager:
                 }
             self.deps.safe_save(child)
             # ③ 成功后转正：清 pending、按 child_id 精确回填 ref，再落盘。
-            ref = self._ref_for_child(child.id, pending_info)
+            ref = self.ref_for_child(child.id, pending_info)
             parent_acb.children_pending.pop(child_id, None)
             # 精确移除同 id 的旧条目（绝不 `pop()` 末尾，避免并发/重复写错位）。
             parent_acb.children_ids = [
@@ -553,7 +558,7 @@ class ChildManager:
 
     def _load_persisted_child(self, child_id: str, ref: str | None):
         """C3：按 ref 加载子快照为 ACB；不可读 → `None`。"""
-        ref = ref or self._ref_for_child(child_id)
+        ref = ref or self.ref_for_child(child_id)
         if not ref:
             return None
         try:
@@ -725,7 +730,7 @@ class ChildManager:
         if parent_id and str(child_id) != str(parent_id):
             self.state.children_index.setdefault(str(parent_id), set()).add(str(child_id))
 
-    def _ensure_children_index(self) -> None:
+    def ensure_children_index(self) -> None:
         """按 `parent_id` / `spec.spawn.parent_id` 反扫全部快照，建父→子索引。
 
         只在第一次取消级联/恢复子时构建一次；`spawn_child` 与 `_restore_acb`
@@ -773,7 +778,7 @@ class ChildManager:
         if not parent_id:
             return
         self._index_child(fresh.id, parent_id)   # X6：替换后的新身份也进反扫索引
-        fresh_ref = fresh.result_ref or self._ref_for_child(fresh.id)
+        fresh_ref = fresh.result_ref or self.ref_for_child(fresh.id)
 
         def _patch(entries):
             out: list = []

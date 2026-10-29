@@ -1311,7 +1311,7 @@ class Harness:
 
     # ---- 端到端运行 -----------------------------------------------
     def _admit_and_register(self, *args, **kwargs):
-        return self.tasks._admit_and_register(*args, **kwargs)
+        return self.tasks.admit_and_register(*args, **kwargs)
 
     def dispatch_and_run(self, *args, **kwargs):
         return self.tasks.dispatch_and_run(*args, **kwargs)
@@ -1365,10 +1365,10 @@ class Harness:
         return self.children._child_ids_for_cancel(*args, **kwargs)
 
     def _ref_for_child(self, *args, **kwargs):
-        return self.children._ref_for_child(*args, **kwargs)
+        return self.children.ref_for_child(*args, **kwargs)
 
     def _settle_orphan_child(self, *args, **kwargs):
-        return self.children._settle_orphan_child(*args, **kwargs)
+        return self.children.settle_orphan_child(*args, **kwargs)
 
     def _reconcile_children_refs(self, *args, **kwargs):
         return self.children._reconcile_children_refs(*args, **kwargs)
@@ -1395,13 +1395,13 @@ class Harness:
         return self.tasks._approval_slot(*args, **kwargs)
 
     def _record_approval(self, *args, **kwargs):
-        return self.tasks._record_approval(*args, **kwargs)
+        return self.tasks.record_approval(*args, **kwargs)
 
     def _hitl_gate(self, *args, **kwargs):
         return self.tasks._hitl_gate(*args, **kwargs)
 
     def _terminal_status(self, *args, **kwargs):
-        return self.tasks._terminal_status(*args, **kwargs)
+        return self.tasks.terminal_status(*args, **kwargs)
 
     def tick(self, *args, **kwargs):
         return self.dispatch.tick(*args, **kwargs)
@@ -1656,10 +1656,10 @@ class Harness:
 
     # ---- S13d §2.5：aging（墙钟 deadline）+ claim fencing --------------
     def _arm_aging(self, *args, **kwargs):
-        return self.dispatch._arm_aging(*args, **kwargs)
+        return self.dispatch.arm_aging(*args, **kwargs)
 
     def _aging_timeout(self, *args, **kwargs):
-        return self.dispatch._aging_timeout(*args, **kwargs)
+        return self.dispatch.aging_timeout(*args, **kwargs)
 
     def readmit_after_aging(self, *args, **kwargs):
         return self.dispatch.readmit_after_aging(*args, **kwargs)
@@ -1677,7 +1677,7 @@ class Harness:
         return self.dispatch.claim_scope(*args, **kwargs)
 
     def _claim_fenced(self, *args, **kwargs):
-        return self.dispatch._claim_fenced(*args, **kwargs)
+        return self.dispatch.claim_fenced(*args, **kwargs)
 
     def _claim_snapshot(self, *args, **kwargs):
         return self.dispatch._claim_snapshot(*args, **kwargs)
@@ -1687,7 +1687,7 @@ class Harness:
         return self.children._index_child(*args, **kwargs)
 
     def _ensure_children_index(self, *args, **kwargs):
-        return self.children._ensure_children_index(*args, **kwargs)
+        return self.children.ensure_children_index(*args, **kwargs)
 
     def _run_one(self, *args, **kwargs):
         return self.dispatch._run_one(*args, **kwargs)
@@ -1711,7 +1711,7 @@ class Harness:
         return self.tasks._admit_ready_successor(*args, **kwargs)
 
     def _adopt_capability(self, *args, **kwargs):
-        return self.tasks._adopt_capability(*args, **kwargs)
+        return self.tasks.adopt_capability(*args, **kwargs)
 
     def _register_token(self, acb: ACB, token) -> None:
         """C5：恢复/签发的 token 必须注册进 `policy._tokens`（否则 `_traceable` 全红）。
@@ -1809,13 +1809,13 @@ class Harness:
         return self.tasks._admission_key_for(*args, **kwargs)
 
     def _lookup_admission(self, *args, **kwargs):
-        return self.tasks._lookup_admission(*args, **kwargs)
+        return self.tasks.lookup_admission(*args, **kwargs)
 
     def _register_admission(self, *args, **kwargs):
-        return self.tasks._register_admission(*args, **kwargs)
+        return self.tasks.register_admission(*args, **kwargs)
 
     def _clear_admission(self, *args, **kwargs):
-        return self.tasks._clear_admission(*args, **kwargs)
+        return self.tasks.clear_admission(*args, **kwargs)
 
     # ---- S3.1：已迁至 kernel/children.py（旧名委托，S5 删除）----
     def _replace_child_ref(self, *args, **kwargs):
@@ -1823,7 +1823,7 @@ class Harness:
 
     # ---- R7：每 ACB 一把 transition 锁 -------------------------------
     def _transition_lock(self, *args, **kwargs):
-        return self.tasks._transition_lock(*args, **kwargs)
+        return self.tasks.transition_lock(*args, **kwargs)
 
     def _finalize(self, *args, **kwargs):
         return self.tasks._finalize(*args, **kwargs)
@@ -1867,7 +1867,7 @@ class Harness:
 
     def _restore_acb(self, data: dict, resume_policy: str = "RESUME", *,
                      bump_epoch: bool = True, for_sweep: bool = False) -> ACB:
-        return self.recovery._restore_acb(
+        return self.recovery.restore_acb(
             data, resume_policy, bump_epoch=bump_epoch, for_sweep=for_sweep)
 
     def _restore_capability(self, acb: ACB, cap) -> None:

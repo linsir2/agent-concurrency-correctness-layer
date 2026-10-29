@@ -128,7 +128,7 @@ def test_c7_6_coordinator_unavailable_is_deny(monkeypatch, repo, tmp_path):
     def _boom(*_a, **_kw):
         raise RaftUnavailable("no quorum")
 
-    monkeypatch.setattr(h, "_admit_and_register", _boom)
+    monkeypatch.setattr(h.tasks, "admit_and_register", _boom)
     r = s.begin("a1", "i1", writes=["a.txt"])
     assert isinstance(r, Deny) and "coordinator_unavailable" in r.reason
 

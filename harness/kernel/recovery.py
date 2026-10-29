@@ -5,7 +5,7 @@
 - 入口 `recover`（**13 步有序过程**：租约 → load_strict → 收据/日志重建 →
   epoch → ACB 重建 → 事件重放 → probe → COMPENSATE 终态策略 → 不变量 →
   注册/准入 → 子对账 → 暂停态 → tick）；
-- ACB 重建（`_restore_acb`）与其三分支：能力（`_restore_capability`）、
+- ACB 重建（`restore_acb`）与其三分支：能力（`_restore_capability`）、
   预算（`_restore_budget` → 重放 / 逐笔账本）、槽位交叉校验；
 - 预算重放（`_replay_budget_events` / `_restore_budget_by_replay` /
   `_declared_budget_nodes` / `_restore_budget_ledger` / `_restore_path` /
@@ -139,7 +139,7 @@ class RecoveryService:
         self.deps.effects.rebuild_from(mine)
         self.deps.comp_journal.rebuild_from(mine)
         self.deps.restore_epoch()                          # S10a §3.4：epoch 读持久化值
-        acb = self._restore_acb(data, resume_policy)
+        acb = self.restore_acb(data, resume_policy)
         # 恢复已应用事件集合（去重键持久化，避免重放重复投影）
         persisted = data.get("applied_event_ids")
         if persisted:
@@ -212,7 +212,7 @@ class RecoveryService:
         self.deps.tick(persist_scan=False)
         return acb
 
-    def _restore_acb(self, data: dict, resume_policy: str = "RESUME", *,
+    def restore_acb(self, data: dict, resume_policy: str = "RESUME", *,
                      bump_epoch: bool = True, for_sweep: bool = False) -> ACB:
         """从 checkpoint 重建 ACB；失败改 `needs_readmit`（**不抛**，§4.3）。
 

@@ -8,9 +8,9 @@
   `_drain_scheduler_claimed` / `_drain_skip_reason` / `_is_current_plan_version`；
 - 超时驱动面与排空：`tick` / `_tick_candidates` / `_pending_deadlines` /
   `next_deadline_ms` / `pump` / `drain`；
-- aging（墙钟）：`_arm_aging` / `_aging_timeout` / `readmit_after_aging`；
+- aging（墙钟）：`arm_aging` / `aging_timeout` / `readmit_after_aging`；
 - claim fencing：`_exec_claim_epoch` / `_bind_claim_epoch` / `_unbind_claim_epoch` /
-  `claim_scope` / `_claim_fenced` / `_claim_snapshot` / `claim_window_s`，以及
+  `claim_scope` / `claim_fenced` / `_claim_snapshot` / `claim_window_s`，以及
   监督者回收 `supervisor_note_crash`。
 
 约定（与 `kernel/tasks.py` / `kernel/children.py` 一致）：
@@ -360,6 +360,11 @@ class DispatchService:
             out.append((int(deadline), acb.id))
         return out
 
+    @property
+    def skipped(self):
+        """调度跳过原因（旧 `Harness._drain_skipped`；唯一对象在 KernelState）。"""
+        return self.state.drain_skipped
+
     def next_deadline_ms(self) -> int | None:
         """最近的到期时刻；`None` = 当前无待结算项。
 
@@ -510,13 +515,13 @@ class DispatchService:
 
     # ============================== aging（墙钟 deadline）+ claim fencing
 
-    def _arm_aging(self, acb: ACB) -> None:
+    def arm_aging(self, acb: ACB) -> None:
         """准入成功后起算 aging（`aging_ms=0` = 禁用，不改既有语义）。"""
         if self.state.aging_ms <= 0:
             return
         acb.aging_deadline = int(self.deps.clock.now_ms()) + int(self.state.aging_ms)
 
-    def _aging_timeout(self, acb: ACB) -> None:
+    def aging_timeout(self, acb: ACB) -> None:
         """到期未调度：单次 → INADMISSIBLE（可 readmit）+ 结算；累计 N → DEAD_LETTER。
 
         P1-1：`INADMISSIBLE` 是**非终态**，若不给出路 Run 永不 finalize。故
@@ -625,7 +630,7 @@ class DispatchService:
 
         return _Scope()
 
-    def _claim_fenced(self, acb: ACB) -> bool:
+    def claim_fenced(self, acb: ACB) -> bool:
         """P0-10：写路径 fencing —— 比较**执行上下文 epoch**，不读共享 ACB。
 
         - 活跃 claim 存在：上下文没有 epoch（外部线程）或 epoch 不等 → fenced；
@@ -674,7 +679,7 @@ class DispatchService:
         """Supervisor 心跳超时回收（文档 §5.8③）。
 
         X1：**先 revoke claim（记录 epoch 水位）再落盘**。否则 save 走
-        `_claim_fenced` 时会因「claim 存在但主线程无执行上下文」被拒；而撤销
+        `claim_fenced` 时会因「claim 存在但主线程无执行上下文」被拒；而撤销
         水位保证旧 worker（线程本地 epoch 落后）此后所有写一律 `REJECT_STALE`。
         """
         self.deps.intents.revoke_all(acb.id)

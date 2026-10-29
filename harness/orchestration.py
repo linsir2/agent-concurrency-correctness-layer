@@ -474,7 +474,7 @@ class Dispatcher:
         （不再只在 `required_tools` 非空时才看能力）——否则
         `try_admit(..., token="garbage-token")` 会直接 ADMITTED。
         """
-        token = self.h._effective_token(acb)
+        token = self.h.identity.effective_token(acb)
         if token is not None:
             resolved = self.h.policy.resolve_token(token)
             if resolved is None or resolved.agent_id not in (acb.id, "*"):
@@ -527,12 +527,12 @@ class Dispatcher:
         key = (run_id, task["task_id"], plan_version)
         prev = None
         if not replace:
-            existing = self.h._lookup_admission(key)
+            existing = self.h.tasks.lookup_admission(key)
             if existing is not None:
                 return existing
         else:
             # C6：replace 也必须继承**旧 ACB 的 lineage**（parent_id 不可变）。
-            prev = self.h._lookup_admission(key)
+            prev = self.h.tasks.lookup_admission(key)
         acb = ACB(id=f"A-{run_id}-{task['task_id']}-{self._next_attempt()}",
                   run_id=run_id, task_id=task["task_id"],
                   logical_subgoal_id=task["logical_subgoal_id"])
@@ -543,7 +543,7 @@ class Dispatcher:
             if prev.parent_id and token is None:
                 # 子被重新准入仍必须是原子树之子：预先按旧 token 签发继承快照，
                 # 否则 `_capability_ok` 会因 parent_id 非空而 fail-closed。
-                self.h._adopt_capability(prev, acb)
+                self.h.tasks.adopt_capability(prev, acb)
         # S13b D10：记录准入时的 plan 版本 —— `_finalize` / `_drain_scheduler`
         # 按 `(run_id, task_id, plan_version)` 解析「当前版本唯一 ACB」，
         # 避免 replan 后旧代际 ACB 被误跑（双跑）。
@@ -583,12 +583,12 @@ class Dispatcher:
                 acb, task, required_tools, eff_plan)
         if committed:
             if replace:
-                self.h._clear_admission(key)
-            self.h._register_admission(acb)
+                self.h.tasks.clear_admission(key)
+            self.h.tasks.register_admission(acb)
             self.h.budget.flush_pending()           # 成功 → 同帧 append_batch
             # S13d §2.5 / B-4：aging 是**墙钟**语义 —— 准入成功即起算，
             # `tick()` 扫描到期项（`aging_ms=0` 表示禁用，不改既有语义）。
-            self.h._arm_aging(acb)
+            self.h.dispatch.arm_aging(acb)
         else:
             self.h.budget.discard_pending()         # 失败 → 丢弃草稿
         return acb
@@ -1038,7 +1038,7 @@ class RunCoordinator:
         with self._lock:
             self._cancelled_acbs.add(acb.id)
         if acb.state in TASK_TERMINAL:
-            self.h._drain_skipped.append((acb.id, "cancel_skip_terminal"))
+            self.h.dispatch.skipped.append((acb.id, "cancel_skip_terminal"))
             if cascade:
                 self._walk_children(acb, seen)
             return
@@ -1051,7 +1051,7 @@ class RunCoordinator:
     def _settle_cancel(self, acb: ACB) -> None:
         """状态 → CANCELLED + 租约/预算/槽位**幂等**结算 + 落盘。"""
         try:
-            with self.h._transition_lock(acb):
+            with self.h.tasks.transition_lock(acb):
                 advance(acb, "cancel")          # 终态 → INVALID_INPUT（不抛）
                 self.h.intents.revoke_all(acb.id)
                 for rid in list(acb.reservation_ids):
@@ -1066,7 +1066,7 @@ class RunCoordinator:
                     acb.budget_node = None
                 self.h._safe_save(acb)
         except Exception as exc:  # noqa: BLE001  # 单个后代异常绝不中断级联
-            self.h._drain_skipped.append((acb.id, f"cancel_error:{type(exc).__name__}"))
+            self.h.dispatch.skipped.append((acb.id, f"cancel_error:{type(exc).__name__}"))
         self.h.bump_epoch()
 
     def _walk_children(self, acb: ACB, seen: set[str]) -> None:
@@ -1087,7 +1087,7 @@ class RunCoordinator:
             try:
                 cid, ref = str(entry[0]), (entry[1] if len(entry) > 1 else None)
             except (TypeError, IndexError):
-                self.h._drain_skipped.append((acb.id, "cancel_bad_child_entry"))
+                self.h.dispatch.skipped.append((acb.id, "cancel_bad_child_entry"))
                 continue
             entries.append((self.h.acbs.get(cid), ref, cid))
         pending = getattr(acb, "children_pending", None) or {}
@@ -1100,9 +1100,9 @@ class RunCoordinator:
         # X6：跨 run 子（`spec.spawn.parent_id`）反向索引 —— 老 checkpoint 的
         # `children_ids` 缺失时，子可能既不在父 run 枚举、也不在上面的三源里。
         # 不补这一步 → 取消**静默漏掉**跨 run 子。
-        self.h._ensure_children_index()
+        self.h.children.ensure_children_index()
         known = {str(cid) for _child, _ref, cid in entries}
-        for cid in sorted(self.h._children_index.get(acb.id, ())):
+        for cid in sorted(self.h.children.index.get(acb.id, ())):
             if cid in seen or cid in known:
                 continue
             entries.append((self.h.acbs.get(cid), None, cid))
@@ -1111,14 +1111,14 @@ class RunCoordinator:
                 self._cancel_one(child, seen, cascade=True)
                 continue
             if not ref:
-                ref = self.h._ref_for_child(cid, pending.get(cid)
+                ref = self.h.children.ref_for_child(cid, pending.get(cid)
                                             if isinstance(pending.get(cid), dict)
                                             else None)
             if ref:
                 self._cancel_from_ref(ref, seen, child_id=cid)
                 continue
             # C1：无 ref 且无快照 → 孤儿结算（事件留痕 + _drain_skipped）。
-            self.h._settle_orphan_child(acb, cid, pending.get(cid))
+            self.h.children.settle_orphan_child(acb, cid, pending.get(cid))
 
     def _cancel_from_ref(self, ref: str | None, seen: set[str],
                          *, child_id: str | None = None) -> None:
@@ -1128,9 +1128,9 @@ class RunCoordinator:
         C3：终态子也要继续遍历其后代（父终态不代表子树终态）。
         """
         if not ref and child_id:
-            ref = self.h._ref_for_child(str(child_id))
+            ref = self.h.children.ref_for_child(str(child_id))
         if not ref:
-            self.h._drain_skipped.append(
+            self.h.dispatch.skipped.append(
                 (str(child_id if child_id is not None else ref),
                  "cancel_skip_missing_ref"))
             return
@@ -1140,20 +1140,20 @@ class RunCoordinator:
             try:
                 data = self.h.checkpoints.load(ref)
             except Exception:  # noqa: BLE001
-                self.h._drain_skipped.append((str(ref), "cancel_skip_unreadable_ref"))
+                self.h.dispatch.skipped.append((str(ref), "cancel_skip_unreadable_ref"))
                 return
         acb = self._stub_from_payload(data)
         if acb.id in seen:
             return
         seen.add(acb.id)
         if acb.state in TASK_TERMINAL:
-            self.h._drain_skipped.append((acb.id, "cancel_skip_terminal"))
+            self.h.dispatch.skipped.append((acb.id, "cancel_skip_terminal"))
             self._walk_children(acb, seen)
             return
         node_id = data.get("budget_node_id")
         node = self.h.budget._nodes.get(node_id) if node_id else None
         if node_id and node is None:
-            self.h._drain_skipped.append((acb.id, "cancel_skip_node_archived"))
+            self.h.dispatch.skipped.append((acb.id, "cancel_skip_node_archived"))
         acb.budget_node = node
         acb.reservation_ids = list(data.get("reservation_ids") or [])
         with self._lock:
@@ -1181,9 +1181,9 @@ class RunCoordinator:
             acb_id = str(acb_id)
             if acb_id in seen:
                 continue
-            ref = ref or self.h._ref_for_child(acb_id)
+            ref = ref or self.h.children.ref_for_child(acb_id)
             if not ref:
-                self.h._drain_skipped.append(
+                self.h.dispatch.skipped.append(
                     (acb_id, "cancel_missing_persisted_ref"))
                 continue
             try:
@@ -1192,7 +1192,7 @@ class RunCoordinator:
                 try:
                     data = self.h.checkpoints.load(ref)
                 except Exception:  # noqa: BLE001
-                    self.h._drain_skipped.append(
+                    self.h.dispatch.skipped.append(
                         (acb_id, "cancel_unreadable_persisted_ref"))
                     continue
             if isinstance(data, dict):
@@ -1357,7 +1357,7 @@ class ReconcileLoop:
             deadline = getattr(acb, "aging_deadline", None)
             if deadline is None or now < int(deadline):
                 continue
-            self.h._aging_timeout(acb)
+            self.h.dispatch.aging_timeout(acb)
             acted += 1
         return acted
 

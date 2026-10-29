@@ -329,7 +329,7 @@ class RscSession:
                 "logical_subgoal_id": intent_key,
                 "min_budget": self.min_budget,
             }])
-            acb = self.h._admit_and_register(plan, agent_id)
+            acb = self.h.tasks.admit_and_register(plan, agent_id)
         except Exception as exc:
             if type(exc).__name__ in _KNOWN_EXC:
                 return Deny(f"coordinator_unavailable:{type(exc).__name__}")
@@ -917,7 +917,7 @@ class RscSession:
         ref = self.h.checkpoints.latest_ref_for_acb(str(token)) or entry["ref"]
         try:
             data = self.h.checkpoints.load_strict(ref)
-            restored = self.h._restore_acb(data, bump_epoch=False)
+            restored = self.h.recovery.restore_acb(data, bump_epoch=False)
         except Exception:  # noqa: BLE001
             return Deny("token_restore_failed")
         if restored.state in TASK_TERMINAL or restored.needs_readmit:
@@ -975,7 +975,7 @@ class RscSession:
                     return None            # 非法内容交给 commit_batch 处理
                 expected.add((str(resource), digest, False))
         try:
-            hit = self.h._dedup_by_external_key(key, expected)
+            hit = self.h.receipts.dedup_by_external_key(key, expected)
         except Exception as exc:
             if type(exc).__name__ in _KNOWN_EXC:
                 return Deny(f"coordinator_unavailable:{type(exc).__name__}")

@@ -2,16 +2,16 @@
 
 搬出的是「任务生命周期」整簇（30 个方法）：
 
-- 准入与登记（`_admit_and_register` / `_admission_key_for` / `_lookup_admission`
-  / `_register_admission` / `_clear_admission`）与执行入口（`dispatch_and_run`）；
+- 准入与登记（`admit_and_register` / `_admission_key_for` / `lookup_admission`
+  / `register_admission` / `clear_admission`）与执行入口（`dispatch_and_run`）；
 - 终态结算（`finish` / `abort` / `_finalize` / `_finalize_locked` /
   `_maybe_poison_locked` / `escalate_quarantined`）；
-- HITL 判态（`_approval_slot` / `_record_approval` / `_hitl_gate` /
-  `_terminal_status`）与每 ACB 的 transition 锁；
+- HITL 判态（`_approval_slot` / `record_approval` / `_hitl_gate` /
+  `terminal_status`）与每 ACB 的 transition 锁；
 - 重规划 / 再准入（`replan` / `_prune_id_aliases` / `replan_from_quarantine` /
   `_dead_letter_after_replan` / `_readmit_after_replan` / `requeue_readmit` /
   `redrive_dead_letter` / `propagate_failure` / `_resolve_current_acb` /
-  `_admit_ready_successor` / `_adopt_capability`）；
+  `_admit_ready_successor` / `adopt_capability`）；
 - 管理面回收（`kill_run` / `_reap_expired_tokens`）。
 
 约定（与 `kernel/children.py` / `kernel/commit.py` 一致）：
@@ -79,7 +79,7 @@ class TaskService:
         self.deps = deps
         self.state = state
 
-    def _admit_and_register(self, plan: dict, task_id: str, *,
+    def admit_and_register(self, plan: dict, task_id: str, *,
                             required_tools: set[str] | None = None,
                             token=None) -> ACB:
         """S22：准入 + 注册（`dispatch_and_run` 与门面 `begin` 共用）。
@@ -100,7 +100,7 @@ class TaskService:
                          required_tools: set[str] | None = None,
                          crash_at=None, token=None) -> ACB:
         """唯一生产入口：准入+注册 → run_task → 返回 acb。"""
-        acb = self._admit_and_register(plan, task_id,
+        acb = self.admit_and_register(plan, task_id,
                                        required_tools=required_tools, token=token)
         if acb.state is not TaskState.ADMITTED:
             return acb
@@ -148,7 +148,7 @@ class TaskService:
             deadline = None
         return (approval_id, deadline)
 
-    def _record_approval(self, acb: ACB, decision: str, reason: str) -> None:
+    def record_approval(self, acb: ACB, decision: str, reason: str) -> None:
         """F8/F11：结算审批 —— 落 `hitl_outcome`、清 `hitl_pending`、写审计事件。
 
         批准/拒绝/超时/非法/状态丢失**全部** append `APPROVAL_RESOLVED`
@@ -187,9 +187,9 @@ class TaskService:
             if approval_id is None or deadline is None:
                 advanced = advance(acb, "timeout")
                 if advanced != Status.OK:
-                    return self._terminal_status(acb)
+                    return self.terminal_status(acb)
                 acb.failure = "APPROVAL_STATE_LOST"
-                self._record_approval(acb, "lost", "APPROVAL_STATE_LOST")
+                self.record_approval(acb, "lost", "APPROVAL_STATE_LOST")
                 decision = "lost"
             else:
                 kind = classify_verdict(self.deps.hitl.resolve(acb))
@@ -199,16 +199,16 @@ class TaskService:
                     acb.hitl_result = {"approved": True}
                     advanced = advance(acb, "resume")
                     if advanced != Status.OK:
-                        return self._terminal_status(acb)
-                    self._record_approval(acb, "approved", "APPROVED")
+                        return self.terminal_status(acb)
+                    self.record_approval(acb, "approved", "APPROVED")
                     decision = "approved"
                 else:
                     advanced = advance(acb, "timeout")
                     if advanced != Status.OK:
-                        return self._terminal_status(acb)
+                        return self.terminal_status(acb)
                     acb.failure = ("APPROVAL_DENIED" if kind == "denied"
                                    else "APPROVAL_INVALID")
-                    self._record_approval(
+                    self.record_approval(
                         acb, "denied" if kind == "denied" else "invalid",
                         acb.failure)
                     decision = "denied" if kind == "denied" else "invalid"
@@ -233,7 +233,7 @@ class TaskService:
                       {"reason": acb.failure, "approval_id": approval_id})
 
     @staticmethod
-    def _terminal_status(acb: ACB) -> Status:
+    def terminal_status(acb: ACB) -> Status:
         # F11：先读审批结论（`hitl_outcome`），避免 `failure` 被预算等其它码覆盖后
         # 把审批拒绝误报成 SEMANTIC_REJECTED。
         outcome = getattr(acb, "hitl_outcome", None)
@@ -258,7 +258,7 @@ class TaskService:
         return (acb.run_id, acb.task_id,
                 int(acb.spec.get("plan_version", 1) or 1))
 
-    def _lookup_admission(self, key: tuple[str, str, int]) -> ACB | None:
+    def lookup_admission(self, key: tuple[str, str, int]) -> ACB | None:
         """取同一 `(run_id, task_id, plan_version)` 的**活跃** ACB（无则 None）。
 
         终态 / `INADMISSIBLE` / `QUARANTINED` / `superseded` → 视为已失效并清登记
@@ -276,11 +276,11 @@ class TaskService:
                 return None
             return acb
 
-    def _register_admission(self, acb: ACB) -> None:
+    def register_admission(self, acb: ACB) -> None:
         with self.state.lock:
             self.state.admission_index[self._admission_key_for(acb)] = acb
 
-    def _clear_admission(self, key: tuple[str, str, int] | None = None,
+    def clear_admission(self, key: tuple[str, str, int] | None = None,
                          acb: ACB | None = None) -> None:
         with self.state.lock:
             if key is not None:
@@ -288,7 +288,7 @@ class TaskService:
             if acb is not None:
                 self.state.admission_index.pop(self._admission_key_for(acb), None)
 
-    def _transition_lock(self, acb: ACB) -> threading.RLock:
+    def transition_lock(self, acb: ACB) -> threading.RLock:
         with self.state.lock:
             lock = self.state.transition_locks.get(acb.id)
             if lock is None:
@@ -301,7 +301,7 @@ class TaskService:
         # 这里**不得**再落盘（否则覆盖 replan 后的快照 → 恢复出僵尸）。
         if getattr(acb, "superseded", False):
             return
-        with self._transition_lock(acb):
+        with self.transition_lock(acb):
             self._finalize_locked(acb)
             self._maybe_poison_locked(acb)
 
@@ -457,7 +457,7 @@ class TaskService:
         plan = plan if plan is not None else self.state.plans.get(acb.run_id)
         if plan is None:
             return None
-        with self._transition_lock(acb):
+        with self.transition_lock(acb):
             if acb.state not in (TaskState.QUARANTINED, TaskState.REPLANNING):
                 return Result(Status.INVALID_INPUT, {
                     "reason": "invalid_replan_state", "state": acb.state.value})
@@ -582,7 +582,7 @@ class TaskService:
 
         R1：**绝不复用旧 ACB 的 token** —— 旧 token 的 `agent_id` 绑定旧 id，
         新 ACB id 必然不同 → `DENIED_CAPABILITY`。此处 `token=None` 让 policy 按
-        新 id 解析，随后以旧 token 的 **scope** 为新 id 重新签发（`_adopt_capability`）。
+        新 id 解析，随后以旧 token 的 **scope** 为新 id 重新签发（`adopt_capability`）。
         R7：成功时在**同一临界区**内把旧 ACB 标 `superseded` 并落盘，再 pop。
         """
         task = self.deps.planner.task_for(new_plan, acb.logical_subgoal_id or acb.task_id)
@@ -624,16 +624,16 @@ class TaskService:
             fresh.parent_id = acb.parent_id
         fresh.children_ids = list(acb.children_ids)
         fresh.children_pending = copy.deepcopy(acb.children_pending)
-        self._adopt_capability(acb, fresh)
+        self.adopt_capability(acb, fresh)
         # R7：同一临界区内标记 + 落盘 + 摘除（避免 `_finalize` 覆盖快照）
         acb.superseded = True
         acb.needs_readmit = False
-        self._clear_admission(acb=acb)
+        self.clear_admission(acb=acb)
         self.deps.safe_save(acb)
         self.state.acbs.pop(acb.id, None)
         self.state.acbs[fresh.id] = fresh
         self.deps.run_coordinator.register(fresh)
-        self._register_admission(fresh)
+        self.register_admission(fresh)
         # X3：先 save 拿到 **fresh 自己的 ref**，再回填父的 children_ids。
         self.deps.checkpoints.save(fresh)          # §2.4：再准入成功落盘
         self.deps.children.replace_child_ref(acb, fresh)
@@ -654,7 +654,7 @@ class TaskService:
             acb.needs_readmit = True
             self.deps.checkpoints.save(acb)
             return acb
-        with self._transition_lock(acb):
+        with self.transition_lock(acb):
             if getattr(acb, "superseded", False):
                 return acb
             acb.needs_readmit = False
@@ -677,7 +677,7 @@ class TaskService:
                     if not self.deps.budget.remove_node(old_node.node_id):
                         self.deps.budget.archive_node(old_node.node_id)
                     acb.budget_node = None
-                self._adopt_capability(acb, fresh)
+                self.adopt_capability(acb, fresh)
                 acb.superseded = True
                 acb.needs_readmit = False
                 self.deps.safe_save(acb)
@@ -716,7 +716,7 @@ class TaskService:
             self.state.drain_skipped.append((acb.id, "redrive_task_missing"))
             return None
 
-        with self._transition_lock(acb):
+        with self.transition_lock(acb):
             old_node = acb.budget_node
             old_rids = list(acb.reservation_ids or [])
             self.deps.slots.release(acb.id)
@@ -734,14 +734,14 @@ class TaskService:
                 acb.budget_node = None
             fresh.redrive_count = count + 1
             fresh.parent_id = acb.parent_id
-            self._adopt_capability(acb, fresh)
+            self.adopt_capability(acb, fresh)
             # 旧 ACB 保持终态（不 superseded 成 CANCELLED，避免改写历史结论）
             acb.needs_readmit = False
             self.deps.safe_save(acb)
             self.deps.safe_save(fresh)
             self.state.acbs[fresh.id] = fresh
             self.deps.run_coordinator.register(fresh)
-            self._register_admission(fresh)
+            self.register_admission(fresh)
             self.deps.event_log.append(
                 EventKind.DLQ_REDRIVEN, acb.run_id,
                 {"from_acb_id": acb.id, "to_acb_id": fresh.id,
@@ -836,7 +836,7 @@ class TaskService:
         if fresh.state is TaskState.ADMITTED:
             self.state.acbs[fresh.id] = fresh
             self.deps.run_coordinator.register(fresh)
-            self._adopt_capability(src, fresh)
+            self.adopt_capability(src, fresh)
             if getattr(fresh, "capability", None) is not None:
                 self.deps.safe_save(fresh)      # R1：新身份 token 随快照落盘
             return fresh
@@ -850,7 +850,7 @@ class TaskService:
             self._finalize(fresh)
         return None
 
-    def _adopt_capability(self, src: ACB | None, fresh: ACB) -> None:
+    def adopt_capability(self, src: ACB | None, fresh: ACB) -> None:
         """R1/R5：绝不复用旧 ACB 的 token（身份绑定到旧 id 必然 DENIED）。
 
         以旧 token 的**scope**为新 id 重新签发内存 token（不是复用原 token 对象）；
@@ -896,7 +896,7 @@ class TaskService:
         for acb in list(self.state.acbs.values()):
             if acb.run_id != run_id or acb.state in TASK_TERMINAL:
                 continue
-            with self._transition_lock(acb):
+            with self.transition_lock(acb):
                 if acb.state in TASK_TERMINAL:
                     continue
                 acb.state = TaskState.CANCELLED

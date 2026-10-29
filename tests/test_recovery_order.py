@@ -29,7 +29,7 @@ PHASES = [
     "effects.rebuild_from",         # ⑤ effect journal 重建
     "comp_journal.rebuild_from",    # ⑤ 补偿 journal 重建
     "restore_epoch",                # ⑥ durable epoch 恢复
-    "_restore_acb",                 # ⑦ ACB 重建（generation+1 / 能力 / 预算 / 槽位）
+    "restore_acb",                  # ⑦ ACB 重建（generation+1 / 能力 / 预算 / 槽位）
     "replay_events",                # ⑧ 事件重放（对齐外部状态）
     "effects.probe_one",            # ⑨ effect 三态对账
     "comp_journal.resume",          # ⑩ 可选 COMPENSATE 终态策略
