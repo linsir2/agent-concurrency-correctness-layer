@@ -18,7 +18,6 @@ from contextlib import nullcontext
 
 import pytest
 
-import harness.harness as harness_module
 import harness.kernel.commit as commit_module
 from harness import ACB, EventKind, Harness, Status, Write
 from harness.event_log import WalEventLog
