@@ -1,0 +1,391 @@
+{
+  "captured_at": "2026-10-29",
+  "claim_scope": "paired_token_cost_of_workflow_turns",
+  "model": "qwen3.7-flash",
+  "prompts": {
+    "a": "66b1aa1e3940bc1ebe685b2530560464cda3258da8f91702de2d1f98836e2d2b",
+    "b": "46ac63552f5b1f4882dbca3464f64e1ccecdbd529df12ca41fa1eecdc67e617b",
+    "b_retry": "0093a91ce4dfe479d4d76a3d0de1454fa909ea3f4aa3fb8e9d06fe4f287edb75"
+  },
+  "provenance": "live",
+  "request": {
+    "enable_thinking": false,
+    "max_tokens": 64,
+    "temperature": 0.0
+  },
+  "sample_size": 5,
+  "samples": [
+    {
+      "arms": {
+        "naive": {
+          "outcome": {
+            "lost_update": true,
+            "success": false
+          },
+          "turn_ids": [
+            "a",
+            "b"
+          ]
+        },
+        "rsc": {
+          "outcome": {
+            "first_conflict": true,
+            "lost_update": false,
+            "success": true
+          },
+          "turn_ids": [
+            "a",
+            "b",
+            "b_retry"
+          ]
+        }
+      },
+      "sample_id": "s0",
+      "turns": {
+        "a": {
+          "agent": "agent-a",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b_retry": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 60,
+          "reason": "retry_conflict",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 61,
+          "usage_missing": false
+        }
+      }
+    },
+    {
+      "arms": {
+        "naive": {
+          "outcome": {
+            "lost_update": true,
+            "success": false
+          },
+          "turn_ids": [
+            "a",
+            "b"
+          ]
+        },
+        "rsc": {
+          "outcome": {
+            "first_conflict": true,
+            "lost_update": false,
+            "success": true
+          },
+          "turn_ids": [
+            "a",
+            "b",
+            "b_retry"
+          ]
+        }
+      },
+      "sample_id": "s1",
+      "turns": {
+        "a": {
+          "agent": "agent-a",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b_retry": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 60,
+          "reason": "retry_conflict",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 61,
+          "usage_missing": false
+        }
+      }
+    },
+    {
+      "arms": {
+        "naive": {
+          "outcome": {
+            "lost_update": true,
+            "success": false
+          },
+          "turn_ids": [
+            "a",
+            "b"
+          ]
+        },
+        "rsc": {
+          "outcome": {
+            "first_conflict": true,
+            "lost_update": false,
+            "success": true
+          },
+          "turn_ids": [
+            "a",
+            "b",
+            "b_retry"
+          ]
+        }
+      },
+      "sample_id": "s2",
+      "turns": {
+        "a": {
+          "agent": "agent-a",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b_retry": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 60,
+          "reason": "retry_conflict",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 61,
+          "usage_missing": false
+        }
+      }
+    },
+    {
+      "arms": {
+        "naive": {
+          "outcome": {
+            "lost_update": true,
+            "success": false
+          },
+          "turn_ids": [
+            "a",
+            "b"
+          ]
+        },
+        "rsc": {
+          "outcome": {
+            "first_conflict": true,
+            "lost_update": false,
+            "success": true
+          },
+          "turn_ids": [
+            "a",
+            "b",
+            "b_retry"
+          ]
+        }
+      },
+      "sample_id": "s3",
+      "turns": {
+        "a": {
+          "agent": "agent-a",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b_retry": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 60,
+          "reason": "retry_conflict",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 61,
+          "usage_missing": false
+        }
+      }
+    },
+    {
+      "arms": {
+        "naive": {
+          "outcome": {
+            "lost_update": true,
+            "success": false
+          },
+          "turn_ids": [
+            "a",
+            "b"
+          ]
+        },
+        "rsc": {
+          "outcome": {
+            "first_conflict": true,
+            "lost_update": false,
+            "success": true
+          },
+          "turn_ids": [
+            "a",
+            "b",
+            "b_retry"
+          ]
+        }
+      },
+      "sample_id": "s4",
+      "turns": {
+        "a": {
+          "agent": "agent-a",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 55,
+          "reason": "initial",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 56,
+          "usage_missing": false
+        },
+        "b_retry": {
+          "agent": "agent-b",
+          "attempts": 1,
+          "cached_tokens": 0,
+          "completion_tokens": 1,
+          "finish_reason": "stop",
+          "model": "qwen3.7-flash",
+          "parse_failed": false,
+          "prompt_tokens": 60,
+          "reason": "retry_conflict",
+          "reasoning_tokens": 0,
+          "text_chars": 1,
+          "total_tokens": 61,
+          "usage_missing": false
+        }
+      }
+    }
+  ],
+  "scenario": "config_conflict",
+  "schema_version": 2
+}

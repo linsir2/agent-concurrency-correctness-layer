@@ -9,6 +9,8 @@ RIPR：
 
 from __future__ import annotations
 
+import pytest
+
 from harness.llm import LLMClient, LLMConfig, LLMReply, usage_from_response
 
 
@@ -57,6 +59,39 @@ def test_missing_usage_is_marked_not_estimated(monkeypatch):
     assert rep.usage_missing is True
     assert rep.total_tokens == 0
     assert rep.tokens == 0                     # 绝不按字符数估算
+
+
+def test_extra_passthrough_and_reserved_keys(monkeypatch):
+    import harness.llm as mod
+
+    seen = {}
+
+    def capture(url, payload, headers, timeout, **kw):
+        seen.update(payload)
+        return {"choices": [{"message": {"content": "1"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2}}
+
+    monkeypatch.setattr(mod, "_post", capture)
+    client = LLMClient(LLMConfig(api_key="k", max_retries=0))
+    client.chat_with_usage([{"role": "user", "content": "x"}],
+                           extra={"enable_thinking": False})
+    assert seen["enable_thinking"] is False
+    assert seen["model"] == client.config.model
+    with pytest.raises(ValueError):
+        client.chat_with_usage([{"role": "user", "content": "x"}],
+                               extra={"model": "other"})
+
+
+def test_finish_reason_is_captured(monkeypatch):
+    client = _client(monkeypatch, {
+        "choices": [{"message": {"content": "abc"}, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 3,
+                  "total_tokens": 4}})
+    rep = client.chat_with_usage([{"role": "user", "content": "x"}])
+    assert rep.finish_reason == "length"
+    assert rep.as_dict()["finish_reason"] == "length"
 
 
 def test_chat_still_returns_text(monkeypatch):

@@ -18,6 +18,7 @@ import urllib.request
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from .egress import EgressDenied, EgressGuard, build_opener
@@ -172,6 +173,7 @@ class LLMReply:
     usage_missing: bool = False
     model: str = ""
     attempts: int = 1
+    finish_reason: str = ""
 
     @property
     def tokens(self) -> int:
@@ -186,6 +188,7 @@ class LLMReply:
                 "total_tokens": self.total_tokens,
                 "usage_missing": self.usage_missing,
                 "model": self.model, "attempts": self.attempts,
+                "finish_reason": self.finish_reason,
                 "text_chars": len(self.text or "")}
 
 
@@ -236,15 +239,21 @@ class LLMClient:
 
     def chat(self, messages: Iterable[Mapping[str, str]], *,
              temperature: float = 0.0,
-             max_tokens: int | None = None) -> str:
+             max_tokens: int | None = None,
+             extra: Mapping[str, Any] | None = None) -> str:
         """向后兼容：只返回文本（既有调用点字节不变）。"""
         return self.chat_with_usage(messages, temperature=temperature,
-                                    max_tokens=max_tokens).text
+                                    max_tokens=max_tokens, extra=extra).text
 
     def chat_with_usage(self, messages: Iterable[Mapping[str, str]], *,
                         temperature: float = 0.0,
-                        max_tokens: int | None = None) -> LLMReply:
-        """同 `chat`，但把**上游 usage**一并带回（S24-9 基准）。"""
+                        max_tokens: int | None = None,
+                        extra: Mapping[str, Any] | None = None) -> LLMReply:
+        """同 `chat`，但把**上游 usage**一并带回（S24-9 基准）。
+
+        `extra` 透传 OpenAI 兼容请求体（例如 `{"enable_thinking": False}`）；
+        禁止覆盖 `model`/`messages`（fail-closed，避免悄悄改请求语义）。
+        """
         cfg = self.config or LLMConfig.from_env()
         validate_base_url(cfg.base_url)
         url = f"{cfg.base_url}/chat/completions"
@@ -255,6 +264,11 @@ class LLMClient:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if extra:
+            reserved = {"model", "messages"} & set(extra)
+            if reserved:
+                raise ValueError(f"extra 不得覆盖 {sorted(reserved)}")
+            payload.update(extra)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {cfg.api_key}",
@@ -266,10 +280,12 @@ class LLMClient:
                 data = _post(url, payload, headers, cfg.timeout_s,
                              egress=self.egress, opener=self.opener)
                 text = data["choices"][0]["message"]["content"]
+                finish = str(data["choices"][0].get("finish_reason") or "")
                 usage = usage_from_response(data)
                 return LLMReply(text=text,
                                 model=str(data.get("model") or cfg.model),
-                                attempts=attempt + 1, **usage)
+                                attempts=attempt + 1,
+                                finish_reason=finish, **usage)
             except EgressDenied:
                 raise                       # 出站被策略拒绝：不得重试、不得降级
             except urllib.error.HTTPError as exc:          # 4xx 不重试（除 429）
@@ -287,6 +303,7 @@ def chat(messages: Iterable[Mapping[str, str]], *,
          config: LLMConfig | None = None,
          temperature: float = 0.0,
          max_tokens: int | None = None,
+         extra: Mapping[str, Any] | None = None,
          egress: EgressGuard | None = None,
          opener: urllib.request.OpenerDirector | None = None) -> str:
     """调用 chat/completions，返回首条回复文本。
@@ -294,4 +311,4 @@ def chat(messages: Iterable[Mapping[str, str]], *,
     仅用于阶段二的真实模型接入；阶段一 demo 默认走 scripted fake。
     """
     return LLMClient(config, egress=egress, opener=opener).chat(
-        messages, temperature=temperature, max_tokens=max_tokens)
+        messages, temperature=temperature, max_tokens=max_tokens, extra=extra)

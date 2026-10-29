@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import pathlib
 
 import pytest
 
@@ -92,6 +93,96 @@ def test_dangling_turn_id_is_rejected():
     doc["arms"]["naive"]["turn_ids"].append("nope")
     with pytest.raises(ValueError):
         B.validate_fixture(doc)
+
+
+# ---------------------------------------------------------------- v2 / n=5
+def _v2(n: int = 5) -> dict:
+    base = B.load_fixture()
+    samples = []
+    for i in range(n):
+        factor = i + 1
+        turns = copy.deepcopy(base["turns"])
+        for turn in turns.values():
+            for key in ("prompt_tokens", "completion_tokens"):
+                turn[key] = int(turn[key]) * factor
+            turn["total_tokens"] = turn["prompt_tokens"] + turn["completion_tokens"]
+        samples.append({"sample_id": f"s{i}", "turns": turns,
+                        "arms": copy.deepcopy(base["arms"])})
+    return {"schema_version": 2, "scenario": "x", "provenance": "live",
+            "model": "m", "sample_size": n, "claim_scope": "c",
+            "request": {"temperature": 0.0, "max_tokens": 64,
+                        "enable_thinking": False},
+            "samples": samples}
+
+
+def test_n5_fixture_is_live_and_thinking_off():
+    path = pathlib.Path(B.__file__).parent / "fixtures" / "llm_replay.n5.json"
+    doc = B.load_fixture(path)
+    assert doc["schema_version"] == 2 and len(doc["samples"]) == 5
+    assert doc["request"]["enable_thinking"] is False
+    got = B.compute_metrics(doc)
+    assert got["n_valid"] == 5 and got["n_rejected"] == 0
+    for sample in doc["samples"]:
+        for turn in sample["turns"].values():
+            assert turn["reasoning_tokens"] == 0
+            assert turn["finish_reason"] != "length"
+
+
+def test_v1_is_backward_compatible():
+    got = B.compute_metrics(B.load_fixture())
+    assert "n_valid" not in got and "token_multiplier_stats" not in got
+    assert got["token_multiplier"] == pytest.approx(1.3909, abs=1e-3)
+
+
+def test_v2_reports_median_and_range():
+    got = B.compute_metrics(_v2(5))
+    assert got["n_valid"] == 5 and got["n_rejected"] == 0
+    assert got["token_multiplier"] == pytest.approx(1.3909, abs=1e-3)
+    assert got["token_multiplier_stats"]["range"] == 0
+    assert got["rework_rate_delta_stats"]["median"] == pytest.approx(1 / 3, abs=1e-3)
+    text = B.write_report(got)
+    assert "描述性统计" in text and "极差" in text
+
+
+def test_v2_rejects_length_and_usage_missing_samples():
+    doc = _v2(5)
+    doc["samples"][1]["turns"]["a"]["finish_reason"] = "length"
+    doc["samples"][2]["turns"]["b"]["usage_missing"] = True
+    got = B.compute_metrics(doc)
+    assert got["n_valid"] == 3 and got["n_rejected"] == 2
+    reasons = {r["sample_id"]: r["reason"] for r in got["rejected"]}
+    assert "截断" in reasons["s1"] and "usage" in reasons["s2"]
+
+
+def test_v2_all_invalid_is_rejected():
+    doc = _v2(2)
+    for sample in doc["samples"]:
+        sample["turns"]["a"]["finish_reason"] = "length"
+    with pytest.raises(ValueError):
+        B.compute_metrics(doc)
+
+
+def test_v2_n1_has_no_range_keys():
+    got = B.compute_metrics(_v2(1))
+    assert got["sample_size"] == 1
+    assert "token_multiplier_stats" not in got
+
+
+def test_cli_passes_n_and_thinking(monkeypatch, capsys):
+    seen = {}
+    doc = _v2(1)
+
+    def fake_capture(**kw):
+        seen.update(kw)
+        return doc
+
+    monkeypatch.setattr(B, "capture_live", fake_capture)
+    assert B.main(["--live", "--n", "1", "--enable-thinking",
+                   "--max-tokens", "8", "--json"]) == 0
+    assert seen == {"via_proxy": False, "n": 1,
+                    "enable_thinking": True, "max_tokens": 8}
+    out = json.loads(capsys.readouterr().out)
+    assert "token_multiplier_stats" not in out
 
 
 # ---------------------------------------------------------------- CLI

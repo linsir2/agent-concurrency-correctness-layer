@@ -29,7 +29,7 @@ B1 串行 / B2 worktree + merge / B3 共享层；C0 零冲突 / C1 弱重叠 / C
 
 ### 0.3 五项指标
 
-`lost_update_rate`、`conflict_rate`（分 `detected`/`silent`）、`speedup`、`serialization_rate`、`wasted_work`；`token_multiplier` 阶段一 N/A，**S24-9 已用真实调用录制补上**（`bench/llm_replay.py`，n=1：1.39×，见 `docs/s24-gap-analysis-and-repositioning.md` §5.10）。
+`lost_update_rate`、`conflict_rate`（分 `detected`/`silent`）、`speedup`、`serialization_rate`、`wasted_work`；`token_multiplier` 阶段一 N/A，**S24-9 已用真实调用录制补上**（`bench/llm_replay.py`，n=1：1.39×）；S24-P1 增加 **n=5 / thinking 关闭** 的 v2 产物（`bench/fixtures/llm_replay.n5.json`，中位数 1.5446×、极差 0，描述性，不与 v1 直接比），见 `docs/s24-gap-analysis-and-repositioning.md` §5.10。
 
 ### 0.4 S8 现状
 
