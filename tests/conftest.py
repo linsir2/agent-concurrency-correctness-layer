@@ -16,6 +16,18 @@ from harness import ACB, Action, Decision, Harness, TaskState, Write
 from harness.runtime import CrashInjected
 
 
+def pytest_collection_modifyitems(config, items):
+    """`chaos` 用例默认跳过；显式 `RSC_CHAOS=1` 才跑完整故障矩阵。"""
+    if os.environ.get("RSC_CHAOS") == "1":
+        return
+    import pytest
+
+    skip = pytest.mark.skip(reason="完整混沌矩阵需 RSC_CHAOS=1")
+    for item in items:
+        if "chaos" in item.keywords:
+            item.add_marker(skip)
+
+
 def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
                  toolgw=None, compensate_crash_at=None,
                  auth_secret: str | None = None,

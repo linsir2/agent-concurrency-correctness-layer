@@ -91,6 +91,7 @@ markers = [
     "netns: 网络命名空间用例（需 CAP_NET_ADMIN，缺失时 xfail 登记）",
     "egress: egress 强制点用例（gate / DNS 钉住 / SSRF）",
     "raft: MS9 Raft 后端用例（需 pysyncobj；缺失时 xfail 登记，真实端口/选主约 1-2s）",
+    "chaos: 多进程故障注入（默认跳过；RSC_CHAOS=1 才跑 SIGSTOP/SIGKILL 完整矩阵）",
     "tla: TLA+ 模型用例（需 java + tla2tools.jar；缺失时显式 skip，不假绿）",
 ]
 
