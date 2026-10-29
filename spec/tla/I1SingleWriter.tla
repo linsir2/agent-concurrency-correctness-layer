@@ -77,4 +77,10 @@ AtMostOneWriter ==
     \A r \in Resources :
         Cardinality({w \in Writers : pc[w] = "crit" /\ target[w] = r}) <= 1
 
+(* 活性（公平性）：Commit 必须用强公平 —— Abort 可无限抢占，弱公平不足。 *)
+FairSpec == Spec /\ \A w \in Writers :
+    WF_vars(Reserve(w)) /\ WF_vars(EnterCrit(w)) /\ SF_vars(Commit(w))
+
+EventuallyCommitted == <>(\E w \in Writers : pc[w] = "committed")
+
 ================================================================================

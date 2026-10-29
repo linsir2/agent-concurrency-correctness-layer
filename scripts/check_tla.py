@@ -34,6 +34,15 @@ CASES: tuple[tuple[str, str, str], ...] = (
     ("I2", "I2NoLostUpdate", "NoLostUpdate"),
     ("I4", "I4Capability", "CapabilityClosed"),
     ("I7", "I7EffectExactlyOnce", "EffectAtMostOnce"),
+    ("I3", "I3Fencing", "I3FencingMonotonic"),
+)
+
+# (编号, 模块, cfg, property, 是否期望被违反)
+PROPERTY_CASES: tuple[tuple[str, str, str, str, bool], ...] = (
+    ("I1-live", "I1SingleWriter", "I1SingleWriter.liveness.cfg",
+     "EventuallyCommitted", False),
+    ("I1-unfair", "I1SingleWriter", "I1SingleWriter.unfair.cfg",
+     "EventuallyCommitted", True),
 )
 
 
@@ -91,7 +100,7 @@ def tail(text: str, n: int = 6) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="对 spec/tla 的 4 个模型跑正确/ broken 两套 TLC 配置"
+        description="对 spec/tla 模型跑正确 / broken / 活性 TLC 配置"
     )
     parser.add_argument("--jar", default=None, help="tla2tools.jar 路径")
     parser.add_argument(
@@ -99,11 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="缺少 Java/jar 时退化为 exit 2（CI 门禁）；默认 SKIP + exit 0",
     )
-    parser.add_argument("--timeout", type=float, default=60.0, help="单次 TLC 超时（秒）")
+    parser.add_argument("--timeout", type=float, default=120.0,
+                        help="单次 TLC 超时（秒）")
     parser.add_argument(
         "--only",
         action="append",
-        choices=[case[0] for case in CASES],
+        choices=[case[0] for case in CASES] + [p[0] for p in PROPERTY_CASES],
         help="只跑指定编号（可重复）",
     )
     args = parser.parse_args(argv)
@@ -154,7 +164,39 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{label}: FAIL exit={rc}（正确模型不应失败）")
                 print(tail(out))
 
-    total = len(selected) * 2
+    selected_props = [p for p in PROPERTY_CASES
+                      if args.only is None or p[0] in args.only]
+    for key, module, cfg_name, prop, expect_fail in selected_props:
+        label = f"[{key}] {cfg_name} PROPERTY {prop}"
+        try:
+            rc, out = run_tlc(
+                java,
+                jar,
+                TLA_DIR / f"{module}.tla",
+                TLA_DIR / cfg_name,
+                timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            failures += 1
+            print(f"{label}: FAIL 超时（>{args.timeout}s）")
+            continue
+        violated = ("Temporal properties were violated" in out
+                    and "Invariant" not in out)
+        if expect_fail:
+            if rc != 0 and violated:
+                print(f"{label}: PASS exit={rc}（temporal 反例符合预期）")
+            else:
+                failures += 1
+                print(f"{label}: FAIL exit={rc}，未检出 temporal 反例")
+                print(tail(out))
+        elif rc == 0:
+            print(f"{label}: PASS exit=0")
+        else:
+            failures += 1
+            print(f"{label}: FAIL exit={rc}（公平模型不应失败）")
+            print(tail(out))
+
+    total = len(selected) * 2 + len(selected_props)
     print(f"通过 {total - failures} / 失败 {failures}")
     return 1 if failures else 0
 

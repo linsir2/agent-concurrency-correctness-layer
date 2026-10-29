@@ -25,6 +25,7 @@ CASES: dict[str, tuple[str, str, str]] = {
     "I2": ("I2NoLostUpdate", "NoLostUpdate", "EnforceCAS"),
     "I4": ("I4Capability", "CapabilityClosed", "EnforceCaps"),
     "I7": ("I7EffectExactlyOnce", "EffectAtMostOnce", "Dedup"),
+    "I3": ("I3Fencing", "I3FencingMonotonic", "EnforceFence"),
 }
 
 
@@ -93,6 +94,7 @@ def test_readme_documents_all_models() -> None:
         assert invariant in readme, f"README 缺少不变量 {invariant}"
     assert "broken" in readme
     assert "TLA2TOOLS_JAR" in readme
+    assert "EventuallyCommitted" in readme and "SF_vars" in readme
 
 
 @pytest.mark.parametrize("key", sorted(CASES))
@@ -118,3 +120,29 @@ def test_broken_model_finds_counterexample(key: str, tla_checker) -> None:
     assert f"Invariant {invariant} is violated" in out, (
         f"{module}.broken.cfg 未报告 {invariant} 违反\n{tla_checker.tail(out)}"
     )
+
+
+def test_liveness_assets_exist() -> None:
+    for name in ("I1SingleWriter.liveness.cfg", "I1SingleWriter.unfair.cfg"):
+        assert (TLA_DIR / name).is_file()
+    tla = (TLA_DIR / "I1SingleWriter.tla").read_text(encoding="utf-8")
+    assert "FairSpec ==" in tla and "SF_vars(Commit(w))" in tla
+    assert "EventuallyCommitted ==" in tla
+
+
+def test_liveness_fair_model_passes(tla_checker) -> None:
+    java, jar = _require_tlc()
+    rc, out = tla_checker.run_tlc(
+        java, jar, TLA_DIR / "I1SingleWriter.tla",
+        TLA_DIR / "I1SingleWriter.liveness.cfg")
+    assert rc == 0, tla_checker.tail(out)
+
+
+def test_liveness_unfair_model_finds_counterexample(tla_checker) -> None:
+    java, jar = _require_tlc()
+    rc, out = tla_checker.run_tlc(
+        java, jar, TLA_DIR / "I1SingleWriter.tla",
+        TLA_DIR / "I1SingleWriter.unfair.cfg")
+    assert rc != 0
+    assert "Temporal properties were violated" in out
+    assert "Invariant" not in out
