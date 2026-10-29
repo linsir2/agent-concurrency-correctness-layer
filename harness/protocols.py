@@ -244,6 +244,10 @@ class Workspace(Protocol):
     # （`manifest` 是文档 §3.1 的唯一读模型，只读不写）。
     manifest: dict
 
+    def deleted_resources(self) -> list[str]:
+        """当前被删除且未重建的资源（manifest 不含、tombstone 含）。"""
+        ...
+
     def stage(self, acb: ACB, resource: str, content) -> None:
         ...
 

@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
 import shlex
@@ -140,6 +141,52 @@ def _safe_rel(root: str, rel: str) -> str | None:
     return target
 
 
+_ROOT_CONFIGS = ("pyproject.toml", "setup.cfg", "setup.py", "pytest.ini",
+                 "tox.ini", "conftest.py", "requirements.txt", "poetry.lock",
+                 "uv.lock", "Makefile")
+_VERIFY_PROTECTED = frozenset(_ROOT_CONFIGS + ("__init__.py",))
+
+
+def _norm_rel(value: str, *, wildcard: bool) -> str:
+    """规范化 include/exclude 路径；越界/通配（按需）→ ValueError。"""
+    text = str(value).replace("\\", "/").strip()
+    if not text:
+        raise ValueError("verify 路径不能为空")
+    if os.path.isabs(text) or text.startswith("/") or ".." in text.split("/"):
+        raise ValueError(f"verify 路径必须是仓库内相对路径：{value!r}")
+    if not wildcard and any(ch in text for ch in "*?[]"):
+        raise ValueError(f"verify_include 不支持通配：{value!r}")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.rstrip("/")
+
+
+def _norm_scope(include, exclude) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    inc = tuple(_norm_rel(x, wildcard=False) for x in (include or ()))
+    exc = tuple(_norm_rel(x, wildcard=True) for x in (exclude or ()))
+    for pattern in exc:
+        if any(fnmatch.fnmatch(name, pattern) for name in _VERIFY_PROTECTED):
+            raise ValueError(f"verify_exclude 不得排除保护路径：{pattern!r}")
+    return inc, exc
+
+
+def _scope_allows(rel: str, include: tuple[str, ...],
+                  exclude: tuple[str, ...]) -> bool:
+    rel = rel.replace("\\", "/")
+    if any(fnmatch.fnmatch(rel, p) for p in exclude):
+        return False
+    if not include:
+        return True
+    base = rel.rsplit("/", 1)[-1]
+    if rel in _ROOT_CONFIGS or base in _ROOT_CONFIGS:
+        return True
+    if base == "__init__.py":
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if any(inc == parent or inc.startswith(parent + "/") for inc in include):
+            return True
+    return any(rel == inc or rel.startswith(inc + "/") for inc in include)
+
+
 def _content_bytes(content) -> bytes | None:
     """账本/pending 内容 → bytes；DELETE/None/结构化对象 → None（不参与）。"""
     if content is DELETE or content is None:
@@ -173,6 +220,9 @@ class RscSession:
                  state_dir: str | None = None,
                  verify_cmd=None, verify_required: bool = False,
                  verify_timeout_s: float = 120.0,
+                 verify_include: tuple[str, ...] = (),
+                 verify_exclude: tuple[str, ...] = (),
+                 verify_diagnostics: bool = False,
                  semantic: str = "off",
                  semantic_ignore: tuple[str, ...] = (),
                  merge_queue: dict | None = None) -> None:
@@ -184,6 +234,9 @@ class RscSession:
         self.verify_cmd = _norm_cmd(verify_cmd)
         self.verify_required = bool(verify_required)
         self.verify_timeout_s = max(1.0, float(verify_timeout_s))
+        self.verify_include, self.verify_exclude = _norm_scope(
+            verify_include, verify_exclude)
+        self.verify_diagnostics = bool(verify_diagnostics)
         if self.verify_required and self.verify_cmd is None:
             # fail-closed：要求验证却没给命令，等于「静默放行」
             raise ValueError("verify_required=True 时必须提供 verify_cmd")
@@ -481,12 +534,16 @@ class RscSession:
                     continue
         post = dict(base)
         for resource in list(self.h.workspace.manifest):
-            if str(resource) not in post:
-                continue
+            # 新增资源也必须进入 post（否则新模块里的调用点不被扫描）
             data = _content_bytes(self.h.workspace.get(resource))
             if data is not None:
                 post[str(resource)] = data
+        for resource in self.h.workspace.deleted_resources():
+            post.pop(str(resource), None)
         for resource, content in (pending or []):
+            if content is DELETE:
+                post.pop(str(resource), None)
+                continue
             data = _content_bytes(content)
             if data is not None:
                 post[str(resource)] = data
@@ -530,87 +587,225 @@ class RscSession:
 
     # ------------------------------------------------------------ Verifier
     def verify(self, token: str, cmd=None, *,
-               timeout_s: float | None = None) -> Result:
+               timeout_s: float | None = None, steps=None,
+               include=None, exclude=None, pending=None) -> Result:
         """S24：在**候选工作区副本 + 账本合并视图**上执行命令（不经 shell）。
 
         为什么要「合并视图」：agent 的工作区是 `begin` 时钉住的旧快照，
         另一个 agent 之后提交的改动不在里面。只有把账本里**已存在**的资源
         叠加进来，才能暴露「文本不冲突、合起来跑不通」。
 
+        `steps`：多步命令，同一副本串行、首步失败即停；与 `cmd` 互斥。
+        `include/exclude`：缩小复制集合（默认关闭；见 `_scope_allows`）。
+
         结果写入 `spec["rsc_verify"]`（随 checkpoint 落盘，供审计）；
         `verify_cmd` 配置了时，`apply` 会**自动**先跑一遍，红则拒绝提交。
         """
+        if cmd is not None and steps is not None:
+            raise ValueError("verify 的 cmd 与 steps 不能同时提供")
         with self._op_lock(token):
-            return self._verify_locked(token, cmd, timeout_s)
+            return self._verify_locked(token, cmd, timeout_s, pending=pending,
+                                       steps=steps, include=include,
+                                       exclude=exclude)
 
-    def _verify_locked(self, token, cmd=None, timeout_s=None, pending=None):
+    def _verify_locked(self, token, cmd=None, timeout_s=None, pending=None, *,
+                       steps=None, include=None, exclude=None):
         acb = self.resolve(token)
         if isinstance(acb, Deny):
             return Result(Status.DENIED, {"reason": acb.reason,
                                           "code": acb.code})
-        argv = _norm_cmd(cmd) if cmd is not None else self.verify_cmd
-        if argv is None:
+        argv_list = self._argv_list(cmd, steps)
+        if argv_list is None:
             return Result(Status.DENIED, {"reason": "verify_cmd_required"})
         worktree = acb.spec.get("rsc_worktree")
         if not worktree or not os.path.isdir(str(worktree)):
             # 没有 Z3 就没有隔离的候选副本 → fail-closed（不跑在主树上）
             return Result(Status.DENIED, {"reason": "verify_requires_worktree"})
+        inc, exc = _norm_scope(
+            self.verify_include if include is None else include,
+            self.verify_exclude if exclude is None else exclude)
         timeout = (self.verify_timeout_s if timeout_s is None
                    else max(1.0, float(timeout_s)))
         started = time.monotonic()
-        tree = self._verification_tree(str(worktree), pending=pending)
+        copy_started = started
+        try:
+            tree = self._verification_tree(str(worktree), pending=pending,
+                                           include=inc, exclude=exc)
+        except ValueError as exc:
+            return Result(Status.DENIED, {"reason": str(exc),
+                                          "code": "verify_config_invalid"})
+        except OSError as exc:
+            return Result(Status.DENIED, {"reason": f"verify_copy_failed: {exc}",
+                                          "code": "verify_copy_failed"})
+        copy_ms = int((time.monotonic() - copy_started) * 1000)
+        files = self._count_files(tree)
+        step_details: list[dict] = []
+        failed_step: int | None = None
+        run_ms = 0
+        try:
+            for index, argv in enumerate(argv_list):
+                step_started = time.monotonic()
+                code, out = self._run_verify_step(argv, tree, timeout)
+                step_ms = int((time.monotonic() - step_started) * 1000)
+                run_ms += step_ms
+                step_details.append({
+                    "cmd": argv, "exit_code": code,
+                    "duration_ms": step_ms,
+                    "tail": out[-_VERIFY_TAIL_CHARS:]})
+                if code != 0:
+                    failed_step = index
+                    for rest in argv_list[index + 1:]:
+                        step_details.append({"cmd": rest, "skipped": True})
+                    break
+        finally:
+            shutil.rmtree(os.path.dirname(tree), ignore_errors=True)
+        exit_code = 0 if failed_step is None else step_details[failed_step]["exit_code"]
+        tail = (step_details[failed_step]["tail"] if failed_step is not None
+                else (step_details[-1]["tail"] if step_details else ""))
+        ok = failed_step is None
+        detail = {"ok": ok, "exit_code": exit_code, "cmd": argv_list[0],
+                  "tail": tail,
+                  "duration_ms": int((time.monotonic() - started) * 1000)}
+        if steps is not None:
+            detail["steps"] = step_details
+            if failed_step is not None:
+                detail["failed_step"] = failed_step
+        if self.verify_diagnostics:
+            detail.update({"copy_ms": copy_ms, "files": files, "run_ms": run_ms})
+        acb.spec["rsc_verify"] = dict(detail)
+        self._resave(acb, token)
+        return Result(Status.OK if ok else Status.DENIED, detail)
+
+    def _argv_list(self, cmd, steps) -> list[list[str]] | None:
+        if steps is not None:
+            if isinstance(steps, (str, bytes)) or not isinstance(steps, (list, tuple)):
+                raise TypeError("verify steps 必须是列表")
+            out: list[list[str]] = []
+            for step in steps:
+                argv = _norm_cmd(step)
+                if argv is None:
+                    raise ValueError("verify steps 不能包含空命令")
+                out.append(argv)
+            if not out:
+                raise ValueError("verify steps 不能为空")
+            return out
+        argv = _norm_cmd(cmd) if cmd is not None else self.verify_cmd
+        return None if argv is None else [argv]
+
+    @staticmethod
+    def _run_verify_step(argv: list[str], tree: str,
+                         timeout: float) -> tuple[int, str]:
         try:
             proc = subprocess.Popen(argv, cwd=tree, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True,
                                     start_new_session=True)
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
-                code = proc.returncode
-                out = ((stdout or "") + (stderr or "")).strip()
+                return proc.returncode, ((stdout or "") + (stderr or "")).strip()
             except subprocess.TimeoutExpired:
                 _kill_process_group(proc)
                 try:
                     stdout, stderr = proc.communicate(timeout=5.0)
                 except subprocess.TimeoutExpired:   # 极端：组内仍有顽固进程
                     stdout, stderr = "", ""
-                code, out = -1, f"verify_timeout after {timeout}s"
+                return -1, f"verify_timeout after {timeout}s"
         except OSError as exc:
-            code, out = -1, f"verify_spawn_failed: {exc}"
-        finally:
-            shutil.rmtree(os.path.dirname(tree), ignore_errors=True)
-        ok = code == 0
-        detail = {"ok": ok, "exit_code": code, "cmd": argv,
-                  "tail": out[-_VERIFY_TAIL_CHARS:],
-                  "duration_ms": int((time.monotonic() - started) * 1000)}
-        acb.spec["rsc_verify"] = dict(detail)
-        self._resave(acb, token)
-        return Result(Status.OK if ok else Status.DENIED, detail)
+            return -1, f"verify_spawn_failed: {exc}"
 
-    def _verification_tree(self, worktree: str, pending=None) -> str:
+    @staticmethod
+    def _count_files(tree: str) -> int:
+        return sum(len(files) for _root, _dirs, files in os.walk(tree))
+
+    def _ignore_fn(self, worktree: str, include: tuple[str, ...],
+                   exclude: tuple[str, ...]):
+        """`copytree` 的 ignore：按 include/exclude 裁剪，但保留祖先目录。"""
+        root = os.path.realpath(worktree)
+
+        def ignore(src: str, names: list[str]) -> set[str]:
+            rel_dir = os.path.relpath(src, root).replace(os.sep, "/")
+            rel_dir = "" if rel_dir == "." else rel_dir
+            ignored: set[str] = set()
+            for name in names:
+                rel = f"{rel_dir}/{name}" if rel_dir else name
+                if name == ".git":
+                    ignored.add(name)
+                    continue
+                if any(fnmatch.fnmatch(rel, p) for p in exclude):
+                    ignored.add(name)
+                    continue
+                if not include:
+                    continue
+                full = os.path.join(src, name)
+                if os.path.isdir(full):
+                    # 目录：是 include 的祖先，或位于 include 目录内 → 继续遍历
+                    if any(inc == rel or inc.startswith(rel + "/")
+                           or rel.startswith(inc + "/") for inc in include):
+                        continue
+                    ignored.add(name)
+                elif not _scope_allows(rel, include, exclude):
+                    ignored.add(name)
+            return ignored
+
+        return ignore
+
+    def _verification_tree(self, worktree: str, pending=None, *,
+                           include: tuple[str, ...] = (),
+                           exclude: tuple[str, ...] = ()) -> str:
         """复制候选工作区（不含 `.git`），叠加「账本合并视图 + 本次待提交内容」。
 
-        顺序很重要：工作区副本 → 账本（他人已提交）→ 本次 pending（后者覆盖前者），
-        得到「提交后会是什么样」的真实视图。
+        顺序很重要：工作区副本 → 账本（其它 agent 已提交）→ 墓碑删除 →
+        本次 pending（后者覆盖前者），得到「提交后会是什么样」的真实视图。
         """
         holder = tempfile.mkdtemp(prefix="rsc-verify-")
         tree = os.path.join(holder, "tree")
         shutil.copytree(worktree, tree, symlinks=True,
-                        ignore=shutil.ignore_patterns(".git"))
+                        ignore=self._ignore_fn(worktree, include, exclude))
         for resource in list(self.h.workspace.manifest):
-            self._overlay(tree, resource, self.h.workspace.get(resource))
+            rel = str(resource)
+            if not _scope_allows(rel, include, exclude):
+                continue
+            self._overlay(tree, rel, self.h.workspace.get(resource), create=True)
+        for resource in self.h.workspace.deleted_resources():
+            if _scope_allows(str(resource), include, exclude):
+                self._overlay(tree, str(resource), DELETE, delete=True)
         for resource, content in (pending or []):
+            rel = str(resource)
+            if not _scope_allows(rel, include, exclude):
+                continue
             # pending 可能是新文件（本次新增）→ 允许创建
-            self._overlay(tree, str(resource), content, create=True)
+            self._overlay(tree, rel, content, create=True)
+        if include and not self._include_matched(tree, include):
+            shutil.rmtree(holder, ignore_errors=True)
+            raise ValueError("verify_include_empty：include 未命中任何文件")
         return tree
 
     @staticmethod
+    def _include_matched(tree: str, include: tuple[str, ...]) -> bool:
+        for root, _dirs, files in os.walk(tree):
+            for name in files:
+                rel = os.path.relpath(os.path.join(root, name), tree)
+                rel = rel.replace(os.sep, "/")
+                if any(rel == inc or rel.startswith(inc + "/") for inc in include):
+                    return True
+        return False
+
+    @staticmethod
     def _overlay(tree: str, resource: str, content, *,
-                 create: bool = False) -> None:
+                 create: bool = False, delete: bool = False) -> None:
         """把 `content` 写进副本；`create=False` 时只覆盖**已存在**的路径。"""
         path = _safe_rel(tree, resource)
-        if path is None or (not create and not os.path.isfile(path)):
+        if path is None:
             return
-        if content is DELETE or content is None:
+        if delete or content is DELETE:
+            if os.path.isfile(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            return
+        if not create and not os.path.isfile(path):
+            return
+        if content is None:
             return
         if isinstance(content, bytes):
             data = content

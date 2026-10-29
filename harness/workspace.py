@@ -146,6 +146,10 @@ class WorkspaceManager:
             return entry.version
         return self._tombstones.get(resource, 0)   # manifest → tombstone → 0
 
+    def deleted_resources(self) -> list[str]:
+        """当前被删除且未重建的资源（manifest 不含，tombstone 含）。"""
+        return sorted(r for r in self._tombstones if r not in self.manifest)
+
     def _next_version(self, resource: str) -> int:
         """下一个单调版本号：`max(manifest.version, tombstone, 0) + 1`。
 

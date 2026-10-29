@@ -21,6 +21,7 @@ from conftest import make_harness
 
 from harness import RscSession
 from harness.facade import Deny, Receipt
+from harness.rebase import DELETE
 from harness.worktree import WorktreeManager
 
 CORE = "def compute_rate(x):\n    return x * 2\n"
@@ -49,6 +50,7 @@ def repo(tmp_path):
     (base / "app/core.py").write_text(CORE, encoding="utf-8")
     (base / "app/api.py").write_text(API, encoding="utf-8")
     (base / "check.py").write_text(CHECK_PY, encoding="utf-8")
+    (base / "pyproject.toml").write_text("[tool]\n", encoding="utf-8")
     _git(base, "add", ".")
     _git(base, "commit", "-qm", "init")
     return base
@@ -216,3 +218,124 @@ def test_verification_tree_does_not_touch_worktree(tmp_path, repo):
     with open(target, "rb") as fh:
         after = fh.read()
     assert before == after
+
+
+# ---------------------------------------------------------------- S24-P1：多步
+def test_steps_run_in_shared_tree_and_report_each(tmp_path, repo):
+    session, _ = _session(tmp_path, repo)
+    tok = session.begin("a1", "i", writes=["app/feature.py"])
+    res = session.verify(tok.token, steps=[
+        [sys.executable, "-c", "open('step1.txt','w').write('1')"],
+        [sys.executable, "-c",
+         "import os,sys; sys.exit(0 if os.path.exists('step1.txt') else 7)"],
+    ])
+    assert res.status.value == "OK", res.detail
+    assert [s["exit_code"] for s in res.detail["steps"]] == [0, 0]
+
+
+def test_steps_failfast_skips_remaining(tmp_path, repo):
+    session, _ = _session(tmp_path, repo)
+    tok = session.begin("a1", "i", writes=["app/feature.py"])
+    marker = tmp_path / "step3.txt"
+    res = session.verify(tok.token, steps=[
+        [sys.executable, "-c", "pass"],
+        [sys.executable, "-c", "raise SystemExit(3)"],
+        [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('1')"],
+    ])
+    assert res.status.value == "DENIED"
+    assert res.detail["failed_step"] == 1
+    assert res.detail["exit_code"] == 3
+    assert res.detail["steps"][2] == {
+        "cmd": [sys.executable, "-c",
+                f"open({str(marker)!r}, 'w').write('1')"], "skipped": True}
+    assert not marker.exists()
+
+
+def test_steps_conflict_with_cmd_rejected(tmp_path, repo):
+    session, _ = _session(tmp_path, repo)
+    tok = session.begin("a1", "i", writes=["app/feature.py"])
+    with pytest.raises(ValueError):
+        session.verify(tok.token, [sys.executable, "-c", "pass"],
+                       steps=[[sys.executable, "-c", "pass"]])
+
+
+# ---------------------------------------------------------------- S24-P1：删除/新增
+def test_ledger_delete_is_visible_in_verify_tree(tmp_path, repo):
+    """A 删除 app/core.py 并改掉 api；B 的验证必须看到文件已不存在。"""
+    session, h = _session(tmp_path, repo)
+    ta = session.begin("agent-a", "delete",
+                       writes=["app/core.py", "app/api.py"])
+    ra = session.apply(ta.token, [("app/core.py", DELETE),
+                                  ("app/api.py", "def handler():\n    return 3\n")],
+                       idempotency_key="a:del", agent_id="agent-a")
+    assert isinstance(ra, Receipt), ra
+    session.finish(ta.token)
+    assert h.workspace.deleted_resources() == ["app/core.py"]
+
+    tb = session.begin("agent-b", "feature", writes=["app/feature.py"])
+    script = ("import os, sys\n"
+              "sys.exit(0 if not os.path.exists('app/core.py') else 9)\n")
+    res = session.verify(tb.token, [sys.executable, "-c", script])
+    assert res.status.value == "OK", res.detail
+
+
+def test_pending_delete_is_visible_in_verify_tree(tmp_path, repo):
+    session, _ = _session(tmp_path, repo)
+    tok = session.begin("a1", "i", writes=["app/feature.py", "app/api.py"])
+    script = ("import os, sys\n"
+              "sys.exit(0 if not os.path.exists('app/api.py') else 9)\n")
+    res = session.verify(tok.token, [sys.executable, "-c", script],
+                         pending=[("app/api.py", DELETE)])
+    assert res.status.value == "OK", res.detail
+
+
+def test_ledger_create_is_visible_in_verify_tree(tmp_path, repo):
+    """A 提交新文件 app/new.py；B 的验证必须能 import 它。"""
+    session, _ = _session(tmp_path, repo)
+    ta = session.begin("agent-a", "new", writes=["app/new.py"])
+    ra = session.apply(ta.token, [("app/new.py", "VALUE = 7\n")],
+                       idempotency_key="a:new", agent_id="agent-a")
+    assert isinstance(ra, Receipt), ra
+    session.finish(ta.token)
+
+    tb = session.begin("agent-b", "feature", writes=["app/feature.py"])
+    script = "import app.new, sys; sys.exit(0 if app.new.VALUE == 7 else 9)\n"
+    res = session.verify(tb.token, [sys.executable, "-c", script])
+    assert res.status.value == "OK", res.detail
+
+
+# ---------------------------------------------------------------- S24-P1：include/exclude
+def test_include_keeps_init_and_root_config(tmp_path, repo):
+    session, _ = _session(tmp_path, repo, verify_include=("app",))
+    tok = session.begin("a1", "i", writes=["app/feature.py"])
+    script = ("import app, sys\n"
+              "assert getattr(app, '__file__', None), 'missing __init__'\n"
+              "assert open('pyproject.toml').read().strip() == '[tool]'\n")
+    res = session.verify(tok.token, [sys.executable, "-c", script])
+    assert res.status.value == "OK", res.detail
+
+
+def test_include_empty_is_config_error(tmp_path, repo):
+    session, _ = _session(tmp_path, repo, verify_include=("nope",))
+    tok = session.begin("a1", "i", writes=["app/feature.py"])
+    res = session.verify(tok.token, [sys.executable, "-c", "pass"])
+    assert res.status.value == "DENIED"
+    assert res.detail["code"] == "verify_config_invalid"
+
+
+def test_exclude_protected_or_wildcard_include_rejected(tmp_path, repo):
+    with pytest.raises(ValueError):
+        _session(tmp_path / "a", repo, verify_exclude=("__init__.py",))
+    with pytest.raises(ValueError):
+        _session(tmp_path / "b", repo, verify_include=("app/*.py",))
+
+
+def test_diagnostics_off_by_default(tmp_path, repo):
+    session, _ = _session(tmp_path, repo)
+    tok = session.begin("a1", "i", writes=["app/feature.py"])
+    res = session.verify(tok.token, [sys.executable, "-c", "pass"])
+    assert "copy_ms" not in res.detail and "files" not in res.detail
+    session2, _ = _session(tmp_path / "d", repo, verify_diagnostics=True)
+    tok2 = session2.begin("a1", "i", writes=["app/feature.py"])
+    res2 = session2.verify(tok2.token, [sys.executable, "-c", "pass"])
+    assert {"copy_ms", "files", "run_ms"} <= set(res2.detail)

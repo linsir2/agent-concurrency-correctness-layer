@@ -136,25 +136,140 @@ def _conditional_bodies(stmt: ast.stmt) -> Iterable[list[ast.stmt]]:
         yield stmt.body
 
 
-def _symbols(tree: ast.Module) -> tuple[set[str], set[str], bool]:
-    """返回 `(确定符号, 不确定符号, 是否动态)`。
+@dataclass(frozen=True)
+class FuncSig:
+    """模块级函数签名（只用于「post 调用是否仍合法」的保守判定）。"""
 
-    - 不确定 = 只出现在 `if`/`try`/循环/`with` 体里的定义（不据此判「已删除」）；
-    - 动态 = 星号导入 / 模块级 `__getattr__` / 调用 `globals/exec/eval/__import__/
-      getattr/setattr`（无法静态确定属性集合）。
-    """
+    name: str
+    posonly_required: tuple[str, ...] = ()
+    posonly_optional: tuple[str, ...] = ()
+    poskw_required: tuple[str, ...] = ()
+    poskw_optional: tuple[str, ...] = ()
+    kwonly_required: tuple[str, ...] = ()
+    kwonly_optional: tuple[str, ...] = ()
+    varargs: bool = False
+    varkw: bool = False
+    opaque: bool = False
+
+
+@dataclass(frozen=True)
+class ClassFacts:
+    """模块级类成员；有基类/装饰器/动态属性时 `opaque=True`（不判删除）。"""
+
+    name: str
+    members: frozenset[str] = frozenset()
+    uncertain: frozenset[str] = frozenset()
+    has_bases: bool = False
+    opaque: bool = False
+
+
+@dataclass(frozen=True)
+class ModuleFacts:
+    symbols: frozenset[str]
+    uncertain: frozenset[str]
+    dynamic: bool
+    funcs: Mapping[str, FuncSig]
+    classes: Mapping[str, ClassFacts]
+
+
+@dataclass(frozen=True)
+class CallSite:
+    module: str
+    name: str
+    pos_count: int
+    kw_names: tuple[str, ...]
+    has_star: bool
+    has_kwstar: bool
+    site: RefSite
+
+
+@dataclass(frozen=True)
+class MemberRef:
+    module: str
+    cls: str
+    attr: str
+    site: RefSite
+
+
+def _func_sig(node) -> FuncSig:
+    args = node.args
+    defaults = len(args.defaults)
+    positional = list(args.posonlyargs) + list(args.args)
+    required = positional[: len(positional) - defaults]
+    optional = positional[len(positional) - defaults:] if defaults else []
+    posonly_n = len(args.posonlyargs)
+    kw_defaults = list(args.kw_defaults)
+    kw_required = [a.arg for a, d in zip(args.kwonlyargs, kw_defaults) if d is None]
+    kw_optional = [a.arg for a, d in zip(args.kwonlyargs, kw_defaults) if d is not None]
+    return FuncSig(
+        name=node.name,
+        posonly_required=tuple(a.arg for a in required[:posonly_n]),
+        posonly_optional=tuple(a.arg for a in optional[:max(0, posonly_n - len(required))]),
+        poskw_required=tuple(a.arg for a in required[posonly_n:]),
+        poskw_optional=tuple(a.arg for a in optional[max(0, posonly_n - len(required)):]),
+        kwonly_required=tuple(kw_required),
+        kwonly_optional=tuple(kw_optional),
+        varargs=args.vararg is not None,
+        varkw=args.kwarg is not None,
+        opaque=bool(node.decorator_list),
+    )
+
+
+def _class_facts(node: ast.ClassDef) -> ClassFacts:
+    members: set[str] = set()
+    uncertain: set[str] = set()
+    opaque = bool(node.decorator_list) or bool(node.bases) or bool(node.keywords)
+
+    def collect(stmts: Iterable[ast.stmt], maybe: bool) -> None:
+        nonlocal opaque
+        for stmt in stmts:
+            target = uncertain if maybe else members
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                target.add(stmt.name)
+                if stmt.name in _DYNAMIC_ATTRS:
+                    opaque = True
+            elif isinstance(stmt, ast.ClassDef):
+                target.add(stmt.name)
+            elif isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    target.update(_target_names(tgt))
+            elif isinstance(stmt, ast.AnnAssign):
+                target.update(_target_names(stmt.target))
+            elif isinstance(stmt, (ast.If, ast.Try, ast.For, ast.AsyncFor,
+                                   ast.While, ast.With,
+                                   getattr(ast, "TryStar", ast.Try),
+                                   getattr(ast, "AsyncWith", ast.With))):
+                for sub in _conditional_bodies(stmt):
+                    collect(sub, True)
+
+    collect(node.body, False)
+    return ClassFacts(name=node.name, members=frozenset(members),
+                      uncertain=frozenset(uncertain),
+                      has_bases=bool(node.bases), opaque=opaque)
+
+
+def _facts(tree: ast.Module) -> ModuleFacts:
+    """模块级符号 + 函数签名 + 类成员（条件定义只进 uncertain）。"""
     certain: set[str] = set()
     uncertain: set[str] = set()
     dynamic = False
+    funcs: dict[str, FuncSig] = {}
+    classes: dict[str, ClassFacts] = {}
 
     def body(stmts: Iterable[ast.stmt], maybe: bool) -> None:
         nonlocal dynamic
         for stmt in stmts:
             target = uncertain if maybe else certain
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 target.add(stmt.name)
                 if stmt.name in _DYNAMIC_ATTRS:
                     dynamic = True
+                if not maybe:
+                    funcs[stmt.name] = _func_sig(stmt)
+            elif isinstance(stmt, ast.ClassDef):
+                target.add(stmt.name)
+                if not maybe:
+                    classes[stmt.name] = _class_facts(stmt)
             elif isinstance(stmt, ast.Assign):
                 for tgt in stmt.targets:
                     target.update(_target_names(tgt))
@@ -168,8 +283,8 @@ def _symbols(tree: ast.Module) -> tuple[set[str], set[str], bool]:
                     target.add(alias.asname or alias.name.split(".")[0])
             elif isinstance(stmt, (ast.If, ast.Try, ast.For, ast.AsyncFor,
                                    ast.While, ast.With,
-                                   getattr(ast, "TryStar", ast.Try),
-                                   getattr(ast, "AsyncWith", ast.With))):
+                                   getattr(stmt, "TryStar", ast.Try),
+                                   getattr(stmt, "AsyncWith", ast.With))):
                 for sub in _conditional_bodies(stmt):
                     body(sub, True)
 
@@ -183,20 +298,91 @@ def _symbols(tree: ast.Module) -> tuple[set[str], set[str], bool]:
                            and node.func.attr in ("import_module",
                                                   "module_from_spec"))
         dynamic = dynamic or is_dynamic_name or is_dynamic_attr
-    return certain, uncertain, dynamic
+    return ModuleFacts(frozenset(certain), frozenset(uncertain), dynamic,
+                       funcs, classes)
+
+
+def _symbols(tree: ast.Module) -> tuple[set[str], set[str], bool]:
+    """兼容包装：返回 `(确定符号, 不确定符号, 是否动态)`。"""
+    facts = _facts(tree)
+    return set(facts.symbols), set(facts.uncertain), facts.dynamic
 
 
 # ---------------------------------------------------------------- 引用
 class _Refs(ast.NodeVisitor):
     """收集「显式模块级引用」；注解与条件导入/受保护块不计。"""
 
-    def __init__(self, module: str, is_init: bool, path: str) -> None:
+    def __init__(self, module: str, is_init: bool, path: str, *,
+                 facts: ModuleFacts | None = None,
+                 facts_by_module: Mapping[str, ModuleFacts] | None = None) -> None:
         self.module = module
         self.is_init = is_init
         self.path = path
+        self.facts = facts or ModuleFacts(frozenset(), frozenset(), False, {}, {})
+        self.facts_by_module = facts_by_module or {}
         self.aliases: dict[str, str] = {}
+        self.imported: dict[str, tuple[str, str]] = {}
         self.refs: list[tuple[str, str | None, RefSite]] = []
+        self.calls: list[CallSite] = []
+        self.member_refs: list[MemberRef] = []
+        self.var_class: dict[str, tuple[str, str]] = {}
         self._guard = 0
+
+    def _resolve_name(self, name: str) -> tuple[str, str, str] | None:
+        """本地名 → `(module, symbol, kind)`；kind ∈ {func, class}。"""
+        if name in self.imported:
+            module, orig = self.imported[name]
+            facts = self.facts_by_module.get(module)
+            if facts is not None:
+                if orig in facts.classes:
+                    return module, orig, "class"
+                if orig in facts.funcs:
+                    return module, orig, "func"
+            return None
+        if name in self.facts.funcs:
+            return self.module, name, "func"
+        if name in self.facts.classes:
+            return self.module, name, "class"
+        return None
+
+    def bind_vars(self, tree: ast.Module) -> None:
+        """收集唯一 `cfg = Cfg(...)` 绑定（同名再赋值/导入/定义 → 放弃）。"""
+        # 先登记顶层导入，否则 `Cfg` 尚未进入 self.imported，绑定无法解析。
+        for stmt in tree.body:
+            if isinstance(stmt, ast.ImportFrom):
+                module = _resolve_import(stmt, self.module, self.is_init)
+                if module is None:
+                    continue
+                for alias in stmt.names:
+                    if alias.name != "*":
+                        self.imported[alias.asname or alias.name] = (module, alias.name)
+            elif isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    local = alias.asname or alias.name.split(".")[0]
+                    self.aliases[local] = (alias.name if alias.asname
+                                           else alias.name.split(".")[0])
+        counts: dict[str, int] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                counts[node.id] = counts.get(node.id, 0) + 1
+        for stmt in tree.body:
+            value = getattr(stmt, "value", None)
+            if not isinstance(value, ast.Call) or not isinstance(value.func, ast.Name):
+                continue
+            owner = self._resolve_name(value.func.id)
+            if owner is None or owner[2] != "class":
+                continue
+            targets: list[str] = []
+            if isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    targets.extend(_target_names(tgt))
+            elif isinstance(stmt, ast.AnnAssign):
+                targets.extend(_target_names(stmt.target))
+            for name in targets:
+                if (counts.get(name, 0) == 1 and name not in self.imported
+                        and name not in self.facts.funcs
+                        and name not in self.facts.classes):
+                    self.var_class[name] = (owner[0], owner[1])
 
     def _site(self, node: ast.AST) -> RefSite:
         return RefSite(self.path, int(getattr(node, "lineno", 0)),
@@ -217,13 +403,47 @@ class _Refs(ast.NodeVisitor):
         if module is None:
             return
         for alias in node.names:
-            if alias.name == "*" or self._guard:
+            if alias.name == "*":
                 continue
-            self.refs.append((module, alias.name, self._site(alias)))
+            if not self._guard:
+                self.imported[alias.asname or alias.name] = (module, alias.name)
+                self.refs.append((module, alias.name, self._site(alias)))
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if isinstance(node.value, ast.Name) and node.value.id in self.aliases:
             self.refs.append((self.aliases[node.value.id], node.attr, self._site(node)))
+        if not self._guard and not node.attr.startswith("__"):
+            owner = None
+            if isinstance(node.value, ast.Name):
+                if node.value.id in self.var_class:
+                    owner = (*self.var_class[node.value.id], "class")
+                else:
+                    owner = self._resolve_name(node.value.id)
+            elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+                owner = self._resolve_name(node.value.func.id)
+            if owner is not None and owner[2] == "class":
+                self.member_refs.append(
+                    MemberRef(owner[0], owner[1], node.attr, self._site(node)))
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        owner = None
+        if isinstance(node.func, ast.Name):
+            owner = self._resolve_name(node.func.id)
+        elif (isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name)
+              and node.func.value.id in self.aliases):
+            module = self.aliases[node.func.value.id]
+            facts = self.facts_by_module.get(module)
+            if facts is not None and node.func.attr in facts.funcs:
+                owner = (module, node.func.attr, "func")
+        if owner is not None and owner[2] == "func" and not self._guard:
+            pos_count = sum(1 for a in node.args if not isinstance(a, ast.Starred))
+            has_star = any(isinstance(a, ast.Starred) for a in node.args)
+            kw_names = tuple(k.arg for k in node.keywords if k.arg is not None)
+            has_kwstar = any(k.arg is None for k in node.keywords)
+            self.calls.append(CallSite(owner[0], owner[1], pos_count, kw_names,
+                                       has_star, has_kwstar, self._site(node)))
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
@@ -332,14 +552,8 @@ def detect(base: Mapping[str, bytes], post: Mapping[str, bytes], *,
         return SemanticReport((), len(b), skipped,
                               int((time.monotonic() - started) * 1000))
 
-    base_syms: dict[str, set[str]] = {}
-    base_unc: dict[str, set[str]] = {}
-    base_dyn: set[str] = set()
-    for module, (_path, tree) in b.items():
-        syms, unc, dyn = _symbols(tree)
-        base_syms[module], base_unc[module] = syms, unc
-        if dyn:
-            base_dyn.add(module)
+    base_facts = {m: _facts(tree) for m, (_path, tree) in b.items()}
+    post_facts = {m: _facts(tree) for m, (_path, tree) in p.items()}
 
     removed: dict[str, set[str]] = {}
     removed_modules: set[str] = set()
@@ -347,37 +561,103 @@ def detect(base: Mapping[str, bytes], post: Mapping[str, bytes], *,
         if module not in p:
             removed_modules.add(module)
             continue
-        syms, unc, dyn = _symbols(p[module][1])
-        if dyn or module in base_dyn:
+        bf, pf = base_facts[module], post_facts[module]
+        if pf.dynamic or bf.dynamic:
             continue
-        gone = (base_syms[module] - syms) - unc - base_unc[module]
+        gone = (bf.symbols - pf.symbols) - pf.uncertain - bf.uncertain
         if gone:
             removed[module] = gone
-
-    if not removed and not removed_modules:
-        return SemanticReport((), len(p), skipped,
-                              int((time.monotonic() - started) * 1000))
 
     found: dict[tuple[str, str], list[RefSite]] = {}
     for module, (path, tree) in p.items():
         is_init = path.replace("\\", "/").endswith("__init__.py")
-        visitor = _Refs(module, is_init, path)
+        visitor = _Refs(module, is_init, path, facts=post_facts[module],
+                        facts_by_module=post_facts)
+        visitor.bind_vars(tree)
         visitor.visit(tree)
         for target, name, site in visitor.refs:
             if target in removed_modules:
                 found.setdefault(("removed_module", target), []).append(site)
             elif name and name in removed.get(target, ()):
                 found.setdefault(("removed_symbol", f"{target}:{name}"), []).append(site)
+        for call in visitor.calls:
+            bf = base_facts.get(call.module)
+            pf = post_facts.get(call.module)
+            if bf is None or pf is None:
+                continue
+            bs, ps = bf.funcs.get(call.name), pf.funcs.get(call.name)
+            if (bs is None or ps is None or bs.opaque or ps.opaque
+                    or call.has_star or call.has_kwstar):
+                continue
+            if _call_ok(bs, call) and not _call_ok(ps, call):
+                key = f"{call.module}:{call.name}"
+                found.setdefault(("signature_incompatible", key), []).append(call.site)
+        for ref in visitor.member_refs:
+            bf = base_facts.get(ref.module)
+            pf = post_facts.get(ref.module)
+            if bf is None or pf is None:
+                continue
+            bc, pc = bf.classes.get(ref.cls), pf.classes.get(ref.cls)
+            if (bc is None or pc is None or bc.opaque or pc.opaque
+                    or bc.has_bases or pc.has_bases):
+                continue
+            if (ref.attr in bc.members and ref.attr not in pc.members
+                    and ref.attr not in pc.uncertain
+                    and ref.attr not in bc.uncertain):
+                key = f"{ref.module}:{ref.cls}.{ref.attr}"
+                found.setdefault(("removed_member", key), []).append(ref.site)
 
     issues: list[SemanticIssue] = []
     for (kind, key), sites in sorted(found.items()):
+        module, _, name = key.partition(":")
         if kind == "removed_module":
             module, name = key, ""
             hint = "模块被删除/改名；请改为新的模块路径"
-        else:
-            module, name = key.split(":", 1)
+        elif kind == "removed_symbol":
             hint = "符号被删除/改名；请改用新名字，或保留兼容别名"
+        elif kind == "signature_incompatible":
+            bf, pf = base_facts.get(module), post_facts.get(module)
+            bs = bf.funcs.get(name) if bf else None
+            ps = pf.funcs.get(name) if pf else None
+            hint = (f"签名不兼容：{_sig_text(bs)} -> {_sig_text(ps)}"
+                    if bs and ps else "函数签名不兼容")
+        else:
+            hint = "类成员被删除/改名；请改用新名字，或保留兼容别名"
         uniq = tuple(sorted(set(sites), key=lambda s: (s.path, s.line, s.col)))
         issues.append(SemanticIssue(kind, module, name, uniq, hint))
     return SemanticReport(tuple(issues), len(p), skipped,
                           int((time.monotonic() - started) * 1000))
+
+
+def _call_ok(sig: FuncSig, site: CallSite) -> bool:
+    """调用点是否满足该签名（保守：无法确信 → True，宁可漏报）。"""
+    pos_slots = (len(sig.posonly_required) + len(sig.posonly_optional)
+                 + len(sig.poskw_required) + len(sig.poskw_optional))
+    required_pos = len(sig.posonly_required) + len(sig.poskw_required)
+    if not sig.varargs and (site.pos_count > pos_slots
+                            or site.pos_count < required_pos):
+        return False
+    allowed_kw = set(sig.poskw_required + sig.poskw_optional
+                     + sig.kwonly_required + sig.kwonly_optional)
+    if not sig.varkw and not set(site.kw_names) <= allowed_kw:
+        return False
+    return set(sig.kwonly_required) <= set(site.kw_names)
+
+
+def _sig_text(sig: FuncSig) -> str:
+    parts: list[str] = []
+    parts.extend(sig.posonly_required)
+    parts.extend(sig.posonly_optional)
+    if sig.posonly_required or sig.posonly_optional:
+        parts.append("/")
+    parts.extend(sig.poskw_required)
+    parts.extend(f"{n}=..." for n in sig.poskw_optional)
+    if sig.varargs:
+        parts.append("*args")
+    elif sig.kwonly_required or sig.kwonly_optional:
+        parts.append("*")
+    parts.extend(sig.kwonly_required)
+    parts.extend(f"{n}=..." for n in sig.kwonly_optional)
+    if sig.varkw:
+        parts.append("**kwargs")
+    return f"{sig.name}({', '.join(parts)})"

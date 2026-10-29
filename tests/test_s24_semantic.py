@@ -21,6 +21,7 @@ from conftest import make_harness
 
 from harness import RscSession
 from harness.facade import Deny, Receipt
+from harness.rebase import DELETE
 from harness.semantic import detect
 from harness.worktree import WorktreeManager
 
@@ -161,6 +162,89 @@ def test_ignore_patterns_and_syntax_errors_are_reported_as_skipped():
     assert "app/broken.py" in report.skipped
 
 
+SIG_BASE = "def f(a, b=1):\n    return a + b\n"
+SIG_POST = "def f(a):\n    return a\n"
+CALLER = "from app.core import f\n\n\ndef run():\n    return f(1, b=2)\n"
+CLASS_BASE = "class Cfg:\n    debug = 1\n\n    def use(self):\n        return self.debug\n"
+CLASS_POST = "class Cfg:\n\n    def use(self):\n        return 1\n"
+CLASS_USER = "from app.core import Cfg\n\n\ndef run():\n    return Cfg().debug\n"
+
+
+def _pair(base_core: str, post_core: str, user: str):
+    return ({"app/core.py": _b(base_core), "app/user.py": _b(user)},
+            {"app/core.py": _b(post_core), "app/user.py": _b(user)})
+
+
+def _kinds(report):
+    return {(i.kind, i.module, i.name) for i in report.issues}
+
+
+def test_signature_removed_keyword_is_detected():
+    report = detect(*_pair(SIG_BASE, SIG_POST, CALLER))
+    assert ("signature_incompatible", "app.core", "f") in _kinds(report)
+
+
+def test_signature_added_required_positional_is_detected():
+    base = {"app/core.py": _b("def f(a):\n    return a\n"),
+            "app/user.py": _b("from app.core import f\n\nf(1)\n")}
+    post = {"app/core.py": _b("def f(a, b):\n    return a\n"),
+            "app/user.py": _b("from app.core import f\n\nf(1)\n")}
+    assert ("signature_incompatible", "app.core", "f") in _kinds(detect(base, post))
+
+
+def test_signature_added_required_kwonly_is_detected():
+    base = {"app/core.py": _b("def f(a):\n    return a\n"),
+            "app/user.py": _b("from app.core import f\n\nf(1)\n")}
+    post = {"app/core.py": _b("def f(a, *, c):\n    return a\n"),
+            "app/user.py": _b("from app.core import f\n\nf(1)\n")}
+    assert ("signature_incompatible", "app.core", "f") in _kinds(detect(base, post))
+
+
+def test_signature_optional_addition_is_not_reported():
+    base = {"app/core.py": _b("def f(a):\n    return a\n"),
+            "app/user.py": _b("from app.core import f\n\nf(1)\n")}
+    post = {"app/core.py": _b("def f(a, b=2):\n    return a\n"),
+            "app/user.py": _b("from app.core import f\n\nf(1)\n")}
+    assert detect(base, post).ok
+
+
+def test_signature_star_and_decorated_are_skipped():
+    star = ("from app.core import f\n\nargs = (1,)\n"
+            "f(*args)\nf(1, **{'b': 2})\n")
+    assert detect(*_pair(SIG_BASE, SIG_POST, star)).ok
+    decorated = ("from app.core import f\n\nf(1, b=2)\n")
+    base = {"app/core.py": _b("@decorator\ndef f(a, b=1):\n    return a\n"),
+            "app/user.py": _b(decorated)}
+    post = {"app/core.py": _b("@decorator\ndef f(a):\n    return a\n"),
+            "app/user.py": _b(decorated)}
+    assert detect(base, post).ok
+
+
+def test_removed_member_call_and_class_attr_are_detected():
+    report = detect(*_pair(CLASS_BASE, CLASS_POST, CLASS_USER))
+    assert ("removed_member", "app.core", "Cfg.debug") in _kinds(report)
+    attr_user = "from app.core import Cfg\n\n\ndef run():\n    return Cfg.debug\n"
+    report = detect(*_pair(CLASS_BASE, CLASS_POST, attr_user))
+    assert ("removed_member", "app.core", "Cfg.debug") in _kinds(report)
+
+
+def test_removed_member_local_instance_is_detected():
+    user = ("from app.core import Cfg\n\ncfg = Cfg()\n\n\n"
+            "def run():\n    return cfg.debug\n")
+    report = detect(*_pair(CLASS_BASE, CLASS_POST, user))
+    assert ("removed_member", "app.core", "Cfg.debug") in _kinds(report)
+
+
+def test_removed_member_inherited_or_dynamic_is_skipped():
+    user = "from app.core import Cfg\n\n\ndef run():\n    return Cfg().debug\n"
+    inherited = "class Base:\n    pass\n\n\nclass Cfg(Base):\n    debug = 1\n"
+    assert detect(*_pair(inherited, "class Base:\n    pass\n\n\n"
+                         "class Cfg(Base):\n    pass\n", user)).ok
+    dynamic = "class Cfg:\n    debug = 1\n\n    def __getattr__(self, n):\n        return 1\n"
+    assert detect(*_pair(dynamic, "class Cfg:\n\n    def __getattr__(self, n):\n"
+                         "        return 1\n", user)).ok
+
+
 def test_detection_is_fast_enough():
     """200 文件 / 约 2 万行的上界（本机阈值放宽到 2s，避免 CI 抖动）。"""
     files = {}
@@ -284,3 +368,25 @@ def test_no_worktree_is_fail_closed(tmp_path):
     res = session.check_semantics(tok.token)
     assert res.status.value == "DENIED"
     assert res.detail["reason"] == "semantic_requires_worktree"
+
+
+def test_deleted_module_is_detected_through_facade(tmp_path, repo):
+    """A 删除 app/core.py，B 仍引用 → 门面必须报 removed_module（当前会漏）。"""
+    session, h = _session(tmp_path, repo, semantic="block")
+    ta = session.begin("agent-a", "delete",
+                       writes=["app/core.py", "app/api.py"])
+    ra = session.apply(ta.token, [("app/core.py", DELETE),
+                                  ("app/api.py", "def handler():\n    return 3\n")],
+                       idempotency_key="a:delete", agent_id="agent-a")
+    assert isinstance(ra, Receipt), ra
+    session.finish(ta.token)
+    assert h.workspace.deleted_resources() == ["app/core.py"]
+
+    tb = session.begin("agent-b", "feature", writes=["app/feature.py"])
+    _write(tb.worktree, "app/feature.py", FEATURE)
+    rb = session.apply(tb.token, [("app/feature.py", FEATURE)],
+                       idempotency_key="b:1", agent_id="agent-b")
+    assert isinstance(rb, Deny) and rb.code == "semantic_conflict", rb
+    issues = h.acbs[tb.token].spec["rsc_semantic"]["issues"]
+    assert issues[0]["kind"] == "removed_module"
+    assert issues[0]["module"] == "app.core"
