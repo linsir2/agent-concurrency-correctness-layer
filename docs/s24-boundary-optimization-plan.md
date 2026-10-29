@@ -134,6 +134,17 @@
 | P0-3 Verifier 杀进程组 | ✅ | `eebc986`；孙进程 marker 不再出现；成功路径不变 |
 | P0-4 lease fence 同集群 | ✅ | `f405ba4`；错配构造期 `LeaseUnavailable` |
 | P0-5 文档真值 + 守卫 | ✅ | `a4bd2e1`；`scripts/check_docs_consistency.py` + 7 用例；HEAD 0 findings |
+| P1-1 语义签名/类成员 + 删除视图 | ✅ | `deleted_resources()` + `_facts`/`CallSite`/`MemberRef`；31 语义用例（含门面删除） |
+| P1-2 Verifier 多步/诊断/include-exclude | ✅ | 同一副本 fail-fast、墓碑/新增文件进合并视图、`copy_ms/files/run_ms`（仅诊断） |
+| P1-3 diagnose checkpoint 信封 + aging | ✅ | `envelope_problems` 复用；`AGING_OVERDUE` warn（hint 在 locator）；只读指纹不变 |
+| P1-4 语料 I3/I9 | ✅ | `corpus_version=1.1.0`；47 条向量；`executable_invariants` 含 I3/I9 |
+| P1-5 基准 n=5 / thinking / finish_reason | ✅ | v1 默认不变；`llm_replay.n5.json`（thinking 关闭、5 样本、中位数 1.5446×、极差 0） |
+| P1-6 TLA I3 + I1 活性 | ✅ | `check_tla.py` 5 正确 + 5 broken + 2 活性；fair exit 0 / unfair exit 13 |
+| P2-1 多进程 Raft 故障注入 | ✅ | 3 OS 进程 + 真 TCP；lite 2 条默认跑，`RSC_CHAOS=1` 7 条全绿 |
+| P2-2 确定性 checkpoint | ✅ | `FileCheckpointStore(entropy, clock)`；同 seed 目录字节一致；默认不变 |
+| P2-3 跨进程重放 + WAL 规范编码 | ✅ | `_canon_default`；PYTHONHASHSEED 0/1/2/random 摘要全等（子进程用例） |
+| P2-4 `Deterministic` 线程守卫 | ✅ | 构造线程记录；跨线程 `ValueError` 且不推进计数/时钟 |
 
 > 环境说明：pysyncobj 在本环境重新安装后 raft 用例恢复真跑；TLA jar 需按 README 下载。
-> 主门禁当前快照：**851 passed / 14 skipped / 4 xfailed**；带 TLA jar：**859 / 6 / 4**。
+> 主门禁当前快照：**907 passed / 23 skipped / 4 xfailed**；带 TLA jar：**919 / 11 / 4**；
+> 完整混沌矩阵（`RSC_CHAOS=1`）单独 7 passed。
