@@ -88,8 +88,9 @@ def test_order_checker_negative_control():
     """负对照：交换/删除任意阶段必须被判错（否则上面的断言是空的）。"""
     ops = _ops(_recover_fn())
     assert _order_ok(ops)
-    swapped = ["ensure_writer_lease", "receipts.rebuild", "checkpoints.load_strict"]
-    assert not _order_ok(swapped), "交换阶段未被发现"
+    swapped = list(PHASES)
+    swapped[3], swapped[4] = swapped[4], swapped[3]      # 相邻交换（完整序列）
+    assert not _order_ok(swapped), "相邻阶段交换未被发现"
     assert not _order_ok(PHASES[:-1]), "缺阶段未被发现"
     assert not _order_ok([]), "空序列未被发现"
 

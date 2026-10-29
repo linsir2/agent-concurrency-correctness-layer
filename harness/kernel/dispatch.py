@@ -77,7 +77,7 @@ class DispatchDeps:
     approval_slot: Callable[..., Any]      # h._approval_slot
     record_approval: Callable[..., None]   # h._record_approval
     reap_expired_tokens: Callable[..., int]         # h._reap_expired_tokens
-    restore_acb: Callable[..., Any]        # h._restore_acb
+    restore_acb: Callable[..., Any]        # h.recovery.restore_acb
     is_paused: Callable[..., bool]         # h.is_paused（Admin 暂停；S5-e 起实现在 admin.py）
     bump_epoch: Callable[..., int]         # h.bump_epoch（写者 epoch，留在 Harness）
 

@@ -266,7 +266,7 @@ class RscSession:
         # verify_egress != off 时按能力矩阵选择沙箱后端。
         self.verify_egress = str(verify_egress)
         self.tool_runner = (tool_runner if tool_runner is not None
-                            else make_runner(self.verify_egress, harness.egress))
+                            else make_runner(self.verify_egress))
         # S24-4：可选单写者队列（默认关闭 → `apply` 路径字节不变）。
         self._queue: MergeQueue | None = None
         if merge_queue is not None:

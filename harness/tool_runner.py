@@ -141,7 +141,7 @@ class SandboxedRunner:
         raise EgressUnsupported(f"unknown_backend:{self.backend}")
 
 
-def make_runner(mode: str, egress_guard, *, backend: str = "userns",
+def make_runner(mode: str, *, backend: str = "userns",
                 netns_name: str = "harness-egress",
                 allow_hosts: Sequence[str] = (),
                 bundle: str | None = None) -> ToolRunner:

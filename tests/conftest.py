@@ -72,7 +72,7 @@ def make_harness(run_limits: int = 1000, *, clock=None, blobs=None, probe=None,
     if toolgw is not None:
         h.toolgw = toolgw
     if compensate_crash_at is not None:
-        _orig_run_one = h.commit._run_one_compensation
+        _orig_run_one = h.commit.run_one_compensation
         _counter = itertools.count(1)
 
         def _crashy(acb, e, w=None, _orig=_orig_run_one, _n=compensate_crash_at):

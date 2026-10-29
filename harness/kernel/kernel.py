@@ -501,7 +501,7 @@ class Harness:
                 record_approval=lambda *a, **k: self.tasks.record_approval(*a, **k),
                 reap_expired_tokens=lambda *a, **k:
                     self.tasks._reap_expired_tokens(*a, **k),
-                restore_acb=lambda *a, **k: self._restore_acb(*a, **k),
+                restore_acb=lambda *a, **k: self.recovery.restore_acb(*a, **k),
                 is_paused=lambda *a, **k: self.is_paused(*a, **k),
                 bump_epoch=lambda *a, **k: self.bump_epoch(*a, **k)),
             self.state)
@@ -816,6 +816,88 @@ class Harness:
     @timers.setter
     def timers(self, value) -> None:
         self.state.timers = value
+
+    @property
+    def hitl_timeout_ms(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.hitl_timeout_ms
+
+    @hitl_timeout_ms.setter
+    def hitl_timeout_ms(self, value) -> None:
+        self.state.hitl_timeout_ms = value
+
+    @property
+    def receipts_enabled(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.receipts_enabled
+
+    @receipts_enabled.setter
+    def receipts_enabled(self, value) -> None:
+        self.state.receipts_enabled = value
+
+    @property
+    def spawn_depth(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.spawn_depth
+
+    @spawn_depth.setter
+    def spawn_depth(self, value) -> None:
+        self.state.spawn_depth = value
+
+    @property
+    def poison_after_failures(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.poison_after_failures
+
+    @poison_after_failures.setter
+    def poison_after_failures(self, value) -> None:
+        self.state.poison_after_failures = value
+
+    @property
+    def replan_budget(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.replan_budget
+
+    @replan_budget.setter
+    def replan_budget(self, value) -> None:
+        self.state.replan_budget = value
+
+    @property
+    def scheduler_mode(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.scheduler_mode
+
+    @scheduler_mode.setter
+    def scheduler_mode(self, value) -> None:
+        self.state.scheduler_mode = value
+
+    @property
+    def drain_timeout_s(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.drain_timeout_s
+
+    @drain_timeout_s.setter
+    def drain_timeout_s(self, value) -> None:
+        self.state.drain_timeout_s = value
+
+    @property
+    def pool_timeout_s(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.pool_timeout_s
+
+    @pool_timeout_s.setter
+    def pool_timeout_s(self, value) -> None:
+        self.state.pool_timeout_s = value
+
+    @property
+    def pool_workers(self):
+        """可变配置（KernelState 视图；S5 收口时保留了写路径）。"""
+        return self.state.pool_workers
+
+    @pool_workers.setter
+    def pool_workers(self, value) -> None:
+        self.state.pool_workers = value
+
 
 
 
@@ -1258,10 +1340,6 @@ class Harness:
     def requeue_readmit(self, *args, **kwargs):
         return self.tasks.requeue_readmit(*args, **kwargs)
 
-    def _restore_acb(self, data: dict, resume_policy: str = "RESUME", *,
-                     bump_epoch: bool = True, for_sweep: bool = False) -> ACB:
-        return self.recovery.restore_acb(
-            data, resume_policy, bump_epoch=bump_epoch, for_sweep=for_sweep)
 
 
 

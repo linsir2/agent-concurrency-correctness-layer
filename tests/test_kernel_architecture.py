@@ -462,22 +462,34 @@ _SERVICE_ATTRS = {"tasks", "children", "dispatch", "recovery", "commit",
 _HARNESS_PATH = _ROOT / "harness/kernel/kernel.py"
 
 
-def _private_service_delegates(tree, src: str) -> list[str]:
+def _private_service_delegates(tree, src: str | None = None) -> list[str]:
+    """AST 判定：私有方法体**只有一条** `return self.<svc>.<m>(...)` 即为委托。
+
+    不依赖行数/文本格式：签名换行、别名、注释都不会漏判
+    （旧版用 `len(body)>3` 漏掉了 `_restore_acb`）。
+    """
     cls = next(n for n in tree.body
                if isinstance(n, ast.ClassDef) and n.name == "Harness")
     found = []
     for m in cls.body:
         if not isinstance(m, ast.FunctionDef) or not m.name.startswith("_"):
             continue
-        seg = ast.get_source_segment(src, m) or ""
-        body = [ln.strip() for ln in seg.splitlines()
-                if ln.strip() and not ln.strip().startswith(('"""', "#", "@"))]
-        if len(body) > 3:
+        body = [n for n in m.body
+                if not (isinstance(n, ast.Expr)
+                        and isinstance(n.value, ast.Constant)
+                        and isinstance(n.value.value, str))]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
             continue
-        for attr in _SERVICE_ATTRS:
-            if f"return self.{attr}." in seg:
-                found.append(m.name)
-                break
+        call = body[0].value
+        if not isinstance(call, ast.Call):
+            continue
+        fn = call.func
+        if (isinstance(fn, ast.Attribute)
+                and isinstance(fn.value, ast.Attribute)
+                and isinstance(fn.value.value, ast.Name)
+                and fn.value.value.id == "self"
+                and fn.value.attr in _SERVICE_ATTRS):
+            found.append(m.name)
     return found
 
 
@@ -490,15 +502,17 @@ def test_harness_has_no_private_service_delegates():
 
 def test_delegate_scanner_has_teeth():
     """负对照：合成一个私有委托必须被检出。"""
-    fake = ast.parse(
+    fake_src = (
         "class Harness:\n"
-        "    def _x(self, *a, **k):\n"
-        "        return self.tasks.finalize(*a, **k)\n")
-    cls = next(n for n in fake.body if isinstance(n, ast.ClassDef))
-    m = next(n for n in cls.body if isinstance(n, ast.FunctionDef))
-    # 用同一判定逻辑（避免依赖模块级 _HARNESS_SRC）
-    seg = ast.unparse(m)
-    assert "return self.tasks." in seg
+        "    def _wrapped(self,\n"
+        "                  a,\n"
+        "                  b,\n"
+        "                  c):\n"
+        "        return self.tasks.finalize(a, b, c)\n"
+        "    def _real(self):\n"
+        "        return 1\n")
+    got = _private_service_delegates(ast.parse(fake_src), fake_src)
+    assert got == ["_wrapped"], got
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +527,8 @@ _EXPECTED_PROPERTIES = {
     "comp_journal",
     "compensation_journal",
     "definitions",
+    "drain_timeout_s",
+    "hitl_timeout_ms",
     "lease_ms",
     "lock_timeout_s",
     "max_fanout",
@@ -520,7 +536,14 @@ _EXPECTED_PROPERTIES = {
     "max_redrives",
     "min_budget_per_child",
     "plans",
+    "poison_after_failures",
+    "pool_timeout_s",
+    "pool_workers",
+    "receipts_enabled",
+    "replan_budget",
     "retention",
+    "scheduler_mode",
+    "spawn_depth",
     "timers",
 }
 
@@ -534,15 +557,28 @@ def _harness_properties() -> set[str]:
                     for d in m.decorator_list)}
 
 
+def _props_match(expected) -> bool:
+    return _harness_properties() == set(expected)
+
+
 def test_no_new_state_mirror_properties():
     """Harness 上的 @property 集合必须与白名单**完全相等**（增删都红）。"""
     got = _harness_properties()
-    assert got == _EXPECTED_PROPERTIES, (
+    assert _props_match(_EXPECTED_PROPERTIES), (
         f"新增: {sorted(got - _EXPECTED_PROPERTIES)}  删除: "
         f"{sorted(_EXPECTED_PROPERTIES - got)}\n"
         "状态读取请直接用 h.state.*；不要为新字段加兼容属性。")
 
 
 def test_property_guard_has_teeth():
-    """负对照：空白名单必须判不相等（证明比较不是恒真）。"""
-    assert _harness_properties() != set()
+    """负对照：少一个名字 / 空白名单都必须判不相等（走真实谓词）。"""
+    assert not _props_match(_EXPECTED_PROPERTIES - {"acbs"})
+    assert not _props_match(set())
+    assert _props_match(_EXPECTED_PROPERTIES)
+
+
+def test_mutable_config_has_write_path():
+    """`_MUTABLE_CONFIG` 中的每个名字必须是 property（否则 `h.<cfg> = x` 静默无效）。"""
+    missing = [n for n in sorted(_MUTABLE_CONFIG)
+               if not isinstance(getattr(Harness, n, None), property)]
+    assert not missing, f"以下可变配置缺少 get/set 属性：{missing}"

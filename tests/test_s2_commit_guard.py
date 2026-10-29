@@ -184,3 +184,17 @@ def test_compensation_crash_hook_is_reachable():
     with pytest.raises(CrashInjected):
         h.compensate(acb, applied)
     assert fired, "补偿钩子未被调用：崩溃注入接缝失效"
+
+
+def test_conftest_crash_injection_parameter_works():
+    """`make_harness(compensate_crash_at=N)` 这条测试夹具必须真的能注入崩溃。
+
+    回归背景：补偿迁到 CommitService 后，夹具仍打桩 `_run_one_compensation`
+    （已改名），夹具一调用就 AttributeError；而唯一消费者整个文件被
+    `importorskip("hypothesis")` 跳过 → 假绿 14 个用例。
+    """
+    from conftest import make_harness
+
+    h = make_harness(compensate_crash_at=0)
+    with pytest.raises(CrashInjected):
+        h.commit.run_one_hook(None, None)
