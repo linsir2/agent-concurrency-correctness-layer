@@ -117,7 +117,7 @@ def _hitl_run(root: pathlib.Path, seed: str) -> bytes:
         "*", tools={"*"}, paths={"*"}, network={"*"}, data_class="*")
     plan = h.planner.plan("run-1", [{
         "task_id": "t", "logical_subgoal_id": "g", "min_budget": 1}])
-    acb = h._admit_and_register(plan, "t")
+    acb = h.tasks.admit_and_register(plan, "t")
     h.run_task(acb, [decision(1, hitl())])
     assert acb.state is TaskState.WAITING_APPROVAL
     wal.close()

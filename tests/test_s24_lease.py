@@ -165,14 +165,14 @@ def test_bump_epoch_advances_store_and_self_stays_valid():
     h = make_harness(lease_store=store, clock=clock)
     s = _session(h)
     tok = s.begin("a", "g", writes=["a.md"])
-    assert h._writer_epoch == 1
+    assert h.state.writer_epoch == 1
     assert h.bump_epoch() == 2
     assert store.read_epoch() == 2
-    assert h._writer_epoch == 2
+    assert h.state.writer_epoch == 2
     # 监督者自己仍然可写
     assert _commit(s, tok, "v1", "k1")
     # 旧 epoch 的视图被拒
-    assert store.renew(owner=h._writer_id, instance=h._lease_instance,
+    assert store.renew(owner=h.state.writer_id, instance=h.state.lease_instance,
                        epoch=1, now_ms=clock.now_ms(), ttl_ms=60_000).outcome \
         == FENCED
 

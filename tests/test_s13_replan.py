@@ -317,12 +317,12 @@ def test_s13_7_drain_does_not_double_run_same_task_id():
     h.runtime.run = spy
     h.scheduler.push(old.id)
     h.scheduler.push(new.id)
-    h._drain_scheduler()
+    h.dispatch.drain_scheduler()
 
     assert ran == [new.id]                 # 恰好 1 个（旧代被跳过）
     assert old.state is TaskState.ADMITTED
     assert new.state is TaskState.DONE
-    assert (old.id, "stale_plan_version") in h._drain_skipped
+    assert (old.id, "stale_plan_version") in h.dispatch.skipped
 
 
 def test_s13_7_dead_letter_is_valid_transition_from_replanning():
@@ -354,7 +354,7 @@ def test_r1_readmit_uses_fresh_identity_token_and_runs():
     assert fresh is not None and fresh.state is TaskState.ADMITTED
     assert fresh.id != old_id
     # 不复用旧 token：新 ACB 的有效 token 必须绑定到新 id（且 scope 保留）
-    resolved = h.policy.resolve_token(h._effective_token(fresh))
+    resolved = h.policy.resolve_token(h.identity.effective_token(fresh))
     assert resolved is not None and resolved.agent_id == fresh.id
     assert resolved.allows_tool("*")
     # 能真跑（gateway 身份绑定通过）
@@ -406,7 +406,7 @@ def test_r3_propagate_failure_normalizes_alias_and_cancels_successor():
     assert new_plan is not None and fresh is not None
 
     fresh.state = TaskState.CANCELLED
-    h._finalize(fresh)
+    h.tasks.finalize(fresh)
 
     assert new_plan["tasks"]["T2"]["state"] is TaskState.CANCELLED
     assert h.scheduler.is_empty()
@@ -499,7 +499,7 @@ def test_r5_successor_is_admitted_and_run_without_pre_admission():
     a2 = _acb_for(h, "R5", "T2")
     assert a2 is not None and a2.state is TaskState.DONE
     assert plan["tasks"]["T2"]["state"] is TaskState.DONE
-    assert ("R5:T2", "push_no_current_acb") not in h._drain_skipped
+    assert ("R5:T2", "push_no_current_acb") not in h.dispatch.skipped
     h.budget.check_invariants()
 
 
@@ -528,7 +528,7 @@ def test_r6_same_version_double_admit_runs_only_once():
     h.runtime.run = spy
     h.scheduler.push(first.id)
     h.scheduler.push(second.id)
-    h._drain_scheduler()
+    h.dispatch.drain_scheduler()
     assert ran == [first.id]
 
 
@@ -547,7 +547,7 @@ def test_r7_finalize_after_replan_does_not_resurrect_old_acb():
     old_ref = acb.result_ref
     assert acb.superseded is True
 
-    h._finalize(acb)                       # 旧路径的迟到结算
+    h.tasks.finalize(acb)                       # 旧路径的迟到结算
     assert acb.result_ref == old_ref        # 快照未被覆盖
 
     recovered = h.recover(old_ref)
@@ -642,7 +642,7 @@ def test_r11_finalize_does_not_push_sibling_subgoal_successors():
     a1.state = TaskState.DONE
     h.acbs[a1.id] = a1
 
-    h._finalize(a1)
+    h.tasks.finalize(a1)
 
     assert _acb_for(h, "R11F", "T3") is not None   # 真后继被就地准入
     assert _acb_for(h, "R11F", "T4") is None       # 同 subgoal 的旁支不得被推起
@@ -688,10 +688,10 @@ def test_r12_resolve_current_acb_ambiguity_is_deterministic():
         acb.state = TaskState.ADMITTED
         h.acbs[acb.id] = acb
 
-    picked = h._resolve_current_acb("R12A", "T1", 1, plan=plan)
+    picked = h.tasks.resolve_current_acb("R12A", "T1", 1, plan=plan)
     assert picked.id == b.id
     assert a.needs_readmit is True
-    assert (("R12A:T1", "ambiguous_pick_best")) in h._drain_skipped
+    assert (("R12A:T1", "ambiguous_pick_best")) in h.dispatch.skipped
 
 
 def test_r12_readmit_failure_keeps_old_acb_and_readmit_flag():

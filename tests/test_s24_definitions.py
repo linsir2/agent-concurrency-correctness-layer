@@ -67,7 +67,7 @@ def test_plan_and_admit_pin_definition():
     plan = _plan(h, ref.as_dict())
     task = plan["tasks"]["t"]
     assert task["definition"] == ref.as_dict()
-    acb = h._admit_and_register(plan, "t")
+    acb = h.tasks.admit_and_register(plan, "t")
     assert acb.state is TaskState.ADMITTED
     assert acb.spec["definition"] == ref.as_dict()
 
@@ -110,7 +110,7 @@ def test_commit_succeeds_with_pinned_definition():
     reg, ref = _registry()
     h = make_harness(definitions=reg)
     plan = _plan(h, ref.as_dict())
-    acb = h._admit_and_register(plan, "t")
+    acb = h.tasks.admit_and_register(plan, "t")
     res = h.commit_batch(acb, [Write("a.md", "v1")])
     assert res.status is Status.OK
     assert h.workspace.version("a.md") == 1
@@ -120,7 +120,7 @@ def test_hot_definition_change_blocks_old_acb_commit():
     reg, ref = _registry()
     h = make_harness(definitions=reg)
     plan = _plan(h, ref.as_dict())
-    acb = h._admit_and_register(plan, "t")
+    acb = h.tasks.admit_and_register(plan, "t")
 
     # 模拟热部署：同名同版本换了内容（新注册表里 hash 不同）
     replacement = DefinitionRegistry()
@@ -138,7 +138,7 @@ def test_no_definition_leaves_paths_unchanged():
     h = make_harness(definitions=reg)
     plan = _plan(h, None)
     assert "definition" not in plan["tasks"]["t"]
-    acb = h._admit_and_register(plan, "t")
+    acb = h.tasks.admit_and_register(plan, "t")
     assert "definition" not in acb.spec
     res = h.commit_batch(acb, [Write("a.md", "v1")])
     assert res.status is Status.OK

@@ -274,7 +274,7 @@ def test_s8_restore_path_cycle_swallowed_by_restore_budget():
     """§4.2：环（合成 dict）→ `_restore_budget` 吞掉 ValueError，标记 needs_readmit。"""
     h = make_harness(run_limits=1000)
     with pytest.raises(ValueError):
-        h._restore_path(["run", "B1", "B1"])
+        h.recovery.restore_path(["run", "B1", "B1"])
 
     acb = ACB(id="A-RC", run_id="R", task_id="T1")
     data = {
@@ -283,7 +283,7 @@ def test_s8_restore_path_cycle_swallowed_by_restore_budget():
         "budget_path_limits": {"run": 1000, "B1": 100},
         "reservations": [],
     }
-    h._restore_budget(acb, data)
+    h.recovery.restore_budget(acb, data)
     assert acb.needs_readmit is True
     assert acb.budget_node is None
     assert acb.reservation_ids == []
@@ -296,7 +296,7 @@ def test_s8_auth_gc_seen():
     """§4.4：`make_harness(auth_gc_every=2)` + 过 exp 的 token → 追加 2 个事件触发 gc_seen。"""
     clock = ManualClock()
     h = make_harness(auth_secret="s3cret", auth_gc_every=2, clock=clock)
-    assert h._auth is not None
+    assert h.state.auth is not None
 
     token = h.auth.mint("A1", exp=int(time.time()) + 1)
     assert h.auth.verify(token) is not None
@@ -617,7 +617,7 @@ def test_s8_4_fault_window_enumeration():
         assert crashed == (k < 2)                        # k=0/1 崩溃，k=2 正常完成
 
         # 解除崩溃注入（make_harness 把 _run_one_compensation 包成 crashy 实例属性）
-        h._run_one_compensation = Harness._run_one_compensation.__get__(h, Harness)
+        h.commit.run_one_compensation = Harness._run_one_compensation.__get__(h, Harness)
 
         # 崩溃后：每个资源要么完全补偿（删除），要么保持原样 —— 无中间态
         for res, val in (("r1", {"v": 1}), ("r2", {"v": 2})):

@@ -173,7 +173,7 @@ def test_coordinator_unavailable_short_circuits(session):
     def boom(*a, **kw):
         raise RaftUnavailable("no quorum")
 
-    session.h._admit_and_register = boom                  # type: ignore[method-assign]
+    session.h.tasks.admit_and_register = boom                  # type: ignore[method-assign]
     factory = rsc_middleware(session, writes={"write_file": ("a.txt",)},
                              agent_id="a1")
     ev = _event()

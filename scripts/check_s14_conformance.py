@@ -84,9 +84,9 @@ chk("K-67B patch 物化 edges", '_canon(' in p and 'new_plan["edges"] = material
 chk("K-67A _prune_id_aliases 存在", hasattr(Harness, "_prune_id_aliases"))
 rp = _impl("replan")
 i_readmit = rp.find("_readmit_after_replan(acb, new_plan)")
-i_prune = rp.find("_prune_id_aliases(acb.run_id, new_plan)")
+i_prune = rp.find("prune_id_aliases(acb.run_id, new_plan)")
 chk("K-67A 剪枝在 readmit 之后", 0 < i_readmit < i_prune, f"readmit@{i_readmit} prune@{i_prune}")
-pa = _impl("_prune_id_aliases")
+pa = _impl("prune_id_aliases")
 chk("K-67A 判据含活跃 ACB task_id", "acb.task_id" in pa)
 chk("K-67A 判据含 logical_subgoal_id", "acb.logical_subgoal_id" in pa)
 

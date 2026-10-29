@@ -660,7 +660,7 @@ class Harness:
     def _wire_wal_fencing(self, *args, **kwargs):
         return self.leases._wire_wal_fencing(*args, **kwargs)
     def _wire_lease_fence(self, *args, **kwargs):
-        return self.leases._wire_lease_fence(*args, **kwargs)
+        return self.leases.wire_lease_fence(*args, **kwargs)
     def _apply_lease_grant(self, *args, **kwargs):
         return self.leases._apply_lease_grant(*args, **kwargs)
     def _lease_failure_reason(self, *args, **kwargs):
@@ -1253,7 +1253,7 @@ class Harness:
     def compensate(self, *args, **kwargs):
         return self.commit.compensate(*args, **kwargs)
     def _run_one_compensation(self, *args, **kwargs):
-        return self.commit._run_one_compensation(*args, **kwargs)
+        return self.commit.run_one_compensation(*args, **kwargs)
     def _mark_write(self, *args, **kwargs):
         return self.commit._mark_write(*args, **kwargs)
     def _compensate_one(self, *args, **kwargs):
@@ -1356,7 +1356,7 @@ class Harness:
         return self.children._spawn_rollback(*args, **kwargs)
 
     def _save_strict(self, *args, **kwargs):
-        return self.children._save_strict(*args, **kwargs)
+        return self.children.save_strict(*args, **kwargs)
 
     def _parent_child_alloc(self, *args, **kwargs):
         return self.children._parent_child_alloc(*args, **kwargs)
@@ -1398,7 +1398,7 @@ class Harness:
         return self.tasks.record_approval(*args, **kwargs)
 
     def _hitl_gate(self, *args, **kwargs):
-        return self.tasks._hitl_gate(*args, **kwargs)
+        return self.tasks.hitl_gate(*args, **kwargs)
 
     def _terminal_status(self, *args, **kwargs):
         return self.tasks.terminal_status(*args, **kwargs)
@@ -1690,10 +1690,10 @@ class Harness:
         return self.children.ensure_children_index(*args, **kwargs)
 
     def _run_one(self, *args, **kwargs):
-        return self.dispatch._run_one(*args, **kwargs)
+        return self.dispatch.run_one(*args, **kwargs)
 
     def _drain_scheduler(self, *args, **kwargs):
-        return self.dispatch._drain_scheduler(*args, **kwargs)
+        return self.dispatch.drain_scheduler(*args, **kwargs)
 
     def _drain_scheduler_claimed(self, *args, **kwargs):
         return self.dispatch._drain_scheduler_claimed(*args, **kwargs)
@@ -1705,7 +1705,7 @@ class Harness:
         return self.dispatch._is_current_plan_version(*args, **kwargs)
 
     def _resolve_current_acb(self, *args, **kwargs):
-        return self.tasks._resolve_current_acb(*args, **kwargs)
+        return self.tasks.resolve_current_acb(*args, **kwargs)
 
     def _admit_ready_successor(self, *args, **kwargs):
         return self.tasks._admit_ready_successor(*args, **kwargs)
@@ -1826,7 +1826,7 @@ class Harness:
         return self.tasks.transition_lock(*args, **kwargs)
 
     def _finalize(self, *args, **kwargs):
-        return self.tasks._finalize(*args, **kwargs)
+        return self.tasks.finalize(*args, **kwargs)
 
     def _maybe_poison_locked(self, *args, **kwargs):
         return self.tasks._maybe_poison_locked(*args, **kwargs)
@@ -1851,7 +1851,7 @@ class Harness:
         return self.tasks.replan(*args, **kwargs)
 
     def _prune_id_aliases(self, *args, **kwargs):
-        return self.tasks._prune_id_aliases(*args, **kwargs)
+        return self.tasks.prune_id_aliases(*args, **kwargs)
 
     def replan_from_quarantine(self, *args, **kwargs):
         return self.tasks.replan_from_quarantine(*args, **kwargs)
@@ -1874,14 +1874,14 @@ class Harness:
         return self.recovery._restore_capability(acb, cap)
 
     def _restore_budget(self, acb: ACB, data: dict) -> None:
-        return self.recovery._restore_budget(acb, data)
+        return self.recovery.restore_budget(acb, data)
 
     def _replay_budget_events(self, cutoff_epoch: int,
                               run_id: str | None = None) -> tuple[bool, list[str]]:
-        return self.recovery._replay_budget_events(cutoff_epoch, run_id)
+        return self.recovery.replay_budget_events(cutoff_epoch, run_id)
 
     def _declared_budget_nodes(self, run_id: str | None = None) -> set[str]:
-        return self.recovery._declared_budget_nodes(run_id)
+        return self.recovery.declared_budget_nodes(run_id)
 
     def _restore_budget_by_replay(self, acb: ACB, data: dict, node_id: str) -> bool:
         return self.recovery._restore_budget_by_replay(acb, data, node_id)
@@ -1890,7 +1890,7 @@ class Harness:
         return self.recovery._restore_budget_ledger(acb, data, node_id)
 
     def _restore_path(self, path: list[str], limits=None) -> list:
-        return self.recovery._restore_path(path, limits=limits)
+        return self.recovery.restore_path(path, limits=limits)
 
     def _replay_events(self, from_seq: int, dedup: bool = True) -> int:
         return self.recovery._replay_events(from_seq, dedup)

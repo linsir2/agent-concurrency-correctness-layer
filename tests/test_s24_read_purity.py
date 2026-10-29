@@ -31,7 +31,7 @@ def _harness(root: pathlib.Path, clock: ManualClock, *, aging_ms: int = 10):
 def _admit(h: Harness):
     plan = h.planner.plan("run-1", [{
         "task_id": "t", "logical_subgoal_id": "g", "min_budget": 1}])
-    return h._admit_and_register(plan, "t")
+    return h.tasks.admit_and_register(plan, "t")
 
 
 def _epoch(root: pathlib.Path) -> int:

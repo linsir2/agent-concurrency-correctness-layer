@@ -20,7 +20,7 @@ def _harness_with_raft_shape():
     # 模拟 RaftEventLog 的形态（有 _replica.lease 与 set_lease_fence）
     h.event_log._replica = types.SimpleNamespace(lease=object())
     h.event_log.set_lease_fence = lambda provider: None
-    h._lease_store.cluster = object()
+    h.state.lease_store.cluster = object()
     h.event_log._cluster = object()
     return h
 
@@ -28,15 +28,15 @@ def _harness_with_raft_shape():
 def test_mismatched_cluster_is_rejected():
     h = _harness_with_raft_shape()
     with pytest.raises(LeaseUnavailable):
-        h._wire_lease_fence()
+        h.leases.wire_lease_fence()
 
 
 def test_same_cluster_is_accepted():
     h = _harness_with_raft_shape()
     shared = object()
-    h._lease_store.cluster = shared
+    h.state.lease_store.cluster = shared
     h.event_log._cluster = shared
-    h._wire_lease_fence()                     # 不抛
+    h.leases.wire_lease_fence()                     # 不抛
     # 没装 lease 状态的日志 → 直接跳过（不假装有 fence）
     h2 = make_harness(lease_store=MemoryLeaseStore())
     h2._wire_lease_fence()

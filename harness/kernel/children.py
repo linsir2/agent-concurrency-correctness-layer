@@ -136,7 +136,7 @@ class ChildManager:
         if slot:
             self.deps.slots.release(child_id)
 
-    def _save_strict(self, acb: ACB) -> str:
+    def save_strict(self, acb: ACB) -> str:
         """C1：关键落盘（spawn 两阶段）**不得吞异常**。
 
         `_safe_save` 的静默 `pass` 会让「崩溃可续做」失去保证；这里让普通
@@ -462,7 +462,7 @@ class ChildManager:
                 "parent_id": parent_acb.id,
             }
             parent_acb.children_pending[child_id] = pending_info
-            self._save_strict(parent_acb)
+            self.save_strict(parent_acb)
 
             node = None
             resv = None
@@ -531,7 +531,7 @@ class ChildManager:
             parent_acb.children_ids.append((child.id, ref))
             parent_acb.children.append(child)
             parent_acb.spec["child_alloc_used"] = used + slice_limits
-            self._save_strict(parent_acb)
+            self.save_strict(parent_acb)
             return child
 
     def _live_child_ids(self, parent_acb: ACB) -> set[str]:

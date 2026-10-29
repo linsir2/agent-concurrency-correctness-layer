@@ -129,7 +129,7 @@ def test_ms3_compensation_crash_resume():
     h.comp_journal = rebuilt
     entries = h.comp_journal.plan(acb, applied)
     assert len(entries) == 2
-    h._run_one_compensation(acb, entries[0], applied[0])
+    h.commit.run_one_compensation(acb, entries[0], applied[0])
     plan = h.comp_journal.resume(acb, h.workspace)
     assert len(plan["done"]) == 1
     assert len(plan["retry"]) == 1
@@ -325,7 +325,7 @@ def test_ms3_requeue_readmit():
 
     # ① needs_readmit 的 ACB 不进调度（drain 跳过：状态/预留不变）
     h.scheduler.push(acb.task_id)
-    h._drain_scheduler()
+    h.dispatch.drain_scheduler()
     assert acb.state is TaskState.ADMITTED
     assert acb.needs_readmit is True
     assert acb.reservation_ids != []

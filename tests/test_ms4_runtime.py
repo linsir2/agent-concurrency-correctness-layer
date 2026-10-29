@@ -55,7 +55,7 @@ def test_t19_registry_dispatches_five_kinds():
     assert first == Status.NEEDS_APPROVAL
     approval_id = hitl_acb.hitl_pending["approval_id"]
     h.hitl.set_result("R19", approval_id, {"approved": True})
-    assert h._hitl_gate(hitl_acb) is None
+    assert h.tasks.hitl_gate(hitl_acb) is None
     assert hitl_acb.state is TaskState.RUNNING
 
     assert all(isinstance(r, Result) for r in results)
@@ -216,7 +216,7 @@ def test_drain_scheduler_consumes_without_recursion():
 
     for acb in (a1, a2, a3):
         h.scheduler.push(acb.id)
-    h._drain_scheduler()
+    h.dispatch.drain_scheduler()
 
     assert h.scheduler.is_empty()
     assert ran == ["T1", "T2"]
@@ -371,5 +371,5 @@ def test_d14_old_acb_failure_after_patch_no_keyerror():
     h.plans["D14"] = new_plan
     old.state = TaskState.FAILED
     old.failure = "X"
-    h._finalize(old)                 # 不抛 KeyError
+    h.tasks.finalize(old)                 # 不抛 KeyError
     assert old.state is TaskState.FAILED

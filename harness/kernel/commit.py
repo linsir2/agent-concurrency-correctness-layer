@@ -70,7 +70,7 @@ class CommitService:
         self.state = state
         self.compensation_journal: list[dict] = []   # 文档 §5.4（兼容视图）
         # 可替换的补偿单条执行器（崩溃注入 / 测试打桩的稳定接缝）
-        self.run_one_hook = self._run_one_compensation
+        self.run_one_hook = self.run_one_compensation
 
     # ------------------------------------------------------------------ 编排
     def commit_batch(self, acb: ACB, writes: list[Write],
@@ -416,7 +416,7 @@ class CommitService:
         for e in reversed(entries):
             self.run_one_hook(acb, e, by_id.get(e.comp_id))
 
-    def _run_one_compensation(self, acb: ACB, e, w: Write | None = None) -> None:
+    def run_one_compensation(self, acb: ACB, e, w: Write | None = None) -> None:
         """单条补偿（§4.2）：先按 journal 状态分支，再按 hash / 版本号判定。"""
         journal = self.compensation_journal
         if w is not None and w.compensated:

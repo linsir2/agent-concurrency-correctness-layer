@@ -4,7 +4,7 @@
 
 - 执行入口与 pool 调度：`run_task` / `_in_worker` / `_current_worker_id` /
   `_run_one_inline` / `_run_task_pooled` / `_worker_main` / `_await_completion`；
-- 单步执行体与队列消费：`_run_one` / `_drain_scheduler` /
+- 单步执行体与队列消费：`run_one` / `drain_scheduler` /
   `_drain_scheduler_claimed` / `_drain_skip_reason` / `_is_current_plan_version`；
 - 超时驱动面与排空：`tick` / `_tick_candidates` / `_pending_deadlines` /
   `next_deadline_ms` / `pump` / `drain`；
@@ -21,9 +21,9 @@
   `aging_max_attempts` / `pool_timeout_s` / `drain_timeout_s` / `max_lease_ttl_s`）。
   冻结进 deps 会读到旧值。
 - **被测试打桩的调用一律 late lookup**：`tests/test_s13_scheduler.py` 在实例上替换
-  `h._run_one` / `h._drain_scheduler`，`tests/test_s13_hitl.py` 在实例与**类**上替换
+  `h.run_one` / `h.drain_scheduler`，`tests/test_s13_hitl.py` 在实例与**类**上替换
   `h.tick` / `Harness._hitl_gate`。因此哪怕调用方与被调用方都在本服务内，
-  `_drain_scheduler` / `_drain_scheduler_claimed` / `_worker_main` / `run_task` /
+  `drain_scheduler` / `_drain_scheduler_claimed` / `_worker_main` / `run_task` /
   `pump` 也一律走 `self.deps.*`。
 - 仍留在 Harness / TaskService 上的方法（`_finalize` / `_safe_save` /
   `_transition_lock` / `_restore_acb` / `_reap_expired_tokens` / `is_paused` /
@@ -64,9 +64,9 @@ class DispatchDeps:
     slots: Any
     tasks: Any                     # TaskService：只用**公开**方法（requeue_readmit）
     # ---- 仍在 Harness 上 / 会被测试打桩：late lookup，绝不传绑定方法 ----
-    run_one: Callable[..., Any]            # h._run_one        —— 实例打桩
+    run_one: Callable[..., Any]            # h.run_one        —— 实例打桩
     tick: Callable[..., Any]               # h.tick            —— 实例打桩
-    drain: Callable[..., Any]              # h._drain_scheduler —— 实例打桩
+    drain: Callable[..., Any]              # h.drain_scheduler —— 实例打桩
     hitl_gate: Callable[..., Any]          # h._hitl_gate      —— 实例 + 类打桩
     terminal_status: Callable[..., Any]    # TaskService 静态方法
     finalize: Callable[..., Any]           # h._finalize
@@ -95,9 +95,9 @@ class DispatchService:
         """外部直接调用入口：注册 + push 到调度器 + 执行 + 消费调度器。
 
         S13d §2.5：
-        - `scheduler_mode="sync"`（默认）保持原路径：push → **内联 `_run_one`**
+        - `scheduler_mode="sync"`（默认）保持原路径：push → **内联 `run_one`**
           → `finally drain`（不改动，36 个同步用例零破坏）；
-        - `scheduler_mode="pool"`：push → 提交 worker（claim + `_run_one` + drain），
+        - `scheduler_mode="pool"`：push → 提交 worker（claim + `run_one` + drain），
           本线程等待 `_await_completion`（`CrashInjected` 必须重抛）；
         - **worker 内嵌套 `run_task`** → 一律内联（P0-9：池满时父等子会永久死锁），
           并由 `_tls.depth` 防递归。
@@ -106,7 +106,7 @@ class DispatchService:
         self.deps.run_coordinator.register(acb)
         # S13a P0-3：唯一超时驱动面（每轮调用）；recover 结束也调一次。
         self.deps.tick()
-        # 修 B-1：`runtime.run` 会无条件置 RUNNING —— 必须在进入 `_run_one`
+        # 修 B-1：`runtime.run` 会无条件置 RUNNING —— 必须在进入 `run_one`
         # **之前**判态，否则恢复出的 WAITING_APPROVAL 审批被绕过。
         gate = self.deps.hitl_gate(acb)
         if gate is not None:
@@ -186,7 +186,7 @@ class DispatchService:
         return self._await_completion(future)
 
     def _worker_main(self, acb: ACB, decisions, crash_at, worker_id: str):
-        """worker 入口：claim → `_run_one` → drain（异常时不 drain，防双跑）。"""
+        """worker 入口：claim → `run_one` → drain（异常时不 drain，防双跑）。"""
         self.state.tls.in_worker = True
         self.state.tls.worker_id = worker_id
         self.state.tls.depth = 0
@@ -422,7 +422,7 @@ class DispatchService:
 
     # ================================ 单步执行体 + 调度队列消费（drain）
 
-    def _run_one(self, acb: ACB, decisions=None, crash_at=None) -> Status:
+    def run_one(self, acb: ACB, decisions=None, crash_at=None) -> Status:
         """执行体（§2.6）：`runtime.run` + `_finalize`；**不 push、不 drain**（防递归）。"""
         prev_running = getattr(self.state.tls, "running_acb", None)
         self.state.tls.running_acb = acb          # X4：内联子记录 `inline_parent`
@@ -432,10 +432,10 @@ class DispatchService:
             self.deps.finalize(acb)
             self.state.tls.running_acb = prev_running
 
-    def _drain_scheduler(self) -> None:
+    def drain_scheduler(self) -> None:
         """真消费 ready_queue（§2.6）：`pop → 找 ACB → 只启动 ADMITTED`。
 
-        - `_run_one` 不 push、不递归 drain → 无无限递归、无双重 run；
+        - `run_one` 不 push、不递归 drain → 无无限递归、无双重 run；
         - `needs_readmit` 的 ACB 不进调度（§5.7）：需先 `requeue_readmit`；
         - **D10（S13b P1-5）**：队列键统一 `acb.id`，**删除**「按 task_id 扫第一个
           ADMITTED」兜底 —— 该兜底在 replan 后同 task_id 出现两个 ADMITTED 时会

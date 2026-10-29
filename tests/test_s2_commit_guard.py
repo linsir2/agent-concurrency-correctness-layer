@@ -162,7 +162,7 @@ def test_order_checker_has_teeth(monkeypatch):
 def test_compensation_crash_hook_is_reachable():
     """补偿单条执行器必须可替换（conftest 的崩溃注入依赖这个接缝）。
 
-    这个用例存在的理由：S2 之后 conftest 仍打在 `h._run_one_compensation` 上，
+    这个用例存在的理由：S2 之后 conftest 仍打在 `h.commit.run_one_compensation` 上，
     服务内部自调用绕过它 → 崩溃注入静默失效，而相关用例在缺 hypothesis 时被 skip
     （假绿）。这里用最小场景把接缝钉死。
     """

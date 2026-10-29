@@ -138,7 +138,7 @@ class WriterLeaseService:
             return
         setter(lock=epoch_lock, epoch_reader=read_epoch,
                epoch_provider=lambda: int(self.deps.intents.get_epoch() or 0))
-    def _wire_lease_fence(self) -> None:
+    def wire_lease_fence(self) -> None:
         """S24-8：租约与 Raft 事件日志**共享同一 RSM** 时，在提交点复核旧 epoch。
 
         条件不满足（事件日志不是 Raft，或 cluster 未启用租约状态）→ **不注入**，

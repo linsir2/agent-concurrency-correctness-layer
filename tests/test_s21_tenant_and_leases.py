@@ -401,7 +401,7 @@ def test_s21_15_tenant_label_survives_replay():
     admit(h, "R1", plan, "T1")
     assert h.usage_report(tenant="t1")["reservations"] >= 1
 
-    ok, _built = h._replay_budget_events(0)
+    ok, _built = h.recovery.replay_budget_events(0)
     assert ok
     assert h.budget._nodes["tenant:t1"].tenant == "t1", "重放后租户标签必须保留"
     assert h.usage_report(tenant="t1")["reservations"] >= 1, (

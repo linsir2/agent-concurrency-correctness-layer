@@ -526,7 +526,7 @@ def test_s13_c2_cancel_rebuilds_tree_from_persisted_run_index(tmp_path):
             ACB(id=acb.id, run_id=acb.run_id, task_id=acb.task_id))
     for rid in rids:
         assert _reservation_state(h, rid) in ("SETTLED", "ARCHIVED")
-    assert not [s for s in h._drain_skipped
+    assert not [s for s in h.dispatch.skipped
                 if s[1] == "cancel_skip_missing_ref"]
     assert h.slots.active == 0
     h.budget.check_invariants()
@@ -549,14 +549,14 @@ def test_s13_c1_pending_ref_none_cancel_finds_child_by_id():
     parent.children_pending[cid] = info
     parent.children_ids = [(cid, None)]
     parent.children = []
-    h._save_strict(parent)
+    h.children.save_strict(parent)
     h.acbs.pop(cid, None)
 
     h.run_coordinator.cancel_run("SP9X")
 
     assert _persisted_state(h, cid) == "CANCELLED"
     assert _reservation_state(h, rid) in ("SETTLED", "ARCHIVED")
-    assert ("None", "cancel_skip_missing_ref") not in h._drain_skipped
+    assert ("None", "cancel_skip_missing_ref") not in h.dispatch.skipped
     h.budget.check_invariants()
 
 
@@ -569,7 +569,7 @@ def test_s13_c1_missing_child_snapshot_settles_orphan_budget_not_silently():
             "run_id": "SPO", "logical_subgoal_id": "S-C", "depth": 1,
             "parent_id": parent.id}
     parent.children_pending[cid] = info
-    h._save_strict(parent)
+    h.children.save_strict(parent)
     # phase ② 已建节点/预留，但 phase ③ 之前崩溃（无子快照）
     with h.budget.suppressed():
         node = h.budget.create_node(
@@ -584,7 +584,7 @@ def test_s13_c1_missing_child_snapshot_settles_orphan_budget_not_silently():
     assert h.budget._reservations[resv.reservation_id][1].state in (
         "SETTLED", "ARCHIVED")
     assert f"B-{cid}" not in h.budget._nodes
-    assert (cid, "spawn_orphan_reclaimed") in h._drain_skipped
+    assert (cid, "spawn_orphan_reclaimed") in h.dispatch.skipped
     orphans = [e for e in h.event_log.all()
                if e.kind is EventKind.SPAWN_ORPHAN_RECLAIMED]
     assert len(orphans) == 1
@@ -606,7 +606,7 @@ def test_s13_c1_recover_promotes_pending_child_found_by_ref(tmp_path):
     parent.children_ids = []
     parent.children = []
     parent.spec["child_alloc_used"] = 0
-    h._save_strict(parent)
+    h.children.save_strict(parent)
     pref = h.checkpoints.latest_ref_for_acb(parent.id)
     assert pref is not None
     h.acbs.pop(cid, None)
@@ -873,7 +873,7 @@ def test_result_envelope_loads_persisted_children_when_memory_lost():
     h.run_task(c1, [decision(1, finish())])
     c2.state = TaskState.FAILED
     c2.failure = "BOOM"
-    h._finalize(c2)
+    h.tasks.finalize(c2)
 
     # 清空内存 + 抹掉 ref（只剩 child_id），验证 `_ref_for_child` 反查
     h.acbs.pop(c1.id, None)
@@ -899,7 +899,7 @@ def test_result_envelope_produces_done_partial_and_is_idempotent():
 
     failed_child.state = TaskState.FAILED
     failed_child.failure = "BOOM"
-    h._finalize(failed_child)
+    h.tasks.finalize(failed_child)
 
     env = h.result_envelope(parent)
     assert env.status == "DONE_PARTIAL"
@@ -1001,12 +1001,12 @@ def test_s13_x6_cross_run_child_cancelled_via_parent_id_index():
     # 强制走「反扫快照」重建。
     parent.children_ids = []
     parent.children = []
-    h._children_index = {}
-    h._children_index_built = False
+    h.state.children_index = {}
+    h.state.children_index_built = False
 
     h.run_coordinator.cancel_run("R6P")
     assert child.state is TaskState.CANCELLED      # 跨 run 子仍被级联取消
-    assert (child.id, "cancel_skip_missing_ref") not in h._drain_skipped
+    assert (child.id, "cancel_skip_missing_ref") not in h.dispatch.skipped
     h.budget.check_invariants()
 
 
@@ -1035,7 +1035,7 @@ def test_s13_x2_done_partial_satisfies_predecessor_and_successor_runs():
     assert done_child.state is TaskState.DONE
     failed_child.state = TaskState.FAILED
     failed_child.failure = "BOOM"
-    h._finalize(failed_child)
+    h.tasks.finalize(failed_child)
 
     env = h.apply_result_envelope(parent)
     assert env.status == "DONE_PARTIAL"
@@ -1047,7 +1047,7 @@ def test_s13_x2_done_partial_satisfies_predecessor_and_successor_runs():
     assert t2 is not None and t2.state is TaskState.ADMITTED
 
     # 真被调度并执行（不是只 push 了队列）
-    h._drain_scheduler()
+    h.dispatch.drain_scheduler()
     assert t2.state is TaskState.DONE
     assert plan["tasks"]["T2"]["state"] is TaskState.DONE
     h.budget.check_invariants()

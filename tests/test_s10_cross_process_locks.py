@@ -282,7 +282,7 @@ def test_s10_8_fencing_rejects_stale_writer_and_preserves_acked_frame(tmp_path):
     st = h.commit_batch(acb, [Write("r")])
     assert st.status is Status.REJECT_STALE
     assert st.detail.get("reason") == "fencing_epoch_rejected"
-    assert ("R-FENCE", "S1") not in h._receipt_heads, "被拒的写不得 ack（改 head）"
+    assert ("R-FENCE", "S1") not in h.state.receipt_heads, "被拒的写不得 ack（改 head）"
     assert len(wal._wal.records()) == before
 
     # ② 「ack 后丢写」反例被拦截：已 ack 的 epoch=4 帧在恢复时**不得**被拒绝

@@ -6,9 +6,9 @@
   epoch → ACB 重建 → 事件重放 → probe → COMPENSATE 终态策略 → 不变量 →
   注册/准入 → 子对账 → 暂停态 → tick）；
 - ACB 重建（`restore_acb`）与其三分支：能力（`_restore_capability`）、
-  预算（`_restore_budget` → 重放 / 逐笔账本）、槽位交叉校验；
-- 预算重放（`_replay_budget_events` / `_restore_budget_by_replay` /
-  `_declared_budget_nodes` / `_restore_budget_ledger` / `_restore_path` /
+  预算（`restore_budget` → 重放 / 逐笔账本）、槽位交叉校验；
+- 预算重放（`replay_budget_events` / `_restore_budget_by_replay` /
+  `declared_budget_nodes` / `_restore_budget_ledger` / `restore_path` /
   `_propagate_subtree_delta`）；
 - 事件重放（`_replay_events`）与 checkpoint 头部兜底
   （`_pointer_header_fallback`）。
@@ -69,8 +69,8 @@ class RecoveryDeps:
     register_token: Callable[..., None]
     ensure_policy_token: Callable[..., Any]
     # 本簇内、但会被测试/基准在**实例级打桩**的两个（走 late lookup 回 Harness，
-    # 否则 `monkeypatch.setattr(h, "_replay_budget_events", ...)` 静默失效）：
-    #   - `tests/test_s10_budget_reconcile.py` 用 `_replay_budget_events` 做
+    # 否则 `monkeypatch.setattr(h, "replay_budget_events", ...)` 静默失效）：
+    #   - `tests/test_s10_budget_reconcile.py` 用 `replay_budget_events` 做
     #     「禁用重放 → 必超发」的负对照；
     #   - `bench/run_bench.py` 给 `_replay_events` 套计时包装。
     replay_budget_events: Callable[..., tuple[bool, list[str]]]
@@ -324,7 +324,7 @@ class RecoveryService:
             elif cap is not None:
                 self._restore_capability(acb, cap)
             if not acb.superseded:
-                self._restore_budget(acb, data)
+                self.restore_budget(acb, data)
             # §2.4：`slots_active` 交叉校验——非终态快照若不含本 ACB 槽位，
             # 说明快照摄于槽位释放之后（如 `_finalize` 末），标记 needs_readmit。
             # F5：`WAITING_APPROVAL` 本来就**不**占槽位，必须豁免。
@@ -380,7 +380,7 @@ class RecoveryService:
                     self.deps.ensure_policy_token(resolved.parent_id)
         # None → 不覆盖（旧格式 / 未签发）
 
-    def _restore_budget(self, acb: ACB, data: dict) -> None:
+    def restore_budget(self, acb: ACB, data: dict) -> None:
         """恢复预算节点与预留（S10a §2.2 重写）。
 
         **新格式**（payload 含 `run_limits` / `budget_cursor`）→ 从 EventLog 重放：
@@ -412,7 +412,7 @@ class RecoveryService:
             return
 
         # S22：**同进程懒恢复**（token 被 purge 后又用同 id 恢复）时，节点还在
-        # `_nodes` 里 —— 直接重绑，绝不触发 `_replay_budget_events`（那会
+        # `_nodes` 里 —— 直接重绑，绝不触发 `replay_budget_events`（那会
         # `_reset_baseline()` 重建整棵树，影响其他 token 的在途预留）。
         existing = self.deps.budget._nodes.get(node_id)
         if existing is not None and (not existing.owner or existing.owner == acb.id):
@@ -425,7 +425,7 @@ class RecoveryService:
             return
         self._restore_budget_ledger(acb, data, node_id)
 
-    def _replay_budget_events(self, cutoff_epoch: int,
+    def replay_budget_events(self, cutoff_epoch: int,
                               run_id: str | None = None) -> tuple[bool, list[str]]:
         """从 EventLog 重放 `BUDGET_*` 事件（**重放前重置基线为 0**）。
 
@@ -484,7 +484,7 @@ class RecoveryService:
             budget.discard_pending()
         return True, built
 
-    def _declared_budget_nodes(self, run_id: str | None = None) -> set[str]:
+    def declared_budget_nodes(self, run_id: str | None = None) -> set[str]:
         """EventLog 声明的节点集（`ARCHIVED` 视为已摘除）——树完整性的真相源。
 
         S12 K-40：`run_id` 给定 → 只统计该 run 的预算事件（分 run 重放）。
@@ -539,7 +539,7 @@ class RecoveryService:
                         or int(snap.get("consumed", sib.consumed)) != sib.consumed):
                     consistent = False
         # 树完整性（§2.3）：declared（EventLog） vs rebuilt（_nodes）
-        if self._declared_budget_nodes() != (set(self.deps.budget._nodes) - {"run"}):
+        if self.declared_budget_nodes() != (set(self.deps.budget._nodes) - {"run"}):
             consistent = False
         acb.budget_node = node
         acb.reservation_ids = list(node.reservations)
@@ -563,7 +563,7 @@ class RecoveryService:
                 if not isinstance(limits, dict):
                     limits = {node_id: data.get("budget_limits")}
                 try:
-                    self._restore_path(path, limits=limits)
+                    self.restore_path(path, limits=limits)
                 except (ValueError, KeyError, RuntimeError):
                     acb.reservation_ids = []
                     acb.budget_node = None
@@ -655,7 +655,7 @@ class RecoveryService:
         acb.budget_node = node
         acb.needs_readmit = acb.needs_readmit or not consistent
 
-    def _restore_path(self, path: list[str], limits=None) -> list:
+    def restore_path(self, path: list[str], limits=None) -> list:
         """§5.2（K-7）：自顶向下重建**任意深度**路径。
 
         - `parent` 恒为路径上的前一个节点（首节点挂到 `run`）；
@@ -705,7 +705,7 @@ class RecoveryService:
         会写入 checkpoint（`applied_event_ids`），跨进程恢复后仍可去重。
 
         S10a §2.2：增 **budget 投影**（`BUDGET_*` 事件 → 重建树，按 `rid` 幂等）。
-        已由 `_restore_budget` 重放过的事件身份在 `_applied_event_ids` 中，
+        已由 `restore_budget` 重放过的事件身份在 `_applied_event_ids` 中，
         `dedup=True` 时会被跳过 → 不会双份（修 P1-3）。
         """
         applied = 0

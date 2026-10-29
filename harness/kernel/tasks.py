@@ -4,13 +4,13 @@
 
 - 准入与登记（`admit_and_register` / `_admission_key_for` / `lookup_admission`
   / `register_admission` / `clear_admission`）与执行入口（`dispatch_and_run`）；
-- 终态结算（`finish` / `abort` / `_finalize` / `_finalize_locked` /
+- 终态结算（`finish` / `abort` / `finalize` / `_finalize_locked` /
   `_maybe_poison_locked` / `escalate_quarantined`）；
-- HITL 判态（`_approval_slot` / `record_approval` / `_hitl_gate` /
+- HITL 判态（`_approval_slot` / `record_approval` / `hitl_gate` /
   `terminal_status`）与每 ACB 的 transition 锁；
-- 重规划 / 再准入（`replan` / `_prune_id_aliases` / `replan_from_quarantine` /
+- 重规划 / 再准入（`replan` / `prune_id_aliases` / `replan_from_quarantine` /
   `_dead_letter_after_replan` / `_readmit_after_replan` / `requeue_readmit` /
-  `redrive_dead_letter` / `propagate_failure` / `_resolve_current_acb` /
+  `redrive_dead_letter` / `propagate_failure` / `resolve_current_acb` /
   `_admit_ready_successor` / `adopt_capability`）；
 - 管理面回收（`kill_run` / `_reap_expired_tokens`）。
 
@@ -23,7 +23,7 @@
 - 仍留在 Harness 上的方法（`_safe_save` / `_effective_token` /
   `_ensure_policy_token` / `run_task` / `purge_run` / token 清理钩子）以
   **lambda** 注入，调用时才做属性查找 —— 绑定方法会冻结原实现，让测试的
-  类级/实例级打桩失效（`tests/test_s13_hitl.py` 会打桩 `_hitl_gate` 与 `tick`）。
+  类级/实例级打桩失效（`tests/test_s13_hitl.py` 会打桩 `hitl_gate` 与 `tick`）。
 - 本模块的构造**不产生任何事件**（`__init__` 只保存引用）。
 - 事件种类/payload/顺序、锁序、构造顺序全部保持不变（纯位移）。
 """
@@ -112,7 +112,7 @@ class TaskService:
     def finish(self, acb: ACB, *, outcome: str = "DONE") -> Result:
         """S22：门面 token 的**结束** —— ADMITTED → DONE/FAILED → 结算/归档/释放槽位。
 
-        结算逻辑**全部复用** `_finalize`（不重写）：预留 settle、节点归档、
+        结算逻辑**全部复用** `finalize`（不重写）：预留 settle、节点归档、
         槽位释放、后继推进。已终态 → 直接 OK（幂等，不重复结算）。
         """
         if acb.state in TASK_TERMINAL:
@@ -123,7 +123,7 @@ class TaskService:
             return Result(Status.INVALID_INPUT, {
                 "reason": "illegal_finish", "state": acb.state.value,
                 "outcome": outcome})
-        self._finalize(acb)
+        self.finalize(acb)
         return Result(Status.OK, {"state": acb.state.value})
 
     def abort(self, acb: ACB) -> None:
@@ -166,7 +166,7 @@ class TaskService:
             {"approval_id": approval_id, "decision": decision, "reason": reason},
             producer=acb.id, run_id=acb.run_id)
 
-    def _hitl_gate(self, acb: ACB) -> Status | Result | None:
+    def hitl_gate(self, acb: ACB) -> Status | Result | None:
         """S13a §2.2：`WAITING_APPROVAL` 进入执行前的三态判态（fail-closed）。
 
         - `_UNSET` → `NEEDS_APPROVAL`，保持等待（不 push / 不 finalize）；
@@ -219,12 +219,12 @@ class TaskService:
                 acb.failure = "NO_SLOT"
                 acb.needs_readmit = True
                 self.deps.intents.revoke_all(acb.id)
-                self._finalize(acb)
+                self.finalize(acb)
                 return Status.SEMANTIC_REJECTED
             self.deps.safe_save(acb)
             return None
         self.deps.intents.revoke_all(acb.id)     # 释放租约
-        self._finalize(acb)                 # 结算预算 / 释放槽位
+        self.finalize(acb)                 # 结算预算 / 释放槽位
         if decision == "timeout":
             return Status.APPROVAL_TIMEOUT
         # F11：拒绝/非法/状态丢失带结构化原因（不复用裸 `Status.DENIED`，
@@ -296,7 +296,7 @@ class TaskService:
                 self.state.transition_locks[acb.id] = lock
             return lock
 
-    def _finalize(self, acb: ACB) -> None:
+    def finalize(self, acb: ACB) -> None:
         # R7：`superseded` 的旧 ACB 已由 replan 在同一临界区结算 + 摘除；
         # 这里**不得**再落盘（否则覆盖 replan 后的快照 → 恢复出僵尸）。
         if getattr(acb, "superseded", False):
@@ -337,7 +337,7 @@ class TaskService:
         plan = self.state.plans.get(acb.run_id)
         if plan and acb.task_id in plan["tasks"]:
             plan["tasks"][acb.task_id]["state"] = acb.state
-        # §2.4：_finalize 落盘（K-3：在结算/归档**之前**，保留活跃预留供 recover 恢复）；
+        # §2.4：finalize 落盘（K-3：在结算/归档**之前**，保留活跃预留供 recover 恢复）；
         # P1-5：保存失败**不得**阻断下面的结算/归档/槽位释放（否则槽位泄漏）。
         # X8：唯一例外是 claim fencing —— 旧 worker 的快照不得覆盖新 claim，
         # 且结算由新持有者完成，这里直接中止（留痕在 `_drain_skipped`）。
@@ -357,7 +357,7 @@ class TaskService:
                 acb.budget_node = None
         self.deps.budget.flush_pending()
         # F5：等待审批**不是**占槽位的理由（否则 `max_concurrent` 下等待中的任务会
-        # 饿死其他 run）；统一释放，`_hitl_gate` 批准后重新 `try_acquire`。
+        # 饿死其他 run）；统一释放，`hitl_gate` 批准后重新 `try_acquire`。
         # `SlotTracker.release` 幂等，重复释放不会泄漏。
         self.deps.slots.release(acb.id)                 # P1-5：先释放槽位（不因落盘失败跳过）
         if acb.state in (TaskState.FAILED, TaskState.CANCELLED, TaskState.DEAD_LETTER):
@@ -407,7 +407,7 @@ class TaskService:
                     continue
                 dst_pv = int(dst_task.get("plan_version",
                                           plan.get("version", 1)) or 1)
-                target = self._resolve_current_acb(
+                target = self.resolve_current_acb(
                     acb.run_id, dst_tid, dst_pv, plan=plan, src=acb)
                 if target is None:
                     self.state.drain_skipped.append((f"{acb.run_id}:{dst_tid}",
@@ -495,10 +495,10 @@ class TaskService:
             # （`task_for(new_plan, acb.task_id)`），所以剪枝必须放在它**之后**。
             self._readmit_after_replan(acb, new_plan)
             # S14 K-67(A)：别名剪枝（判据含「活跃 ACB 的 task_id / subgoal」）。
-            self._prune_id_aliases(acb.run_id, new_plan)
+            self.prune_id_aliases(acb.run_id, new_plan)
             return new_plan
 
-    def _prune_id_aliases(self, run_id: str, plan: dict) -> None:
+    def prune_id_aliases(self, run_id: str, plan: dict) -> None:
         """S14 K-67(A)：剪掉**已不可能再被引用**的旧 id → logical_subgoal 映射。
 
         判据（修正 S13 §2.3 的漏洞）::
@@ -507,7 +507,7 @@ class TaskService:
                                     ∪ 本 run 活跃 ACB 的 logical_subgoal_id
 
         为什么必须含最后两项：`patch()` 已把 `edges` 端点**物化**为 canonical id，
-        于是边不再引用旧 id；但 `_finalize` / `_readmit_after_replan` 仍按
+        于是边不再引用旧 id；但 `finalize` / `_readmit_after_replan` 仍按
         **活跃 ACB 的旧 `task_id`** 解析。只按 edges 剪枝会把它们剪掉 →
         `replan_no_task`。这正是 K-67 的判据修正。
 
@@ -625,7 +625,7 @@ class TaskService:
         fresh.children_ids = list(acb.children_ids)
         fresh.children_pending = copy.deepcopy(acb.children_pending)
         self.adopt_capability(acb, fresh)
-        # R7：同一临界区内标记 + 落盘 + 摘除（避免 `_finalize` 覆盖快照）
+        # R7：同一临界区内标记 + 落盘 + 摘除（避免 `finalize` 覆盖快照）
         acb.superseded = True
         acb.needs_readmit = False
         self.clear_admission(acb=acb)
@@ -780,7 +780,7 @@ class TaskService:
                 if isinstance(succ, dict) and succ.get("state") not in TASK_TERMINAL:
                     succ["state"] = TaskState.CANCELLED
 
-    def _resolve_current_acb(self, run_id: str, task_id: str,
+    def resolve_current_acb(self, run_id: str, task_id: str,
                              plan_version: int | None = None,
                              *, plan: dict | None = None,
                              src: ACB | None = None) -> ACB | None:
@@ -790,7 +790,7 @@ class TaskService:
         - 无候选且 `plan` 给出了 PLANNED 任务 → **就地 `try_admit`**（生产常态：
           `dispatch_and_run` 一次只准入一个 task，后继不会提前有 ACB）；准入失败：
           `INVALID_INPUT` / `DENIED_CAPABILITY` / `CONTRACT_CONFLICT` 等**硬失败**
-          → `advance("give_up")` 后 `_finalize`（FAILED 并传播），绝不 silent skip；
+          → `advance("give_up")` 后 `finalize`（FAILED 并传播），绝不 silent skip；
           `NO_SLOT` / `BUDGET_EXHAUSTED` 等可恢复失败 → 记 `_drain_skipped` 留给
           supervisor 重试；
         - 多候选 → 按 `(plan_version, generation, acb.id)` 确定性选一个，落选者
@@ -844,10 +844,10 @@ class TaskService:
         self.state.drain_skipped.append((f"{run_id}:{task_id}", f"admit_{reason}"))
         if fresh.state is TaskState.INADMISSIBLE and reason in (
                 "INVALID_INPUT", "DENIED_CAPABILITY", "CONTRACT_CONFLICT"):
-            # R5：无法处理 → 走状态机 give_up（FAILED），由 `_finalize` 传播；
+            # R5：无法处理 → 走状态机 give_up（FAILED），由 `finalize` 传播；
             # 资源已在准入回滚中释放，不会留下残留。
             advance(fresh, "give_up")
-            self._finalize(fresh)
+            self.finalize(fresh)
         return None
 
     def adopt_capability(self, src: ACB | None, fresh: ACB) -> None:
@@ -902,7 +902,7 @@ class TaskService:
                 acb.state = TaskState.CANCELLED
                 acb.failure = "KILLED_BY_ADMIN"
                 self.deps.intents.revoke_all(acb.id)
-                self._finalize(acb)
+                self.finalize(acb)
                 killed += 1
         self.state.paused_runs.discard(run_id)
         return killed

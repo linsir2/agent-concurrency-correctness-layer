@@ -147,9 +147,9 @@ def test_review_p0_3_receipt_conflict_isolated(monkeypatch):
     acb.staged["b"] = {"v": 1}
     assert h.commit_batch(acb, [Write("b")]) == Status.OK
 
-    commit_key = h._commit_key(acb, "b", h.blobs.put(canonical_bytes({"v": 1})),
+    commit_key = h.receipts.commit_key(acb, "b", h.blobs.put(canonical_bytes({"v": 1})),
                                Mode.COMMIT)
-    assert commit_key in h._receipt_ids, "前提：收据已签发"
+    assert commit_key in h.state.receipt_ids, "前提：收据已签发"
     # 模拟「提交事件丢失、但收据仍在」→ 去重失效，append 前断言必须拦住
     monkeypatch.setattr(h.receipts, "dedup_event", lambda *a, **k: None)
 
@@ -157,7 +157,7 @@ def test_review_p0_3_receipt_conflict_isolated(monkeypatch):
         h.commit_batch(acb, [Write("b")])
     assert _count(h, EventKind.RESOURCE_COMMITTED) == 1, "冲突后不得追加提交事件"
     scope = (acb.run_id, acb.logical_subgoal_id)
-    assert scope in h._tainted_scopes, "冲突必须隔离 scope（P2-C）"
+    assert scope in h.state.tainted_scopes, "冲突必须隔离 scope（P2-C）"
     assert h.verify_receipts(*scope) is False, "隔离后 verify 必须为 False（P2-C）"
     # 链本身未被破坏（冲突在 append 前被拦住）：直接校验链连续 + 签名
     receipts = h.receipts_of(*scope)

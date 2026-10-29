@@ -104,7 +104,7 @@ def test_d2_redrive_is_bounded():
 
     # 已达上限 → 拒绝
     assert h.redrive_dead_letter(first) is None
-    assert (first.id, "redrive_limit_exceeded") in h._drain_skipped
+    assert (first.id, "redrive_limit_exceeded") in h.dispatch.skipped
 
 
 def test_d2_redrive_rejects_non_dead_letter():
@@ -134,11 +134,11 @@ def test_d3_pause_blocks_scheduling_but_keeps_resources():
 
     assert h.pause_run("R1") is True
     h.scheduler.push(acb.id)
-    h._drain_scheduler()
+    h.dispatch.drain_scheduler()
 
     # 未执行
     assert acb.state is TaskState.ADMITTED
-    assert (acb.id, "run_paused") in h._drain_skipped
+    assert (acb.id, "run_paused") in h.dispatch.skipped
     # 资源保留（这是 pause 与 cancel 的核心区别）
     assert set(h.slots.active_keys()) == slot_before
     assert h.budget.root.subtree_reserved == reserved_before

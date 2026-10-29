@@ -312,8 +312,8 @@ def test_s10_9_budget_events_do_not_trigger_gc():
     assert [e for e in h.event_log.all() if e.kind in kinds], \
         "预算事件未落 EventLog（notify=False 之外还须 append）"
     # 预算事件全部 notify=False → `_event_count` 不受影响
-    assert h._event_count == 0, \
-        f"预算事件触发了订阅者：_event_count={h._event_count}（应 0）"
+    assert h.state.event_count == 0, \
+        f"预算事件触发了订阅者：_event_count={h.state.event_count}（应 0）"
 
     # 现有 gc 用例语义不变：第 3 个**普通**事件才触发 gc
     h.event_log.append(EventKind.TASK_COMPLETED, "x1", {})
@@ -404,7 +404,7 @@ def test_s10_restore_budget_old_dict_branch_unchanged():
         "reservation_ids": ["rid-x"],
     }
     acb = ACB(id="A-S10-RB", run_id="R", task_id="T1")
-    h._restore_budget(acb, data)
+    h.recovery.restore_budget(acb, data)
     assert h.budget._nodes["B-X"].limits == 10
     assert acb.reservation_ids == ["rid-x"]
 
@@ -508,7 +508,7 @@ def test_s10_replay_failure_rolls_back_built_nodes(monkeypatch):
 
     monkeypatch.setattr(BudgetManager, "apply_budget_event",
                         lambda self, ev: False)
-    ok, built = h._replay_budget_events(0)
+    ok, built = h.recovery.replay_budget_events(0)
     assert ok is False and built == []
     assert set(h.budget._nodes) == {"run"}, f"回滚残留节点：{set(h.budget._nodes)}"
     assert h.budget.root.children == []

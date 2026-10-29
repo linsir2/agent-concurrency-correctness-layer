@@ -336,7 +336,7 @@ def test_s13_13_run_task_calls_tick_before_gate_and_settles(monkeypatch):
 
     order: list[str] = []
     orig_tick = h.tick
-    orig_gate = h._hitl_gate
+    orig_gate = h.tasks.hitl_gate
 
     def spy_tick(now_ms=None):
         order.append("tick")
@@ -418,5 +418,5 @@ def test_s13_0_capability_and_schema_version_persisted():
     assert recovered.needs_readmit is True
     # 空串哨兵：有效 token 不得落回 policy.default_token（否则 fail-open）
     assert recovered.capability == ""
-    assert h._effective_token(recovered) == ""
-    assert h.policy.resolve_token(h._effective_token(recovered)) is None
+    assert h.identity.effective_token(recovered) == ""
+    assert h.policy.resolve_token(h.identity.effective_token(recovered)) is None
