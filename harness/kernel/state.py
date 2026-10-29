@@ -87,6 +87,12 @@ class KernelState:
     timers_fired: list = field(default_factory=list)   # 旧 `self._timers_fired`
     draining: bool = False                            # 旧 `self._draining`
 
+    # ---- S5-e：Timer 面两个**可在构造后整体替换**的组件引用（旧 `self.definitions`
+    # / `self.timers`）。`tests/test_s24_definitions.py` 会 `h.definitions = replacement`
+    # —— 冻进 `TimerDeps`（frozen）会读到旧值，故留在这里、调用时读。
+    definitions: Any = None                           # 旧 `self.definitions`
+    timers: Any = None                                # 旧 `self.timers`（DurableTimer | None）
+
     # ---- S4：恢复去重集合（旧 `self._applied_event_ids`，recovery 抽取前置）----
     # 事件身份已应用集合；`CheckpointStore` 持有**同一对象**引用
     # （`checkpoints.applied_event_ids`），故只能原地 update/add，绝不换新 set。

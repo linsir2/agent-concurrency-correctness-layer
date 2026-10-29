@@ -14,11 +14,22 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 def _method(name: str) -> str:
-    """`Harness.<name>` 的**实现**源码（S3.2：准入/终态簇已迁至 kernel/tasks.py）。"""
+    """`<name>` 的**实现**源码（服务优先、Harness 兜底解析）。
+
+    S3.2：准入/终态簇迁至 `kernel/tasks.py`；S5-e：租户/计量/剪枝迁至
+    `kernel/tenancy.py`，Admin 面迁至 `kernel/admin.py`（`claim_window_s` 的
+    真实现仍在 `kernel/dispatch.py`，故 dispatch 优先于 admin 的转发层）。
+    """
     from harness import Harness
+    from harness.kernel.admin import AdminService
+    from harness.kernel.dispatch import DispatchService
     from harness.kernel.tasks import TaskService
-    owner = TaskService if hasattr(TaskService, name) else Harness
-    return inspect.getsource(getattr(owner, name))
+    from harness.kernel.tenancy import TenancyService
+    for owner in (TaskService, DispatchService, TenancyService, AdminService,
+                  Harness):
+        if hasattr(owner, name):
+            return inspect.getsource(getattr(owner, name))
+    raise AttributeError(name)
 
 
 def _impl() -> str:
@@ -97,10 +108,10 @@ chk("K-99 协议声明 reap_expired", "def reap_expired" in _proto)
 chk("K-100 max_lease_ttl_s 存在", hasattr(Harness, "max_lease_ttl_s")
     or "max_lease_ttl_s" in inspect.getsource(Harness.__init__))
 chk("K-100 claim_window_s 存在", callable(getattr(Harness, "claim_window_s", None)))
-_cw = inspect.getsource(Harness.claim_window_s)
+_cw = _method("claim_window_s")
 chk("K-100 窗口用租约时长而非常量", "max_lease_ttl_s" in _cw)
 chk("K-100 窗口 = 上限 × 租约时长", "claim_tombstone_max" in _cw)
-_pb = inspect.getsource(Harness.prune_budget)
+_pb = _method("prune_budget")
 chk("K-100 prune 下发 max_lease_ttl_s", "max_lease_ttl_s" in _pb)
 chk("K-100 回读 claim_window_exceeded", "claim_window_exceeded" in _pb)
 _rb = inspect.getsource(raft_mod._ReplicatedBudget)
@@ -123,7 +134,7 @@ chk("K-100 Raft 后端暴露 claim_tombstone_max 诊断",
                property))
 
 # ---------------------------------------------------- 多租户优先级份额
-_et = inspect.getsource(Harness.ensure_tenant)
+_et = _method("ensure_tenant")
 chk("份额 ensure_tenant 支持 min_share", "min_share" in _et)
 chk("份额 建 tenant:<t>:reserved", ":reserved" in _et)
 chk("份额 超 quota 显式拒绝", "ValueError" in _et)

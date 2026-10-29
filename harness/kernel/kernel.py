@@ -25,6 +25,7 @@ from ..egress import EgressGuard
 from ..event_log import EventLog
 from ..ingress import Ingress
 from ..intent_registry import IntentRegistry
+from .admin import AdminDeps, AdminService
 from .children import ChildDeps, ChildManager
 from .commit import CommitDeps, CommitService
 from .dispatch import (
@@ -45,6 +46,8 @@ from .recovery import (
 )
 from .state import KernelState
 from .tasks import TaskDeps, TaskService
+from .tenancy import TenancyDeps, TenancyService
+from .timers import TimerService
 from ..llm import LLMClient
 from ..orchestration import (
     HITL,
@@ -75,11 +78,8 @@ from ..subscription import SubscriptionRegistry
 from ..timer import DurableTimer
 from ..types import (
     ACB,
-    TASK_TERMINAL,
-    EventKind,
     Mode,
     Result,
-    TaskState,
     Write,
 )
 from ..workspace import WorkspaceManager, WorkspaceVersionStore
@@ -488,6 +488,25 @@ class Harness:
                 is_paused=lambda *a, **k: self.is_paused(*a, **k),
                 bump_epoch=lambda *a, **k: self.bump_epoch(*a, **k)),
             self.state)
+        # ---- S5-e：Admin / Tenancy / Timer 三个面（构造不追加任何事件）----
+        # 依赖此刻已全部就绪（event_log / budget / clock / run_coordinator /
+        # dispatch 均在上）。可变容器/配置一律在调用时读 `KernelState`；`drain` /
+        # `claim_window_s` 的真实现在 dispatch 上，故以 **lambda** 二次转发
+        # （不传绑定方法，保证「构造后替换 dispatch 实例方法」仍然生效）。
+        self.admin = AdminService(
+            AdminDeps(event_log=self.event_log, budget=self.budget,
+                      run_coordinator=self.run_coordinator,
+                      dispatch_drain=lambda *a, **k: self.dispatch.drain(*a, **k),
+                      dispatch_claim_window_s=lambda *a, **k:
+                          self.dispatch.claim_window_s(*a, **k)),
+            self.state)
+        self.tenancy = TenancyService(
+            TenancyDeps(budget=self.budget, clock=self.clock,
+                        event_log=self.event_log),
+            self.state)
+        # TimerService 无 `*Deps`：它只碰 `state.definitions` / `state.timers`
+        # （两者都可在构造后整体替换，见 `KernelState` 的同名字段）。
+        self.timer_service = TimerService(self.state)
         self.state.plans = {}
         self.state.acbs = {}
         self.state.lock = threading.RLock()
@@ -575,7 +594,7 @@ class Harness:
                     self.tasks.register_admission(*a, **k),
                 run_one_compensation=lambda *a, **k:
                     self.commit.run_one_compensation(*a, **k),
-                rebuild_pause_state=lambda: self._rebuild_pause_state(),
+                rebuild_pause_state=lambda: self.admin.rebuild_pause_state(),
                 token_from_payload=lambda *a, **k:
                     self._token_from_payload(*a, **k),
                 register_token=lambda *a, **k: self._register_token(*a, **k),
@@ -908,6 +927,25 @@ class Harness:
     def _paused_runs(self, value) -> None:
         self.state.paused_runs = value
 
+    # ---- S5-e：Timer 面的两个组件入口（TimerService 在调用时读 `state`）----
+    @property
+    def definitions(self):
+        """S24-11：定义注册表（旧 `self.definitions`；**可在构造后整体替换**）。"""
+        return self.state.definitions
+
+    @definitions.setter
+    def definitions(self, value) -> None:
+        self.state.definitions = value
+
+    @property
+    def timers(self):
+        """S24-11：`DurableTimer | None`（旧 `self.timers`；None = 未启用）。"""
+        return self.state.timers
+
+    @timers.setter
+    def timers(self, value) -> None:
+        self.state.timers = value
+
     @property
     def _drain_skipped(self):
         """D11：调度跳过原因（旧 `self._drain_skipped: list[tuple[str, str]]`）。"""
@@ -1189,26 +1227,16 @@ class Harness:
     # ---- 单写者租约 + fencing epoch（S10a §2.5 / §3.4 / S24-8）----------
 
     # ---- S24-11：定义版本化 + DurableTimer 便捷入口 ----------------
+    # S5-e：实现已迁至 `kernel/timers.py::TimerService`（此处仅公共委托）。
     def check_definition(self, ref) -> str:
         """校验 ACB/plan 钉住的定义引用；空串 = 通过（fail-closed）。"""
-        if not ref:
-            return ""
-        if self.definitions is None:
-            return "DEFINITION_REGISTRY_MISSING"
-        try:
-            return str(self.definitions.check(ref))
-        except Exception:  # noqa: BLE001  # 非法 ref → 拒绝
-            return "DEFINITION_MALFORMED"
+        return self.timer_service.check_definition(ref)
 
     def set_timer(self, timer_id: str, fire_at_ms: int, **kwargs):
-        if self.timers is None:
-            raise RuntimeError("未启用 timers（Harness(timers=...) / durable_timers=True）")
-        return self.timers.schedule(timer_id, fire_at_ms, **kwargs)
+        return self.timer_service.set_timer(timer_id, fire_at_ms, **kwargs)
 
     def cancel_timer(self, timer_id: str, *, reason: str = "") -> bool:
-        if self.timers is None:
-            raise RuntimeError("未启用 timers")
-        return self.timers.cancel(timer_id, reason=reason)
+        return self.timer_service.cancel_timer(timer_id, reason=reason)
 
 
 
@@ -1282,236 +1310,70 @@ class Harness:
         return self.dispatch.pump(*args, **kwargs)
 
     # ---- S15 D3：Admin pause / resume（持久化、不丢状态）-------------
+    # S5-e：实现已迁至 `kernel/admin.py::AdminService`（此处仅公共委托）。
     def is_paused(self, run_id: str) -> bool:
         """该 run 是否处于 Admin 暂停（只阻止**未开始**的任务被调度）。"""
-        return bool(run_id) and run_id in self._paused_runs
+        return self.admin.is_paused(run_id)
 
     def pause_run(self, run_id: str, *, reason: str = "") -> bool:
-        """暂停一个 run：保留槽位/预算/节点（可恢复），只停止新调度。
-
-        与 `cancel_run` 的区别：cancel **释放资源且不可恢复**；pause 不释放。
-        在途任务**不打断**（避免半提交），让它跑完。
-        返回 `True` = 本次真的从「运行」变为「暂停」；已暂停返回 `False`。
-        """
-        run_id = str(run_id or "")
-        if not run_id or run_id in self._paused_runs:
-            return False
-        self._paused_runs.add(run_id)
-        self.event_log.append(EventKind.RUN_PAUSED, run_id,
-                              {"reason": str(reason or "")}, run_id=run_id)
-        return True
+        """暂停一个 run：保留槽位/预算/节点（可恢复），只停止新调度。"""
+        return self.admin.pause_run(run_id, reason=reason)
 
     def resume_run(self, run_id: str) -> bool:
         """恢复一个被暂停的 run（`True` = 本次真的从「暂停」变为「运行」）。"""
-        run_id = str(run_id or "")
-        if run_id not in self._paused_runs:
-            return False
-        self._paused_runs.discard(run_id)
-        self.event_log.append(EventKind.RUN_RESUMED, run_id, {}, run_id=run_id)
-        return True
+        return self.admin.resume_run(run_id)
 
     def paused_runs(self) -> list[str]:
-        return sorted(self._paused_runs)
-
-    def _rebuild_pause_state(self) -> None:
-        """从事件流重建暂停集合（**持久真相**，重启后仍暂停）。
-
-        按 seq 顺序应用 `RUN_PAUSED` / `RUN_RESUMED`，后者覆盖前者。
-        """
-        paused: set[str] = set()
-        for ev in self.event_log.all():
-            if ev.kind is EventKind.RUN_PAUSED:
-                paused.add(str(ev.subject))
-            elif ev.kind is EventKind.RUN_RESUMED:
-                paused.discard(str(ev.subject))
-        self._paused_runs = paused
+        return self.admin.paused_runs()
 
     # ---- S15 D2：DLQ redrive（终态 + 显式重放 + 有界）----------------
     def redrive_dead_letter(self, *args, **kwargs):
         return self.tasks.redrive_dead_letter(*args, **kwargs)
 
     # ---- S15 D4：可观测快照（零依赖，OTel 友好结构）------------------
+    # S5-e：实现已迁至 `kernel/admin.py::AdminService`（此处仅公共委托）。
     def metrics(self) -> dict:
-        """只读快照：`{"counters": {...}, "gauges": {...}}`。
-
-        从 EventLog 与内存状态派生，**不引入 OTel/Prometheus 依赖**
-        （`dependencies = []` 是硬约束）；使用者可自行映射到自己的指标后端。
-        """
-        counters: dict[str, int] = {}
-        for ev in self.event_log.all():
-            name = ev.kind.value if hasattr(ev.kind, "value") else str(ev.kind)
-            counters[name] = counters.get(name, 0) + 1
-        gauges = {
-            "acbs_total": len(self.acbs),
-            "acbs_nonterminal": sum(
-                1 for a in self.acbs.values() if a.state not in TASK_TERMINAL),
-            "paused_runs": len(self._paused_runs),
-            "dead_letter": sum(
-                1 for a in self.acbs.values()
-                if a.state is TaskState.DEAD_LETTER),
-            "waiting_approval": sum(
-                1 for a in self.acbs.values()
-                if a.state is TaskState.WAITING_APPROVAL),
-            "budget_root_reserved": int(
-                getattr(self.budget.root, "subtree_reserved", 0) or 0),
-            "event_log_tail": self.event_log.tail(),
-        }
-        return {"counters": counters, "gauges": gauges}
+        """只读快照：`{"counters": {...}, "gauges": {...}}`（零依赖派生）。"""
+        return self.admin.metrics()
 
     # ---- S17 MS10：优雅排空 / Admin kill·purge / 可观测 ----------------
     def drain(self, *args, **kwargs):
-        return self.dispatch.drain(*args, **kwargs)
+        return self.admin.drain(*args, **kwargs)
 
     def kill_run(self, *args, **kwargs):
         return self.tasks.kill_run(*args, **kwargs)
 
     def purge_run(self, run_id: str) -> bool:
-        """把**已全终态**的 run 移出内存（`acbs`/`plans`）。
-
-        **不删除历史事件**（保留审计与收据链），只写 `RUN_PURGED` 事件。
-        存在未终态任务 → 返回 `False`（要求先 `kill_run`/等完成）。
-        """
-        acbs = [a for a in self.acbs.values() if a.run_id == run_id]
-        if any(a.state not in TASK_TERMINAL for a in acbs):
-            return False
-        for acb in acbs:
-            self.acbs.pop(acb.id, None)
-            self.run_coordinator.unregister(acb)
-        self.plans.pop(run_id, None)
-        self._paused_runs.discard(run_id)
-        self.event_log.append(EventKind.RUN_PURGED, run_id, {}, run_id=run_id)
-        return True
+        """把**已全终态**的 run 移出内存（`acbs`/`plans`），不删历史事件。"""
+        return self.admin.purge_run(run_id)
 
 
     def claim_window_s(self, *args, **kwargs):
-        return self.dispatch.claim_window_s(*args, **kwargs)
+        return self.admin.claim_window_s(*args, **kwargs)
 
+    # ---- S20 阶段二：预算墓碑剪枝（S5-e：实现已迁至 kernel/tenancy.py）----
     def prune_budget(self, *, max_age_s: float | None = None,
                      now_ms: int | None = None) -> int:
-        """S19 K-88：剪掉「已终结 + 无人引用 + 超过保留期」的预算预留条目。
-
-        `live_rids` 由**活 ACB**（非终态）的 `reservation_ids` 精确算出 ——
-        这是比「按序号水位」更强的引用栅栏（单机 rid 是 uuid，没有单调 seq）。
-        """
-        now_s = (int(self.clock.now_ms()) if now_ms is None else int(now_ms)) / 1000.0
-        live: set[str] = set()
-        live_ids: set[str] = set()
-        for acb in self.acbs.values():
-            if acb.state in TASK_TERMINAL:
-                continue
-            live_ids.add(acb.id)
-            live.update(acb.reservation_ids or ())
-        # S21 K-100：墓碑的**年龄窗口**随命令下发（`max_lease_ttl_s`）——由
-        # Raft 副本按「入墓已满该时长」判定能否忘记，避免复活仍活着的旧 worker。
-        # 单机后端接收后忽略。拒绝淘汰的次数回读到 `_claim_window_exceeded`。
-        removed = self.budget.prune(now_s, live, max_age_s=max_age_s,
-                                    live_acb_ids=live_ids,
-                                    max_lease_ttl_s=float(self.max_lease_ttl_s))
-        self._claim_window_exceeded = int(
-            getattr(self.budget, "claim_window_exceeded", 0) or 0)
-        return removed
+        """S19 K-88：剪掉「已终结 + 无人引用 + 超过保留期」的预算预留条目。"""
+        return self.tenancy.prune_budget(max_age_s=max_age_s, now_ms=now_ms)
 
     # ---- S20 阶段三：多租户（**配额隔离**，非安全隔离）----------------
+    # S5-e：实现已迁至 `kernel/tenancy.py::TenancyService`（此处仅公共委托）。
     def ensure_tenant(self, tenant: str, quota: int, *,
                       parent: str = "run", min_share: float = 0.0):
-        """确保存在 `tenant:<t>` 预算节点（幂等）。挂在它下面的节点共享受配额约束。
-
-        `min_share>0` 时再建 `tenant:<t>:reserved`（优先级份额池）。
-
-        **失败零残留**：份额/配额先校验再建节点；配置冲突（同名节点已存在但
-        quota/parent/share 不同）**显式抛错**，绝不静默返回旧节点。
-
-        **诚实边界**：这只有**配额**隔离；同进程仍共享内存（安全隔离靠 egress/沙箱）。
-        `plan["tenant"]` 已由 K-97 自动接到准入（见 `Dispatcher._resolve_parent_budget`）。
-        """
-        tid = str(tenant or "")
-        if not tid:
-            return None
-        if ":" in tid:
-            # `tenant:<t>` 的解析靠 `:` 分隔；租户名含 `:` 会让归属/计量错位。
-            raise ValueError(f"非法 tenant 名：{tid!r}（不得含 ':'）")
-        # 显式拒绝小数：`int()` 静默截断会让「6.9 变成 6」看起来成功。
-        if int(quota) != quota:
-            raise ValueError(f"quota={quota!r} 必须是整数")
-        if min_share is not None and int(min_share) != min_share:
-            raise ValueError(f"min_share={min_share!r} 必须是整数")
-        quota = int(quota)
-        share = int(min_share or 0)
-        # ① 先校验（在建任何节点之前）—— 非法份额不得留下半成品。
-        if quota <= 0:
-            raise ValueError(f"quota={quota} 必须 > 0")
-        if share < 0 or share > quota:
-            raise ValueError(
-                f"min_share={share} 必须满足 0 <= share <= quota={quota}")
-        if parent != "run" and self.budget._nodes.get(parent) is None:
-            raise ValueError(f"父预算节点不存在：{parent!r}")
-        # ② 建租户节点；同名但配置不同 → create_node 返回 None → 显式拒绝。
-        node = self.budget.create_node(f"tenant:{tid}", quota, parent, tenant=tid)
-        if node is None:
-            raise ValueError(
-                f"tenant:{tid} 已存在但 quota/parent 不一致（不会静默沿用旧配置）")
-        if share > 0:
-            # 预留子节点：已知档位（premium/standard/developer）挂它，
-            # 其他/未知档位回落共享池（超额借用）。
-            rnode = self.budget.create_node(f"tenant:{tid}:reserved", share,
-                                            f"tenant:{tid}", tenant=tid)
-            if rnode is None:
-                raise ValueError(
-                    f"tenant:{tid}:reserved 已存在但 min_share 不一致（不会静默沿用旧配置）")
-        return node
+        """确保存在 `tenant:<t>` 预算节点（幂等，失败零残留）。"""
+        return self.tenancy.ensure_tenant(tenant, quota, parent=parent,
+                                          min_share=min_share)
 
     # ---- S20 阶段三：计量（**从事件派生**，天然幂等）------------------
     def usage_report(self, *, tenant: str | None = None) -> dict:
-        """按租户归集的用量（从 EventLog 重算，**幂等**）。
+        """按租户归集的用量（从 EventLog 重算，**幂等**）。"""
+        return self.tenancy.usage_report(tenant=tenant)
 
-        为什么不用原子计数器：AWS Builders' Library 指出原子计数器**不幂等**
-        （重试会重复计数）；EventLog 是唯一提交点（I1），从它重算天然幂等。
-
-        归集口径（**明确写死，避免歧义**）：
-        - `actions`：`RESOURCE_COMMITTED` 事件数（全局）
-        - `runs`：出现过的 `run_id` 去重数
-        - `by_tenant[t]`：**预算预留事件数**（`BUDGET_RESERVED`），按事件的
-          `subject`（= 预算节点 id）映射到该节点上的 `tenant` 标签归集
-        - `tenant=` 给定时只返回该租户的切片
-        """
-        node_tenant: dict[str, str] = {}
-        for nid, node in (getattr(self.budget, "_nodes", {}) or {}).items():
-            t = getattr(node, "tenant", "") or ""
-            if t:
-                node_tenant[nid] = t
-
-        actions = 0
-        runs: set[str] = set()
-        by_tenant: dict[str, int] = {}
-        for ev in self.event_log.all():
-            kind = ev.kind.value if hasattr(ev.kind, "value") else str(ev.kind)
-            if ev.run_id:
-                runs.add(ev.run_id)
-            if kind == "RESOURCE_COMMITTED":
-                actions += 1
-            elif kind == "BUDGET_RESERVED":
-                t = node_tenant.get(str(ev.subject), "")
-                if t:
-                    by_tenant[t] = by_tenant.get(t, 0) + 1
-
-        if tenant is not None:
-            t = str(tenant)
-            return {"tenant": t, "reservations": int(by_tenant.get(t, 0)),
-                    "runs": len(runs), "actions": actions}
-        return {"actions": actions, "runs": len(runs), "by_tenant": by_tenant}
-
+    # ---- S17 MS10：可观测导出（S5-e：实现已迁至 kernel/admin.py）----
     def export_observability(self, sink=None) -> int:
-        """把事件流 + metrics 推给 `SpanSink`（默认 `MemorySpanSink`）。
-
-        **零依赖**：不 import OTel；需要真实 OTel 时传入
-        `observability.make_otel_sink()`。返回推送的 span 条数。
-        """
-        from ..observability import MemorySpanSink, export_metrics, export_spans
-
-        target = sink if sink is not None else MemorySpanSink()
-        n = export_spans(target, self.event_log.all())
-        export_metrics(target, self.metrics())
-        return n
+        """把事件流 + metrics 推给 `SpanSink`（默认 `MemorySpanSink`）。"""
+        return self.admin.export_observability(sink)
 
 
     # ---- S13d §2.5：aging（墙钟 deadline）+ claim fencing --------------

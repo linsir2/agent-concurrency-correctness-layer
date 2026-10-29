@@ -17,6 +17,7 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "tests"))
 
 import harness
+from harness.kernel.admin import AdminService
 from harness.kernel.dispatch import DispatchService
 from harness.kernel.tasks import TaskService
 from harness.kernel.children import ChildManager
@@ -38,7 +39,8 @@ bad: list[tuple[str, str]] = []
 
 
 _OWNERS = (DispatchService, TaskService, ChildManager, CommitService,
-           ReceiptChain, RecoveryService, WriterLeaseService, Harness)
+           ReceiptChain, RecoveryService, WriterLeaseService, AdminService,
+           Harness)
 
 
 def _impl(name: str) -> str:
@@ -142,12 +144,14 @@ chk("D2 走清理序列（settle/remove_node）",
     "budget.settle" in src_r and "remove_node" in src_r)
 
 # D3：Admin pause/resume
-for m in ("pause_run", "resume_run", "is_paused", "paused_runs",
-          "_rebuild_pause_state"):
+for m in ("pause_run", "resume_run", "is_paused", "paused_runs"):
     chk(f"D3 Harness.{m} 存在", callable(getattr(Harness, m, None)))
-src_p = inspect.getsource(Harness.pause_run)
+# S5-e：私有实现随 AdminService 迁出（Harness 不再持有私有委托）
+chk("D3 AdminService.rebuild_pause_state 存在",
+    callable(getattr(AdminService, "rebuild_pause_state", None)))
+src_p = _impl("pause_run")
 chk("D3 pause 写 RUN_PAUSED 事件（持久化）", "RUN_PAUSED" in src_p)
-src_r2 = inspect.getsource(Harness.resume_run)
+src_r2 = _impl("resume_run")
 chk("D3 resume 写 RUN_RESUMED 事件", "RUN_RESUMED" in src_r2)
 src_d = _impl("_drain_skip_reason")
 chk("D3 调度尊重暂停（run_paused）", "run_paused" in src_d)
@@ -157,7 +161,7 @@ chk("D3 submit_command 路由 PAUSE/RESUME",
 
 # D4：可观测
 chk("D4 metrics 存在", callable(getattr(Harness, "metrics", None)))
-src_m = inspect.getsource(Harness.metrics)
+src_m = _impl("metrics")
 chk("D4 返回 counters/gauges", '"counters"' in src_m and '"gauges"' in src_m)
 chk("D4 零依赖（不 import otel/prometheus）",
     "opentelemetry" not in src_m and "prometheus" not in src_m)

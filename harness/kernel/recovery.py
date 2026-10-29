@@ -20,10 +20,11 @@
   deps 会读到旧值。
 - 仍留在 Harness 上的方法（`_ensure_writer_lease` / `_restore_epoch` /
   `bump_epoch` / `tick` / `_register_admission` / `_run_one_compensation` /
-  `_rebuild_pause_state` / `_token_from_payload` / `_register_token` /
+  `_token_from_payload` / `_register_token` /
   `_ensure_policy_token`）以 **lambda** 注入，调用时才做属性查找 —— 绑定方法会
   冻结原实现，让测试的类级/实例级打桩失效（`tests/test_s13_hitl.py` 会打桩
-  `tick`）。
+  `tick`）。`rebuild_pause_state` 自 S5-e 起直连
+  `kernel/admin.py::AdminService`（暂停族的唯一实现），不再经 Harness。
 - 跨服务调用只走**公开接缝**：收据链 `receipts.rebuild()`（`_rebuild_receipts`
   的唯一实现）、子任务 `children.index_child` / `reconcile_children_refs` /
   `reconcile_children_pending`。绝不 `._private` 穿透。

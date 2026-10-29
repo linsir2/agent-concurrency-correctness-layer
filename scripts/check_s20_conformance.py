@@ -23,6 +23,7 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
 
 from harness import Harness
 from harness.budget import BudgetManager
+from harness.kernel.tenancy import TenancyService
 from harness.storage import raft as raft_mod
 
 # ---------------------------------------------------- K-94
@@ -69,7 +70,7 @@ chk("多租户 create_node 接受 tenant",
 # ---------------------------------------------------- 计量
 chk("计量 usage_report 存在",
     callable(getattr(Harness, "usage_report", None)))
-_ur = inspect.getsource(Harness.usage_report)
+_ur = inspect.getsource(TenancyService.usage_report)
 chk("计量从事件派生（非内存计数器）",
     "event_log.all()" in _ur and "tenant" in _ur)
 
