@@ -175,7 +175,8 @@ def create_netns(name: str, *, mode: str = MODE_A_NO_ROUTE,
 
 def spawn_in_netns(argv: Sequence[str], name: str, *,
                    mode: str = MODE_A_NO_ROUTE,
-                   proxy: str | None = None) -> subprocess.Popen:
+                   proxy: str | None = None,
+                   **popen_kwargs) -> subprocess.Popen:
     """在 `name` netns 里启动子进程（**部署级**；进程内 netns 不支持，P0-1）。
 
     终审 5-2：复用**已存在**的 netns 前必须校验模式标记 —— 否则已有 MODE_B
@@ -208,7 +209,8 @@ def spawn_in_netns(argv: Sequence[str], name: str, *,
             raise EgressUnavailable(
                 f"netns {name!r} 既有代理 {marker.get('proxy')!r} ≠ 请求代理 "
                 f"{proxy!r} → 拒绝复用")
-    return subprocess.Popen([ip, "netns", "exec", name, *argv])
+    return subprocess.Popen([ip, "netns", "exec", name, *argv],
+                            **popen_kwargs)
 
 
 def delete_netns(name: str) -> None:

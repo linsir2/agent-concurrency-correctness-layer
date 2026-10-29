@@ -26,8 +26,6 @@ import hashlib
 import os
 import shlex
 import shutil
-import signal
-import subprocess
 import tempfile
 import threading
 import time
@@ -47,7 +45,8 @@ from .types import ACB, TASK_TERMINAL, Result, Status, TaskState, Write, advance
 
 if TYPE_CHECKING:                            # pragma: no cover
     from .harness import Harness
-    from .worktree import WorktreeManager
+from .tool_runner import ToolResult, make_runner
+from .worktree import WorktreeManager
 
 # ---------------------------------------------------------------- 结果类型
 @dataclass(frozen=True)
@@ -111,22 +110,6 @@ def _norm_cmd(cmd) -> list[str] | None:
     if not argv:
         raise ValueError("verify_cmd 不能为空")
     return argv
-
-
-def _kill_process_group(proc: subprocess.Popen) -> None:
-    """超时后杀**整个进程组**（S24-P0）。
-
-    `subprocess.run(timeout=...)` 只杀直接子进程：验证命令若自己再起子进程
-    （测试运行器/构建工具很常见），孙进程会继续跑并可能写文件、占端口。
-    `start_new_session=True` 让子进程成为组长，超时时 `killpg` 一次清干净。
-    """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.kill()
-        except OSError:
-            pass
 
 
 def _safe_rel(root: str, rel: str) -> str | None:
@@ -254,7 +237,8 @@ class RscSession:
                  semantic: str = "off",
                  semantic_ignore: tuple[str, ...] = (),
                  merge_queue: dict | None = None,
-                 capability=None, capability_required: bool = False) -> None:
+                 capability=None, capability_required: bool = False,
+                 verify_egress: str = "off", tool_runner=None) -> None:
         self.h = harness
         self.tenant = str(tenant or "")
         self.token_ttl_ms = max(1, int(token_ttl_ms))
@@ -278,6 +262,11 @@ class RscSession:
             raise ValueError("capability_required=True 时必须提供 capability")
         self.capability = _normalize_capability(harness, capability)
         self.capability_required = bool(capability_required)
+        # #4：外部命令执行器。默认 LocalRunner（与内联 Popen 逐行为等价）；
+        # verify_egress != off 时按能力矩阵选择沙箱后端。
+        self.verify_egress = str(verify_egress)
+        self.tool_runner = (tool_runner if tool_runner is not None
+                            else make_runner(self.verify_egress, harness.egress))
         # S24-4：可选单写者队列（默认关闭 → `apply` 路径字节不变）。
         self._queue: MergeQueue | None = None
         if merge_queue is not None:
@@ -769,25 +758,22 @@ class RscSession:
         argv = _norm_cmd(cmd) if cmd is not None else self.verify_cmd
         return None if argv is None else [argv]
 
-    @staticmethod
-    def _run_verify_step(argv: list[str], tree: str,
+    def _run_verify_step(self, argv: list[str], tree: str,
                          timeout: float) -> tuple[int, str]:
-        try:
-            proc = subprocess.Popen(argv, cwd=tree, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True,
-                                    start_new_session=True)
-            try:
-                stdout, stderr = proc.communicate(timeout=timeout)
-                return proc.returncode, ((stdout or "") + (stderr or "")).strip()
-            except subprocess.TimeoutExpired:
-                _kill_process_group(proc)
-                try:
-                    stdout, stderr = proc.communicate(timeout=5.0)
-                except subprocess.TimeoutExpired:   # 极端：组内仍有顽固进程
-                    stdout, stderr = "", ""
-                return -1, f"verify_timeout after {timeout}s"
-        except OSError as exc:
-            return -1, f"verify_spawn_failed: {exc}"
+        """执行一步验证命令。
+
+        行为契约（与内联 Popen 版本逐条等价）：
+        - 正常：`(rc, stdout+stderr stripped)`；
+        - 超时：`(-1, "verify_timeout after {timeout}s")`，**杀整个进程组**；
+        - spawn 失败：`(-1, "verify_spawn_failed: ...")`。
+        """
+        res: ToolResult = self.tool_runner.run(
+            argv, cwd=tree, timeout_s=float(timeout))
+        if res.timed_out:
+            return -1, f"verify_timeout after {timeout}s"
+        if res.rc == -1 and res.output.startswith("verify_spawn_failed"):
+            return -1, res.output
+        return res.rc, res.output
 
     @staticmethod
     def _count_files(tree: str) -> int:
