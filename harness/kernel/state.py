@@ -25,13 +25,6 @@ class _NullLock:
         return False
 
 
-class _SpawnAbort(Exception):
-    """C1：spawn ② 事务的「明确拒绝」信号（非崩溃），由回滚分支转成 failure。
-
-    TODO(S3)：这是控制流异常，不是状态；S3 抽取 ChildManager 时移到 kernel/children.py。
-    """
-
-
 @dataclass
 class KernelState:
     # ---- 身份 / 签名（SigningService）----
@@ -80,6 +73,9 @@ class KernelState:
     transition_locks: dict = field(default_factory=dict)  # R7：每 ACB 一把 transition 锁
     children_index: dict = field(default_factory=dict)    # X6：parent_id → {child_acb_id}
     children_index_built: bool = False
+    # S3.1：spawn 子 id 序号源（旧 `self._spawn_counter = itertools.count(1)`）。
+    # 是**可变状态**，不能冻结进 `ChildDeps`（服务在调用时读 `self.state`）。
+    spawn_counter: Any = None
 
     # ---- S3.0：可变配置（服务/测试在构造后修改，必须调用时读取）----
     scheduler_mode: str = "sync"
