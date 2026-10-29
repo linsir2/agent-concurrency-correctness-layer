@@ -708,6 +708,18 @@ class ChildManager:
         """`_replace_child_ref` 的公开别名（S3.2：TaskService 的唯一入口）。"""
         self._replace_child_ref(old, fresh)
 
+    def index_child(self, child_id: str, parent_id: str) -> None:
+        """`_index_child` 的公开别名（S4：RecoveryService 恢复即登记反扫索引）。"""
+        self._index_child(child_id, parent_id)
+
+    def reconcile_children_refs(self, acb: ACB) -> None:
+        """`_reconcile_children_refs` 的公开别名（S4：`recover` 的 C1 对账）。"""
+        self._reconcile_children_refs(acb)
+
+    def reconcile_children_pending(self, acb: ACB) -> None:
+        """`_reconcile_children_pending` 的公开别名（S4：`recover` 的 C1 对账）。"""
+        self._reconcile_children_pending(acb)
+
     # ---- X6：跨 run 子索引 -----------------------------------------
     def _index_child(self, child_id: str, parent_id: str) -> None:
         if parent_id and str(child_id) != str(parent_id):

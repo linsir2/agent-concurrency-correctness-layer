@@ -16,6 +16,7 @@ from harness.kernel.tasks import TaskService
 from harness.kernel.children import ChildManager
 from harness.kernel.commit import CommitService
 from harness.kernel.receipts import ReceiptChain
+from harness.kernel.recovery import RecoveryService
 from harness.kernel.leases import WriterLeaseService
 from harness import Harness, TaskState
 from harness.checkpoint import CheckpointStore, FileCheckpointStore
@@ -27,7 +28,7 @@ ok, bad = [], []
 
 
 _OWNERS = (DispatchService, TaskService, ChildManager, CommitService,
-           ReceiptChain, WriterLeaseService, Harness)
+           ReceiptChain, RecoveryService, WriterLeaseService, Harness)
 
 
 def _impl(name: str) -> str:
@@ -53,7 +54,7 @@ c = _impl("_tick_candidates")
 chk("K-69 候选集含 refs_all", "refs_all()" in c)
 chk("K-69 候选集含内存", "self.state.acbs.values()" in c)
 chk("K-69 水合失败记录 _tick_skipped", "tick_load_failed" in c and "tick_hydrate_failed" in c)
-chk("K-69 recover 传 persist_scan=False", "tick(persist_scan=False)" in inspect.getsource(Harness.recover))
+chk("K-69 recover 传 persist_scan=False", "tick(persist_scan=False)" in _impl("recover"))
 chk("K-69 next_deadline_ms 存在", hasattr(Harness, "next_deadline_ms"))
 chk("K-69 pump 存在", hasattr(Harness, "pump"))
 pt = inspect.getsource(Harness.tick)

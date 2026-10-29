@@ -40,9 +40,10 @@ _METHOD_SIZE_ALLOWLIST: set[tuple[str, str]] = {("children.py", "spawn_child")}
 # ---------------------------------------------------------------------------
 # 2) 边界：服务只能经**公开**接缝互相调用
 # ---------------------------------------------------------------------------
-# kernel 里的**服务**（拆出来的 8 个模块的服务类名）
+# kernel 里的**服务**（拆出来的 9 个模块的服务类名）
 _SERVICES: frozenset[str] = frozenset({
     "commit", "receipts", "leases", "identity", "children", "tasks", "dispatch",
+    "recovery",
 })
 
 # **组件私有缝**是合法的：组件（workspace/budget/...）本来就不是「服务」，

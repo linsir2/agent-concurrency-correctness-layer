@@ -87,6 +87,11 @@ class KernelState:
     timers_fired: list = field(default_factory=list)   # 旧 `self._timers_fired`
     draining: bool = False                            # 旧 `self._draining`
 
+    # ---- S4：恢复去重集合（旧 `self._applied_event_ids`，recovery 抽取前置）----
+    # 事件身份已应用集合；`CheckpointStore` 持有**同一对象**引用
+    # （`checkpoints.applied_event_ids`），故只能原地 update/add，绝不换新 set。
+    applied_event_ids: Any = field(default_factory=set)
+
     # ---- S3.0：可变配置（服务/测试在构造后修改，必须调用时读取）----
     scheduler_mode: str = "sync"
     aging_ms: int = 0

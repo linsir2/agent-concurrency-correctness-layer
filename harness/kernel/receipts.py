@@ -98,6 +98,14 @@ class ReceiptChain:
             self.state.receipt_scan_watermark = self.deps.event_log.tail()
         except Exception:  # noqa: BLE001  # tail 不可用 → 0（刷新退回全扫，仍正确）
             self.state.receipt_scan_watermark = 0
+
+    def rebuild(self) -> None:
+        """`_rebuild_receipts` 的公开别名（S4：`recover` 的唯一入口）。
+
+        实现仍是 `_rebuild_receipts` 这一份 —— 不复制逻辑、不做二次重建。
+        """
+        self._rebuild_receipts()
+
     @staticmethod
     def _scan_receipts(records, heads: dict, ids: set, tainted: set,
                        malformed: list) -> int:

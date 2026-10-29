@@ -22,6 +22,7 @@ from harness.kernel.tasks import TaskService
 from harness.kernel.children import ChildManager
 from harness.kernel.commit import CommitService
 from harness.kernel.receipts import ReceiptChain
+from harness.kernel.recovery import RecoveryService
 from harness.kernel.leases import WriterLeaseService
 from harness import (
     EventKind,
@@ -37,7 +38,7 @@ bad: list[tuple[str, str]] = []
 
 
 _OWNERS = (DispatchService, TaskService, ChildManager, CommitService,
-           ReceiptChain, WriterLeaseService, Harness)
+           ReceiptChain, RecoveryService, WriterLeaseService, Harness)
 
 
 def _impl(name: str) -> str:
@@ -150,7 +151,7 @@ src_r2 = inspect.getsource(Harness.resume_run)
 chk("D3 resume 写 RUN_RESUMED 事件", "RUN_RESUMED" in src_r2)
 src_d = _impl("_drain_skip_reason")
 chk("D3 调度尊重暂停（run_paused）", "run_paused" in src_d)
-chk("D3 recover 重建暂停态", "_rebuild_pause_state" in inspect.getsource(Harness.recover))
+chk("D3 recover 重建暂停态", "rebuild_pause_state" in _impl("recover"))
 chk("D3 submit_command 路由 PAUSE/RESUME",
     "PAUSE_RUN" in _src_c and "RESUME_RUN" in _src_c)
 
