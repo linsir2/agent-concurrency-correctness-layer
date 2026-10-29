@@ -18,13 +18,26 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# 这 5 个脚本在原始提交 999b8c3 上就是全绿；s17–s22 在原始提交上已失败
+# （AttributeError / ❌），不属于本次重构回归，故不纳入门禁。
+PASSING_BASELINE = [
+    "check_s14_conformance.py",
+    "check_s15_conformance.py",
+    "check_s16_conformance.py",
+    "check_s23_conformance.py",
+    "check_s24_conformance.py",
+]
 
-def test_s24_conformance_passes():
+
+@pytest.mark.parametrize("script", PASSING_BASELINE)
+def test_conformance_script_passes(script):
     proc = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/check_s24_conformance.py")],
-        capture_output=True, text=True, cwd=str(ROOT), timeout=120)
+        [sys.executable, str(ROOT / "scripts" / script)],
+        capture_output=True, text=True, cwd=str(ROOT), timeout=180)
     assert proc.returncode == 0, (
-        "conformance 脚本失败（通常是源码被搬动后断言未跟随）:\n"
+        f"{script} 失败（通常是源码被搬动后断言未跟随）:\n"
         + proc.stdout[-3000:] + proc.stderr[-2000:])

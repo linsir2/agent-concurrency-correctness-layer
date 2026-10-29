@@ -17,6 +17,12 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "tests"))
 
 import harness
+from harness.kernel.dispatch import DispatchService
+from harness.kernel.tasks import TaskService
+from harness.kernel.children import ChildManager
+from harness.kernel.commit import CommitService
+from harness.kernel.receipts import ReceiptChain
+from harness.kernel.leases import WriterLeaseService
 from harness import (
     EventKind,
     Harness,
@@ -30,13 +36,20 @@ ok: list[str] = []
 bad: list[tuple[str, str]] = []
 
 
-def _impl(name: str) -> str:
-    """`Harness.<name>` 的**实现**源码（S3.2：DLQ redrive 已迁至 kernel/tasks.py）。
+_OWNERS = (DispatchService, TaskService, ChildManager, CommitService,
+           ReceiptChain, WriterLeaseService, Harness)
 
-    拆分后 Harness 只留旧名委托；直接取 Harness 上的属性只剩一行转发。
+
+def _impl(name: str) -> str:
+    """`name` 的**实现**源码（S3：拆到 kernel/*.py 后 Harness 只剩委托）。
+
+    按「服务优先、Harness 兜底」解析：同一名字在服务上有实现、在 Harness 上
+    只有一行转发时，必须取实现，否则源码文本断言变成空断言。
     """
-    owner = TaskService if hasattr(TaskService, name) else Harness
-    return inspect.getsource(getattr(owner, name))
+    for owner in _OWNERS:
+        if hasattr(owner, name):
+            return inspect.getsource(getattr(owner, name))
+    raise AttributeError(name)
 
 
 def chk(name: str, cond: bool, detail: str = "") -> None:
@@ -135,7 +148,7 @@ src_p = inspect.getsource(Harness.pause_run)
 chk("D3 pause 写 RUN_PAUSED 事件（持久化）", "RUN_PAUSED" in src_p)
 src_r2 = inspect.getsource(Harness.resume_run)
 chk("D3 resume 写 RUN_RESUMED 事件", "RUN_RESUMED" in src_r2)
-src_d = inspect.getsource(Harness._drain_skip_reason)
+src_d = _impl("_drain_skip_reason")
 chk("D3 调度尊重暂停（run_paused）", "run_paused" in src_d)
 chk("D3 recover 重建暂停态", "_rebuild_pause_state" in inspect.getsource(Harness.recover))
 chk("D3 submit_command 路由 PAUSE/RESUME",

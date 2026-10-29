@@ -11,6 +11,12 @@ import sys
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT)); sys.path.insert(0, str(_ROOT / 'tests'))
+from harness.kernel.dispatch import DispatchService
+from harness.kernel.tasks import TaskService
+from harness.kernel.children import ChildManager
+from harness.kernel.commit import CommitService
+from harness.kernel.receipts import ReceiptChain
+from harness.kernel.leases import WriterLeaseService
 from harness import Harness, TaskState
 from harness.checkpoint import CheckpointStore, FileCheckpointStore
 from harness.kernel.tasks import TaskService
@@ -20,25 +26,32 @@ from harness.types import TRANSITIONS, ResultEnvelope
 ok, bad = [], []
 
 
-def _impl(name: str) -> str:
-    """`Harness.<name>` 的**实现**源码（S3.2：重规划簇已迁至 kernel/tasks.py）。
+_OWNERS = (DispatchService, TaskService, ChildManager, CommitService,
+           ReceiptChain, WriterLeaseService, Harness)
 
-    拆分后 Harness 只留旧名委托，单看 `inspect.getsource(Harness.<name>)` 会
-    只剩一行 `return self.tasks.…` → 源码文本断言假绿/假红。
+
+def _impl(name: str) -> str:
+    """`name` 的**实现**源码（S3：拆到 kernel/*.py 后 Harness 只剩委托）。
+
+    按「服务优先、Harness 兜底」解析：同一名字在服务上有实现、在 Harness 上
+    只有一行转发时，必须取实现，否则源码文本断言变成空断言。
     """
-    owner = TaskService if hasattr(TaskService, name) else Harness
-    return inspect.getsource(getattr(owner, name))
+    for owner in _OWNERS:
+        if hasattr(owner, name):
+            return inspect.getsource(getattr(owner, name))
+    raise AttributeError(name)
+
 
 def chk(name, cond, detail=""):
     (ok if cond else bad).append((name, detail))
 
 # --- K-69
-src = inspect.getsource(Harness.tick)
+src = _impl("tick")
 chk("K-69 tick 用 _tick_candidates(persist_scan=)", "_tick_candidates(persist_scan=persist_scan)" in src)
-chk("K-69 tick 签名含 persist_scan", "persist_scan" in inspect.signature(Harness.tick).parameters)
-c = inspect.getsource(Harness._tick_candidates)
+chk("K-69 tick 签名含 persist_scan", "persist_scan" in inspect.signature(DispatchService.tick).parameters)
+c = _impl("_tick_candidates")
 chk("K-69 候选集含 refs_all", "refs_all()" in c)
-chk("K-69 候选集含内存", "self.acbs.values()" in c)
+chk("K-69 候选集含内存", "self.state.acbs.values()" in c)
 chk("K-69 水合失败记录 _tick_skipped", "tick_load_failed" in c and "tick_hydrate_failed" in c)
 chk("K-69 recover 传 persist_scan=False", "tick(persist_scan=False)" in inspect.getsource(Harness.recover))
 chk("K-69 next_deadline_ms 存在", hasattr(Harness, "next_deadline_ms"))
@@ -58,10 +71,10 @@ chk("K-68 耗尽抛 FencingRejected", "FencingRejected" in inspect.getsource(Fil
 # --- K-71(a)
 chk("K-71a 新边 ADMITTED->FAILED", TRANSITIONS.get((TaskState.ADMITTED,"inline_depth_exceeded")) is TaskState.FAILED)
 chk("K-71a 新边 RUNNING->FAILED", TRANSITIONS.get((TaskState.RUNNING,"inline_depth_exceeded")) is TaskState.FAILED)
-d = inspect.getsource(Harness._run_one_inline)
+d = _impl("_run_one_inline")
 chk("K-71a 返回 GUARD_VIOLATION", "GUARD_VIOLATION" in d)
 chk("K-71a 不再返回 INVALID_INPUT", 'Status.INVALID_INPUT, {"reason": "inline_depth_exceeded"}' not in d)
-chk("K-71a 有 _finalize 传播", "_finalize(acb)" in d)
+chk("K-71a 有 _finalize 传播", "self.deps.finalize(acb)" in d)
 
 # --- K-67(B) 物化 edges
 p = inspect.getsource(Planner.patch)
