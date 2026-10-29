@@ -140,6 +140,15 @@ class Harness:
                  max_redrives: int = 3,
                  poison_after_failures: int = 3,
                  drain_timeout_s: float = 5.0) -> None:
+        timers = self._assemble_config(retention=retention, lease_ms=lease_ms, guard_every=guard_every, aging_max=aging_max, max_steps=max_steps, max_concurrent=max_concurrent, hitl_timeout_ms=hitl_timeout_ms, clock=clock, auth_secret=auth_secret, per_action_delay=per_action_delay, entropy=entropy, definitions=definitions, timers=timers, durable_timers=durable_timers, epoch_scope=epoch_scope, replan_budget=replan_budget, spawn_depth=spawn_depth, max_fanout=max_fanout, min_budget_per_child=min_budget_per_child, scheduler_mode=scheduler_mode, pool_workers=pool_workers, pool_timeout_s=pool_timeout_s, claim_lease_ms=claim_lease_ms, aging_ms=aging_ms, aging_max_attempts=aging_max_attempts)
+        self._assemble_components(run_limits=run_limits, policy_default_allow=policy_default_allow, clock=clock, event_log=event_log, intents=intents, versions=versions, workspace=workspace, budget=budget, checkpoints=checkpoints, effects=effects, policy=policy, subscriptions=subscriptions, default_token=default_token, blobs=blobs, path_of=path_of, lock_timeout_s=lock_timeout_s, auth_secret=auth_secret, tombstone_ttl_s=tombstone_ttl_s, auth_gc_every=auth_gc_every, gc_every=gc_every, checkpoint_root=checkpoint_root, entropy=entropy, timers=timers, durable_timers=durable_timers, egress_required=egress_required)
+        self._assemble_services(retention=retention, context=context, decide=decide, resolver=resolver, receipts_enabled=receipts_enabled)
+        self._assemble_execution(max_concurrent=max_concurrent, scheduler_mode=scheduler_mode, max_redrives=max_redrives, poison_after_failures=poison_after_failures, drain_timeout_s=drain_timeout_s)
+        self._assemble_writer(writer_id=writer_id, lease_store=lease_store, entropy=entropy)
+        self._assemble_recovery()
+
+    def _assemble_config(self, retention, lease_ms, guard_every, aging_max, max_steps, max_concurrent, hitl_timeout_ms, clock, auth_secret, per_action_delay, entropy, definitions, timers, durable_timers, epoch_scope, replan_budget, spawn_depth, max_fanout, min_budget_per_child, scheduler_mode, pool_workers, pool_timeout_s, claim_lease_ms, aging_ms, aging_max_attempts):
+        """校验 + 可变配置 → KernelState；返回（可能被包装的）timers。"""
         if epoch_scope not in ("run", "global"):
             raise ValueError(f"未知 epoch_scope：{epoch_scope!r}（run|global）")
         # S24-10：确定性模式的安全/边界（fail-closed，绝不静默削弱）
@@ -228,6 +237,10 @@ class Harness:
         # `egress_required=True`  → 构造即校验，无强制点 → `EgressUnavailable`（拒绝启动）
         # `egress_required=None`  → 构造不校验，**任何出站** fail-closed（默认）
         # `egress_required=False` → 显式降级（仅测试/离线），原因记入 `degradations`
+        return timers
+
+    def _assemble_components(self, run_limits, policy_default_allow, clock, event_log, intents, versions, workspace, budget, checkpoints, effects, policy, subscriptions, default_token, blobs, path_of, lock_timeout_s, auth_secret, tombstone_ttl_s, auth_gc_every, gc_every, checkpoint_root, entropy, timers, durable_timers, egress_required):
+        """组件层：egress/clock/event_log/budget/checkpoints/…（顺序不变）。"""
         self.egress = EgressGuard(required=egress_required)
         # S11-8 / 终审 8-1：真实出站路径（`llm._post`）必须过同一个 guard；
         # 只构造 guard 不接线等于「有锁不装门」——`ensure()` 永远不会被调用。
@@ -346,6 +359,8 @@ class Harness:
                        else PolicyEngine(default_allow=policy_default_allow,
                                          default_token=default_token))
         # S1：身份服务（签名 / 有效 token / 幂等键 / 事件分发）
+
+    def _assemble_services(self, retention, context, decide, resolver, receipts_enabled):
         self.identity = SigningService(
             IdentityDeps(clock=self.clock, policy=self.policy, budget=self.budget,
                          subscriptions=self.subscriptions,
@@ -379,6 +394,8 @@ class Harness:
         self.resolver = (resolver if resolver is not None
                          else ScriptedResolver())       # §7 默认 scripted（不联网）
 
+
+    def _assemble_execution(self, max_concurrent, scheduler_mode, max_redrives, poison_after_failures, drain_timeout_s):
         self.slots = SlotTracker(max_concurrent, shared=self.checkpoints)
         self.checkpoints.slots = self.slots        # checkpoint 快照活跃槽位
         # F6：checkpoint 落盘的是**有效 token**（`acb.capability` → `policy._tokens`
@@ -509,6 +526,8 @@ class Harness:
         self.timer_service = TimerService(self.state)
         self.state.plans = {}
         self.state.acbs = {}
+
+    def _assemble_writer(self, writer_id, lease_store, entropy):
         self.state.lock = threading.RLock()
         # R6：准入唯一性登记 `(run_id, task_id, plan_version) → ACB`。
         # 同一 key 的活跃 ACB 不会被第二次 try_admit 复制出 `A-...-2`（双跑）。
@@ -577,6 +596,8 @@ class Harness:
         # 本簇不需要订阅，且不移动任何既有语句（`subscribe` 仍是最后一条）。
         # 仍留在 Harness 上的方法一律走 **late lookup lambda** —— 绑定方法会冻结
         # 原实现，让 tests 的实例级/类级打桩失效（`test_s13_hitl` 打桩 `tick`）。
+
+    def _assemble_recovery(self):
         self.recovery = RecoveryService(
             RecoveryDeps(
                 budget=self.budget, checkpoints=self.checkpoints,
@@ -606,6 +627,7 @@ class Harness:
             self.state)
 
         self.event_log.subscribe(self._on_event)
+
 
     # ---- 收据链（S9 §2.3 / K-24） --------------------------------
     # ---- 收据链（S1：实现已迁至 kernel/receipts.py）----------
